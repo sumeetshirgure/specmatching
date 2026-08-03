@@ -1,0 +1,13 @@
+pyrematching
+Copyright (c) 2026 <YOUR NAME>
+
+This product includes software derived from PyMatching
+(https://github.com/oscarhiggott/PyMatching), Copyright (c) Oscar Higgott
+and contributors, licensed under the Apache License, Version 2.0.
+
+The sparse blossom implementation under src/pyrematching/sparse_blossom/
+is upstream PyMatching source, renamed but otherwise unmodified except
+where noted in docs/upstream_edits.md.
+
+If you use this software, please cite the sparse blossom paper:
+  O. Higgott and C. Gidney, arXiv:2303.15933.

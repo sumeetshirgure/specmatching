@@ -42,3 +42,7 @@ Issues = "https://github.com/sumeetshirgure/pyrematching/issues"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/pyrematching"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+norecursedirs = ["extern", "build", "docs", "benchmarks", "*.egg-info"]
