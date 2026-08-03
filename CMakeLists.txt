@@ -62,6 +62,11 @@ set(SOURCE_FILES_NO_MAIN
         src/pyrematching/two_phase/truncation/truncated_timeline.cc
         src/pyrematching/two_phase/truncation/harvest.cc
         src/pyrematching/two_phase/truncation/exposed_blossom.cc
+        src/pyrematching/two_phase/manifold/ball_tables.cc
+        src/pyrematching/two_phase/manifold/ball_serialize.cc
+        src/pyrematching/two_phase/manifold/ball_graph.cc
+        src/pyrematching/two_phase/manifold/ball_mwpm.cc
+        src/pyrematching/two_phase/manifold/ball_decoding.cc
         )
 
 set(TEST_FILES
@@ -89,6 +94,9 @@ set(TEST_FILES
         tests/two_phase/truncation_harvest.test.cc
         tests/two_phase/truncation_exposed_blossom.test.cc
         tests/two_phase/truncation_fuzz.test.cc
+        tests/two_phase/manifold_ball_tables.test.cc
+        tests/two_phase/manifold_ball_graph.test.cc
+        tests/two_phase/manifold_ball_identity.test.cc
         )
 
 set(PERF_FILES
@@ -145,6 +153,15 @@ if (NOT (MSVC))
     target_link_options(two_phase_m1_artifact PRIVATE -pthread -O3)
 endif ()
 target_link_libraries(two_phase_m1_artifact libstim)
+
+# M2 exit artifact: ball table cost, `speedup_vs_m1` with the per-stage split, and the level-3
+# end-to-end LER comparison the M2 exit read is made from. Built optimised, like the perf harness.
+add_executable(two_phase_m2_artifact benchmarks/two_phase/m2_exit_artifact.cc ${SOURCE_FILES_NO_MAIN})
+target_compile_options(two_phase_m2_artifact PRIVATE ${ARCH_OPT})
+if (NOT (MSVC))
+    target_link_options(two_phase_m2_artifact PRIVATE -pthread -O3)
+endif ()
+target_link_libraries(two_phase_m2_artifact libstim)
 
 add_library(libpyrematching ${SOURCE_FILES_NO_MAIN})
 set_target_properties(libpyrematching PROPERTIES PREFIX "")

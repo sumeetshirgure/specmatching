@@ -153,6 +153,14 @@ inline pm::cumulative_time_int median_edge_weight(const pm::MatchingGraph& graph
     return (pm::cumulative_time_int)weights[weights.size() / 2];
 }
 
+/// One "edge weight" of the graph, expressed in the DEM float weight units that `BallParams` and
+/// `BallConfig` take. Horizons are quoted in multiples of a lattice edge weight throughout the M1
+/// results, and that is the normalisation under which every structure in the data is
+/// `d`-independent — so it is the unit the ball tests size `T` and `R` in too.
+inline double edge_weight_units(const pm::MatchingGraph& graph) {
+    return (double)median_edge_weight(graph) / graph.normalising_constant;
+}
+
 /// Phase-1-only decode: truncated timeline, harvest, and the same negative-weight post-processing
 /// that `pm::decode_detection_events` applies. At `pm::NO_HORIZON` this must be bit-identical to
 /// the stock decoder.
