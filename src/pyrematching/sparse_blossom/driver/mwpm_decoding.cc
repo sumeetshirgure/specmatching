@@ -79,7 +79,7 @@ pm::Mwpm pm::detector_error_model_to_mwpm(
     return user_graph.to_mwpm(num_distinct_weights, ensure_search_flooder_included);
 }
 
-void process_timeline_until_completion(pm::Mwpm& mwpm, const std::vector<uint64_t>& detection_events) {
+void pm::begin_timeline(pm::Mwpm& mwpm, const std::vector<uint64_t>& detection_events) {
     if (!mwpm.flooder.queue.empty()) {
         throw std::invalid_argument("!mwpm.flooder.queue.empty()");
     }
@@ -128,6 +128,10 @@ void process_timeline_until_completion(pm::Mwpm& mwpm, const std::vector<uint64_
             }
         }
     }
+}
+
+void process_timeline_until_completion(pm::Mwpm& mwpm, const std::vector<uint64_t>& detection_events) {
+    pm::begin_timeline(mwpm, detection_events);
 
     while (true) {
         auto event = mwpm.flooder.run_until_next_mwpm_notification();

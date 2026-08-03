@@ -59,6 +59,9 @@ set(SOURCE_FILES_NO_MAIN
         src/pyrematching/sparse_blossom/search/search_flooder.cc
         src/pyrematching/sparse_blossom/driver/user_graph.cc
         src/pyrematching/rand/rand_gen.cc
+        src/pyrematching/two_phase/truncation/truncated_timeline.cc
+        src/pyrematching/two_phase/truncation/harvest.cc
+        src/pyrematching/two_phase/truncation/exposed_blossom.cc
         )
 
 set(TEST_FILES
@@ -82,6 +85,10 @@ set(TEST_FILES
         src/pyrematching/sparse_blossom/search/search_graph.test.cc
         src/pyrematching/sparse_blossom/search/search_flooder.test.cc
         src/pyrematching/sparse_blossom/driver/user_graph.test.cc
+        tests/two_phase/truncation_timeline.test.cc
+        tests/two_phase/truncation_harvest.test.cc
+        tests/two_phase/truncation_exposed_blossom.test.cc
+        tests/two_phase/truncation_fuzz.test.cc
         )
 
 set(PERF_FILES
@@ -111,7 +118,11 @@ install(TARGETS pyrematching RUNTIME DESTINATION bin)
 enable_testing()
 
 add_executable(pyrematching_tests ${SOURCE_FILES_NO_MAIN} ${TEST_FILES})
-target_compile_options(pyrematching_tests PRIVATE -fsanitize=address -g -fsanitize=undefined -fno-omit-frame-pointer -coverage)
+# The two-phase tests share a helper header under tests/, which is outside the `src` include root.
+target_include_directories(pyrematching_tests PRIVATE ${CMAKE_CURRENT_LIST_DIR})
+# -UNDEBUG so the debug-build invariants (asserts, and the M1 horizon gate counters) are live in the
+# test binary even when the tree is configured as a Release build.
+target_compile_options(pyrematching_tests PRIVATE -fsanitize=address -g -fsanitize=undefined -fno-omit-frame-pointer -coverage -UNDEBUG)
 if (NOT (MSVC))
     target_link_options(pyrematching_tests PRIVATE -pthread -fsanitize=address -fsanitize=undefined -coverage)
 else ()
@@ -125,6 +136,15 @@ if (NOT (MSVC))
     target_link_options(pyrematching_perf PRIVATE -pthread -O3)
 endif ()
 target_link_libraries(pyrematching_perf libstim)
+
+# M1 exit artifact: sweeps (d, p, T) and reports the residual/fallback statistics the M1 go/no-go
+# read is made from. Built optimised, like the perf harness.
+add_executable(two_phase_m1_artifact benchmarks/two_phase/m1_exit_artifact.cc ${SOURCE_FILES_NO_MAIN})
+target_compile_options(two_phase_m1_artifact PRIVATE ${ARCH_OPT})
+if (NOT (MSVC))
+    target_link_options(two_phase_m1_artifact PRIVATE -pthread -O3)
+endif ()
+target_link_libraries(two_phase_m1_artifact libstim)
 
 add_library(libpyrematching ${SOURCE_FILES_NO_MAIN})
 set_target_properties(libpyrematching PROPERTIES PREFIX "")

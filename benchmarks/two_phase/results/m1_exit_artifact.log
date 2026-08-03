@@ -1,0 +1,199 @@
+generating d=11 p=0.001 (500 shots)
+  T=4068 (0.25 edges)  q=0.998  mean_residual=19.28  phase1_ns=4784  exact_ns=5021.77
+  T=8136 (0.5 edges)  q=0.96  mean_residual=6.508  phase1_ns=4508.52  exact_ns=4732.96
+  T=12204 (0.75 edges)  q=0.452  mean_residual=0.7  phase1_ns=5264  exact_ns=4776.55
+  T=16274 (1 edges)  q=0.026  mean_residual=0.038  phase1_ns=5462.14  exact_ns=4276.97
+  T=20342 (1.25 edges)  q=0  mean_residual=0  phase1_ns=5416.19  exact_ns=4342.11
+  T=24410 (1.5 edges)  q=0  mean_residual=0  phase1_ns=5558.87  exact_ns=4161.75
+  T=32548 (2 edges)  q=0  mean_residual=0  phase1_ns=5572.33  exact_ns=4175.9
+  T=48822 (3 edges)  q=0  mean_residual=0  phase1_ns=5902.66  exact_ns=4423.27
+  T=65096 (4 edges)  q=0  mean_residual=0  phase1_ns=5392.23  exact_ns=4180.4
+  T=130192 (8 edges)  q=0  mean_residual=0  phase1_ns=5457.61  exact_ns=4081.82
+generating d=11 p=0.003 (500 shots)
+  T=3948 (0.25 edges)  q=1  mean_residual=57.492  phase1_ns=13355  exact_ns=17512.2
+  T=7896 (0.5 edges)  q=1  mean_residual=14.696  phase1_ns=13107.4  exact_ns=17083.4
+  T=11844 (0.75 edges)  q=0.894  mean_residual=2.538  phase1_ns=16913.2  exact_ns=15977.7
+  T=15792 (1 edges)  q=0.208  mean_residual=0.302  phase1_ns=18072.7  exact_ns=15760.8
+  T=19740 (1.25 edges)  q=0.058  mean_residual=0.064  phase1_ns=18586.5  exact_ns=15876.1
+  T=23688 (1.5 edges)  q=0.024  mean_residual=0.024  phase1_ns=18975.2  exact_ns=15328.5
+  T=31584 (2 edges)  q=0.006  mean_residual=0.006  phase1_ns=19481.3  exact_ns=15215.2
+  T=47376 (3 edges)  q=0  mean_residual=0  phase1_ns=19644.7  exact_ns=15403.3
+  T=63168 (4 edges)  q=0  mean_residual=0  phase1_ns=19424.1  exact_ns=15257.7
+  T=126336 (8 edges)  q=0  mean_residual=0  phase1_ns=19827.7  exact_ns=15681.9
+generating d=11 p=0.005 (500 shots)
+  T=3880 (0.25 edges)  q=1  mean_residual=93.26  phase1_ns=20749.7  exact_ns=33699.2
+  T=7760 (0.5 edges)  q=1  mean_residual=32.26  phase1_ns=22153.3  exact_ns=33819.4
+  T=11640 (0.75 edges)  q=0.98  mean_residual=4.884  phase1_ns=30720.2  exact_ns=32150.3
+  T=15522 (1 edges)  q=0.44  mean_residual=0.778  phase1_ns=33863.3  exact_ns=31519.5
+  T=19402 (1.25 edges)  q=0.208  mean_residual=0.256  phase1_ns=35990.4  exact_ns=32368.2
+  T=23282 (1.5 edges)  q=0.072  mean_residual=0.076  phase1_ns=38869  exact_ns=33731
+  T=31044 (2 edges)  q=0.006  mean_residual=0.006  phase1_ns=37814.2  exact_ns=31114.5
+  T=46566 (3 edges)  q=0  mean_residual=0  phase1_ns=37724.9  exact_ns=31041.4
+  T=62088 (4 edges)  q=0  mean_residual=0  phase1_ns=37947.9  exact_ns=31308
+  T=124176 (8 edges)  q=0  mean_residual=0  phase1_ns=37656.2  exact_ns=31010.8
+generating d=13 p=0.001 (500 shots)
+  T=4068 (0.25 edges)  q=1  mean_residual=32.86  phase1_ns=8767.13  exact_ns=9083.3
+  T=8136 (0.5 edges)  q=0.994  mean_residual=11.14  phase1_ns=8250.39  exact_ns=8666.1
+  T=12204 (0.75 edges)  q=0.62  mean_residual=1.084  phase1_ns=9041.36  exact_ns=8168.13
+  T=16274 (1 edges)  q=0.044  mean_residual=0.062  phase1_ns=9649.52  exact_ns=8104.47
+  T=20342 (1.25 edges)  q=0.006  mean_residual=0.006  phase1_ns=9746.62  exact_ns=8252.86
+  T=24410 (1.5 edges)  q=0.004  mean_residual=0.004  phase1_ns=9722.91  exact_ns=7987.94
+  T=32548 (2 edges)  q=0  mean_residual=0  phase1_ns=10052.2  exact_ns=8187.76
+  T=48822 (3 edges)  q=0  mean_residual=0  phase1_ns=9780.06  exact_ns=7938.25
+  T=65096 (4 edges)  q=0  mean_residual=0  phase1_ns=9809.89  exact_ns=7930.39
+  T=130192 (8 edges)  q=0  mean_residual=0  phase1_ns=10625.1  exact_ns=8680.94
+generating d=13 p=0.003 (500 shots)
+  T=3948 (0.25 edges)  q=1  mean_residual=95.944  phase1_ns=24480.9  exact_ns=32521.1
+  T=7896 (0.5 edges)  q=1  mean_residual=23.888  phase1_ns=26945.8  exact_ns=34970.8
+  T=11844 (0.75 edges)  q=0.972  mean_residual=4.006  phase1_ns=31995.1  exact_ns=31450.5
+  T=15792 (1 edges)  q=0.352  mean_residual=0.588  phase1_ns=33217  exact_ns=30671.9
+  T=19740 (1.25 edges)  q=0.124  mean_residual=0.15  phase1_ns=33692.3  exact_ns=29935.4
+  T=23688 (1.5 edges)  q=0.046  mean_residual=0.052  phase1_ns=35046.5  exact_ns=30261.8
+  T=31584 (2 edges)  q=0.002  mean_residual=0.002  phase1_ns=35678.1  exact_ns=29784.9
+  T=47376 (3 edges)  q=0  mean_residual=0  phase1_ns=35446.9  exact_ns=29862.2
+  T=63168 (4 edges)  q=0  mean_residual=0  phase1_ns=35965.1  exact_ns=30526
+  T=126336 (8 edges)  q=0  mean_residual=0  phase1_ns=35186.3  exact_ns=29513
+generating d=13 p=0.005 (500 shots)
+  T=3880 (0.25 edges)  q=1  mean_residual=155.746  phase1_ns=41420.1  exact_ns=66210.2
+  T=7760 (0.5 edges)  q=1  mean_residual=53.182  phase1_ns=42879.8  exact_ns=66028.9
+  T=11640 (0.75 edges)  q=0.998  mean_residual=8.336  phase1_ns=61091.9  exact_ns=66594.2
+  T=15522 (1 edges)  q=0.698  mean_residual=1.556  phase1_ns=66056.5  exact_ns=64913
+  T=19402 (1.25 edges)  q=0.328  mean_residual=0.468  phase1_ns=68099.6  exact_ns=64395.2
+  T=23282 (1.5 edges)  q=0.124  mean_residual=0.132  phase1_ns=70810.4  exact_ns=64168.3
+  T=31044 (2 edges)  q=0.018  mean_residual=0.02  phase1_ns=72530.5  exact_ns=63090.3
+  T=46566 (3 edges)  q=0  mean_residual=0  phase1_ns=73208.8  exact_ns=63763.2
+  T=62088 (4 edges)  q=0  mean_residual=0  phase1_ns=73743.7  exact_ns=64942.1
+  T=124176 (8 edges)  q=0  mean_residual=0  phase1_ns=72606.5  exact_ns=62671.4
+generating d=15 p=0.001 (500 shots)
+  T=4068 (0.25 edges)  q=1  mean_residual=52.538  phase1_ns=15893.7  exact_ns=16530.4
+  T=8136 (0.5 edges)  q=1  mean_residual=17.374  phase1_ns=16279.4  exact_ns=16937.6
+  T=12204 (0.75 edges)  q=0.748  mean_residual=1.494  phase1_ns=17419.4  exact_ns=15848
+  T=16274 (1 edges)  q=0.056  mean_residual=0.074  phase1_ns=17834.4  exact_ns=15241
+  T=20342 (1.25 edges)  q=0.004  mean_residual=0.004  phase1_ns=18640.9  exact_ns=15901.6
+  T=24410 (1.5 edges)  q=0.004  mean_residual=0.004  phase1_ns=18640.2  exact_ns=15754.5
+  T=32548 (2 edges)  q=0  mean_residual=0  phase1_ns=18218.7  exact_ns=15141.5
+  T=48822 (3 edges)  q=0  mean_residual=0  phase1_ns=18410.9  exact_ns=15305
+  T=65096 (4 edges)  q=0  mean_residual=0  phase1_ns=18992.6  exact_ns=15821.9
+  T=130192 (8 edges)  q=0  mean_residual=0  phase1_ns=18932.5  exact_ns=15781.9
+generating d=15 p=0.003 (500 shots)
+  T=3948 (0.25 edges)  q=1  mean_residual=151.586  phase1_ns=46077.2  exact_ns=60488
+  T=7896 (0.5 edges)  q=1  mean_residual=37.07  phase1_ns=46336.3  exact_ns=59528.3
+  T=11844 (0.75 edges)  q=0.982  mean_residual=6.062  phase1_ns=59215.5  exact_ns=59763.3
+  T=15792 (1 edges)  q=0.51  mean_residual=0.942  phase1_ns=61970  exact_ns=58708.9
+  T=19740 (1.25 edges)  q=0.182  mean_residual=0.212  phase1_ns=63110.1  exact_ns=58268.5
+  T=23688 (1.5 edges)  q=0.064  mean_residual=0.068  phase1_ns=64209.4  exact_ns=58303.2
+  T=31584 (2 edges)  q=0.01  mean_residual=0.01  phase1_ns=64406.9  exact_ns=57035.5
+  T=47376 (3 edges)  q=0  mean_residual=0  phase1_ns=64613.9  exact_ns=57200.5
+  T=63168 (4 edges)  q=0  mean_residual=0  phase1_ns=64925.3  exact_ns=57413.3
+  T=126336 (8 edges)  q=0  mean_residual=0  phase1_ns=64939.7  exact_ns=57585.1
+generating d=15 p=0.005 (500 shots)
+  T=3880 (0.25 edges)  q=1  mean_residual=243.158  phase1_ns=76195.2  exact_ns=123716
+  T=7760 (0.5 edges)  q=1  mean_residual=83.202  phase1_ns=79364.8  exact_ns=121429
+  T=11640 (0.75 edges)  q=1  mean_residual=12.428  phase1_ns=106862  exact_ns=121269
+  T=15522 (1 edges)  q=0.814  mean_residual=2.396  phase1_ns=116025  exact_ns=120312
+  T=19402 (1.25 edges)  q=0.406  mean_residual=0.626  phase1_ns=121396  exact_ns=120358
+  T=23282 (1.5 edges)  q=0.174  mean_residual=0.208  phase1_ns=124140  exact_ns=119871
+  T=31044 (2 edges)  q=0.028  mean_residual=0.028  phase1_ns=127454  exact_ns=119880
+  T=46566 (3 edges)  q=0  mean_residual=0  phase1_ns=128705  exact_ns=120100
+  T=62088 (4 edges)  q=0  mean_residual=0  phase1_ns=128662  exact_ns=121049
+  T=124176 (8 edges)  q=0  mean_residual=0  phase1_ns=128007  exact_ns=120343
+generating d=17 p=0.001 (500 shots)
+  T=4068 (0.25 edges)  q=1  mean_residual=76.006  phase1_ns=26316.5  exact_ns=27906.4
+  T=8136 (0.5 edges)  q=1  mean_residual=25.214  phase1_ns=25572.9  exact_ns=26936.1
+  T=12204 (0.75 edges)  q=0.842  mean_residual=2.11  phase1_ns=28034  exact_ns=26808.7
+  T=16274 (1 edges)  q=0.094  mean_residual=0.132  phase1_ns=29031.2  exact_ns=25979.8
+  T=20342 (1.25 edges)  q=0.024  mean_residual=0.026  phase1_ns=29045.4  exact_ns=26103.1
+  T=24410 (1.5 edges)  q=0.008  mean_residual=0.008  phase1_ns=29788.1  exact_ns=26640.5
+  T=32548 (2 edges)  q=0  mean_residual=0  phase1_ns=29753.8  exact_ns=25764
+  T=48822 (3 edges)  q=0  mean_residual=0  phase1_ns=29444.4  exact_ns=25749.8
+  T=65096 (4 edges)  q=0  mean_residual=0  phase1_ns=29859.7  exact_ns=25931.8
+  T=130192 (8 edges)  q=0  mean_residual=0  phase1_ns=30386.4  exact_ns=26831.3
+generating d=17 p=0.003 (500 shots)
+  T=3948 (0.25 edges)  q=1  mean_residual=221.656  phase1_ns=82749.3  exact_ns=105485
+  T=7896 (0.5 edges)  q=1  mean_residual=53.116  phase1_ns=80552.2  exact_ns=102825
+  T=11844 (0.75 edges)  q=0.998  mean_residual=8.53  phase1_ns=98596.4  exact_ns=101958
+  T=15792 (1 edges)  q=0.56  mean_residual=1.22  phase1_ns=103386  exact_ns=101035
+  T=19740 (1.25 edges)  q=0.21  mean_residual=0.266  phase1_ns=106114  exact_ns=102497
+  T=23688 (1.5 edges)  q=0.084  mean_residual=0.09  phase1_ns=108106  exact_ns=101751
+  T=31584 (2 edges)  q=0.01  mean_residual=0.01  phase1_ns=107245  exact_ns=99385
+  T=47376 (3 edges)  q=0  mean_residual=0  phase1_ns=108370  exact_ns=100184
+  T=63168 (4 edges)  q=0  mean_residual=0  phase1_ns=107609  exact_ns=99583.6
+  T=126336 (8 edges)  q=0  mean_residual=0  phase1_ns=107231  exact_ns=99444.8
+generating d=17 p=0.005 (500 shots)
+  T=3880 (0.25 edges)  q=1  mean_residual=356.968  phase1_ns=135160  exact_ns=219202
+  T=7760 (0.5 edges)  q=1  mean_residual=119.776  phase1_ns=138460  exact_ns=219466
+  T=11640 (0.75 edges)  q=1  mean_residual=18.272  phase1_ns=184252  exact_ns=222157
+  T=15522 (1 edges)  q=0.916  mean_residual=3.554  phase1_ns=201342  exact_ns=224520
+  T=19402 (1.25 edges)  q=0.524  mean_residual=0.886  phase1_ns=204969  exact_ns=218040
+  T=23282 (1.5 edges)  q=0.228  mean_residual=0.288  phase1_ns=210322  exact_ns=217936
+  T=31044 (2 edges)  q=0.02  mean_residual=0.024  phase1_ns=215250  exact_ns=217839
+  T=46566 (3 edges)  q=0  mean_residual=0  phase1_ns=215990  exact_ns=218484
+  T=62088 (4 edges)  q=0  mean_residual=0  phase1_ns=216446  exact_ns=218583
+  T=124176 (8 edges)  q=0  mean_residual=0  phase1_ns=216048  exact_ns=218696
+generating d=19 p=0.001 (500 shots)
+  T=4068 (0.25 edges)  q=1  mean_residual=107.664  phase1_ns=40502  exact_ns=43437.6
+  T=8136 (0.5 edges)  q=1  mean_residual=35.692  phase1_ns=43590  exact_ns=45863.3
+  T=12204 (0.75 edges)  q=0.912  mean_residual=2.672  phase1_ns=44480.9  exact_ns=43212.4
+  T=16274 (1 edges)  q=0.112  mean_residual=0.166  phase1_ns=49484.4  exact_ns=46103
+  T=20342 (1.25 edges)  q=0.02  mean_residual=0.022  phase1_ns=46291.4  exact_ns=42229.7
+  T=24410 (1.5 edges)  q=0.012  mean_residual=0.012  phase1_ns=74724.5  exact_ns=73537.4
+  T=32548 (2 edges)  q=0  mean_residual=0  phase1_ns=76061.2  exact_ns=73448
+  T=48822 (3 edges)  q=0  mean_residual=0  phase1_ns=73596.3  exact_ns=70520.7
+  T=65096 (4 edges)  q=0  mean_residual=0  phase1_ns=72107.3  exact_ns=69855.8
+  T=130192 (8 edges)  q=0  mean_residual=0  phase1_ns=76809.2  exact_ns=71630.1
+generating d=19 p=0.003 (500 shots)
+  T=3948 (0.25 edges)  q=1  mean_residual=312.034  phase1_ns=217485  exact_ns=292386
+  T=7896 (0.5 edges)  q=1  mean_residual=73.718  phase1_ns=189302  exact_ns=248223
+  T=11844 (0.75 edges)  q=1  mean_residual=11.764  phase1_ns=223451  exact_ns=250326
+  T=15792 (1 edges)  q=0.682  mean_residual=1.768  phase1_ns=231835  exact_ns=252127
+  T=19740 (1.25 edges)  q=0.246  mean_residual=0.334  phase1_ns=236266  exact_ns=251695
+  T=23688 (1.5 edges)  q=0.102  mean_residual=0.12  phase1_ns=243312  exact_ns=255183
+  T=31584 (2 edges)  q=0.004  mean_residual=0.004  phase1_ns=248525  exact_ns=261151
+  T=47376 (3 edges)  q=0  mean_residual=0  phase1_ns=213957  exact_ns=220351
+  T=63168 (4 edges)  q=0  mean_residual=0  phase1_ns=212573  exact_ns=219827
+  T=126336 (8 edges)  q=0  mean_residual=0  phase1_ns=237684  exact_ns=244025
+generating d=19 p=0.005 (500 shots)
+  T=3880 (0.25 edges)  q=1  mean_residual=504.058  phase1_ns=258563  exact_ns=419289
+  T=7760 (0.5 edges)  q=1  mean_residual=169.738  phase1_ns=259883  exact_ns=415325
+  T=11640 (0.75 edges)  q=1  mean_residual=25.628  phase1_ns=328343  exact_ns=420351
+  T=15522 (1 edges)  q=0.97  mean_residual=5.128  phase1_ns=353802  exact_ns=418821
+  T=19402 (1.25 edges)  q=0.65  mean_residual=1.23  phase1_ns=321341  exact_ns=364787
+  T=23282 (1.5 edges)  q=0.302  mean_residual=0.414  phase1_ns=331386  exact_ns=368401
+  T=31044 (2 edges)  q=0.044  mean_residual=0.044  phase1_ns=336777  exact_ns=367974
+  T=46566 (3 edges)  q=0.002  mean_residual=0.002  phase1_ns=338309  exact_ns=367671
+  T=62088 (4 edges)  q=0  mean_residual=0  phase1_ns=341937  exact_ns=372139
+  T=124176 (8 edges)  q=0  mean_residual=0  phase1_ns=337552  exact_ns=367785
+generating d=21 p=0.001 (500 shots)
+  T=4068 (0.25 edges)  q=1  mean_residual=145.39  phase1_ns=63924.5  exact_ns=68854.6
+  T=8136 (0.5 edges)  q=1  mean_residual=47.474  phase1_ns=63245  exact_ns=68273.2
+  T=12204 (0.75 edges)  q=0.956  mean_residual=3.564  phase1_ns=67922.2  exact_ns=67355.2
+  T=16274 (1 edges)  q=0.174  mean_residual=0.294  phase1_ns=71621.6  exact_ns=67589.9
+  T=20342 (1.25 edges)  q=0.028  mean_residual=0.03  phase1_ns=71346.6  exact_ns=67176
+  T=24410 (1.5 edges)  q=0.02  mean_residual=0.02  phase1_ns=71932.7  exact_ns=67354.1
+  T=32548 (2 edges)  q=0  mean_residual=0  phase1_ns=71321.4  exact_ns=66089
+  T=48822 (3 edges)  q=0  mean_residual=0  phase1_ns=72027.4  exact_ns=67745.9
+  T=65096 (4 edges)  q=0  mean_residual=0  phase1_ns=71530.6  exact_ns=65972.8
+  T=130192 (8 edges)  q=0  mean_residual=0  phase1_ns=72348.5  exact_ns=67101.9
+generating d=21 p=0.003 (500 shots)
+  T=3948 (0.25 edges)  q=1  mean_residual=422.672  phase1_ns=214858  exact_ns=264839
+  T=7896 (0.5 edges)  q=1  mean_residual=99.308  phase1_ns=206486  exact_ns=261665
+  T=11844 (0.75 edges)  q=1  mean_residual=14.754  phase1_ns=238460  exact_ns=262539
+  T=15792 (1 edges)  q=0.81  mean_residual=2.334  phase1_ns=247638  exact_ns=262348
+  T=19740 (1.25 edges)  q=0.324  mean_residual=0.46  phase1_ns=346261  exact_ns=366044
+  T=23688 (1.5 edges)  q=0.128  mean_residual=0.14  phase1_ns=278822  exact_ns=284687
+  T=31584 (2 edges)  q=0.006  mean_residual=0.006  phase1_ns=259008  exact_ns=266941
+  T=47376 (3 edges)  q=0  mean_residual=0  phase1_ns=259104  exact_ns=266236
+  T=63168 (4 edges)  q=0  mean_residual=0  phase1_ns=255967  exact_ns=264146
+  T=126336 (8 edges)  q=0  mean_residual=0  phase1_ns=255420  exact_ns=262750
+generating d=21 p=0.005 (500 shots)
+  T=3880 (0.25 edges)  q=1  mean_residual=685.012  phase1_ns=347288  exact_ns=563618
+  T=7760 (0.5 edges)  q=1  mean_residual=228.984  phase1_ns=346236  exact_ns=564703
+  T=11640 (0.75 edges)  q=1  mean_residual=33.824  phase1_ns=441870  exact_ns=563013
+  T=15522 (1 edges)  q=0.99  mean_residual=7.086  phase1_ns=481628  exact_ns=569823
+  T=19402 (1.25 edges)  q=0.748  mean_residual=1.764  phase1_ns=498530  exact_ns=569971
+  T=23282 (1.5 edges)  q=0.416  mean_residual=0.608  phase1_ns=511176  exact_ns=568879
+  T=31044 (2 edges)  q=0.064  mean_residual=0.066  phase1_ns=532488  exact_ns=578756
+  T=46566 (3 edges)  q=0.002  mean_residual=0.002  phase1_ns=525040  exact_ns=568681
+  T=62088 (4 edges)  q=0  mean_residual=0  phase1_ns=526445  exact_ns=573119
+  T=124176 (8 edges)  q=0  mean_residual=0  phase1_ns=526553  exact_ns=570877
+wrote benchmarks/two_phase/results/m1_exit_artifact.csv

@@ -55,6 +55,14 @@ struct GraphFlooder {
     /// The sum of the edge weights of all edges with negative edge weights.
     pm::total_weight_int negative_weight_sum;
 
+    /// Truncation horizon `T`, in cumulative time units (M1).
+    ///
+    /// Node/grow events that would occur strictly after this time are never inserted into the
+    /// queue, and the timeline loop stops rather than advancing past it. The sentinel
+    /// `pm::NO_HORIZON` disables truncation entirely and is the only value the stock decode path
+    /// ever sees; it is set (and restored) by `process_timeline_until_horizon`.
+    cumulative_time_int horizon{NO_HORIZON};
+
     GraphFlooder();
     explicit GraphFlooder(MatchingGraph graph);
     GraphFlooder(GraphFlooder&&) noexcept;

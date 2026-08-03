@@ -33,7 +33,8 @@ GraphFlooder::GraphFlooder(GraphFlooder &&flooder) noexcept
       negative_weight_detection_events(std::move(flooder.negative_weight_detection_events)),
       negative_weight_observables(std::move(flooder.negative_weight_observables)),
       negative_weight_obs_mask(flooder.negative_weight_obs_mask),
-      negative_weight_sum(flooder.negative_weight_sum) {
+      negative_weight_sum(flooder.negative_weight_sum),
+      horizon(flooder.horizon) {
 }
 
 void GraphFlooder::do_region_created_at_empty_detector_node(GraphFillRegion &region, DetectorNode &detector_node) {
@@ -131,12 +132,16 @@ void GraphFlooder::reschedule_events_at_detector_node(DetectorNode &detector_nod
     if (x.first == SIZE_MAX) {
         detector_node.node_event_tracker.set_no_desired_event();
     } else {
+        // GATED: this is a growth/collision event. If it lies past the horizon it will never be
+        // reached within the truncated timeline, so it must not enter the queue at all.
         detector_node.node_event_tracker.set_desired_event(
             {
                 &detector_node,
                 cyclic_time_int{x.second},
             },
-            queue);
+            queue,
+            x.second,
+            horizon);
     }
 }
 
@@ -147,6 +152,8 @@ void GraphFlooder::schedule_tentative_shrink_event(GraphFillRegion &region) {
     } else {
         t = region.shell_area.back()->local_radius().time_of_x_intercept_for_shrinking();
     }
+    // EXEMPT: shrink events are never gated. A shrinking region's shell-area bookkeeping has to be
+    // able to complete, or the region state is inconsistent at harvest time.
     region.shrink_event_tracker.set_desired_event(
         {
             &region,
@@ -325,12 +332,17 @@ MwpmEvent GraphFlooder::do_look_at_node_event(DetectorNode &node) {
         // Need to revisit this node immediately after the mwpm event is handled. There may be an event to handle
         // along another edge, or even along the same edge at a later time (e.g. if this event isn't the *first* event
         // for the neighbor along the current edge when the neighbor is being rescheduled).
+        // GATED: a node event, like every other. The gate never actually fires here, because the
+        // event is scheduled for the present and the present is never past the horizon; the
+        // argument is passed anyway so that no node-event scheduling site is un-gated.
         node.node_event_tracker.set_desired_event(
             {
                 &node,
                 cyclic_time_int{queue.cur_time},
             },
-            queue);
+            queue,
+            queue.cur_time,
+            horizon);
 
         if (node.neighbors[next.first] == nullptr) {
             return do_region_hit_boundary_interaction(node);
@@ -339,12 +351,16 @@ MwpmEvent GraphFlooder::do_look_at_node_event(DetectorNode &node) {
         return do_neighbor_interaction(node, next.first, neighbor);
     } else if (next.first != SIZE_MAX) {
         // Need to revisit this node at a later time.
+        // GATED: a growth/collision event past the horizon is unreachable in the truncated
+        // timeline, so it must not enter the queue at all.
         node.node_event_tracker.set_desired_event(
             {
                 &node,
                 cyclic_time_int{next.second},
             },
-            queue);
+            queue,
+            next.second,
+            horizon);
     }
 
     return MwpmEvent::no_event();
@@ -367,6 +383,14 @@ MwpmEvent GraphFlooder::run_until_next_mwpm_notification() {
     while (true) {
         FloodCheckEvent tentative_event = dequeue_valid();
         if (tentative_event.tentative_event_type == NO_FLOOD_CHECK_EVENT) {
+            return MwpmEvent::no_event();
+        }
+        // Truncation stop (M1). Dequeueing advances `queue.cur_time` to the event's time. Node
+        // events past the horizon were never enqueued, but shrink events are exempt from the gate,
+        // so a surviving shrink event is the one thing that can carry the timeline past `T`.
+        // Report "nothing further happens" instead of processing it. With the sentinel horizon
+        // this comparison is never true and the stock path is unchanged.
+        if (queue.cur_time > horizon) {
             return MwpmEvent::no_event();
         }
         MwpmEvent notification = process_tentative_event_returning_mwpm_event(tentative_event);

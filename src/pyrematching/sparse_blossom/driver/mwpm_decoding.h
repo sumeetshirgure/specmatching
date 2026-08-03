@@ -52,6 +52,15 @@ Mwpm detector_error_model_to_mwpm(
     bool ensure_search_flooder_included = false,
     bool enable_correlations = false);
 
+/// Seeds a fresh timeline: checks the queue is empty, resets `cur_time` to 0, and creates the
+/// detection events for `detection_events`, including the marking/unmarking dance that cancels
+/// detection events implied by negative weight edges.
+///
+/// Factored out of `process_timeline_until_completion` so that the truncated timeline
+/// (`pm::two_phase::process_timeline_until_horizon`) reuses this preamble verbatim rather than
+/// copying it.
+void begin_timeline(pm::Mwpm& mwpm, const std::vector<uint64_t>& detection_events);
+
 MatchingResult decode_detection_events_for_up_to_64_observables(
     pm::Mwpm& mwpm, const std::vector<uint64_t>& detection_events, bool edge_correlations);
 
