@@ -1,0 +1,24 @@
+  d=11 rounds=11 p=0.001 T=2 done (1000000 shots, 85 escalated)
+  d=13 rounds=13 p=0.001 T=2 done (1000000 shots, 112 escalated)
+
+=== escalation rate (always with its shot count) ===
+   d  rounds        p     T      shots  escalated            q     resolution
+  11      11    0.001     2    1000000         85    8.500e-05      1.000e-06
+  13      13    0.001     2    1000000        112    1.120e-04      1.000e-06
+
+=== escalation cost (ns) ===
+   d        p     T    C_phase1  C_escalation  stock_on_esc  mean_stock   amortised     penalty
+  11    0.001     2     18523.5       32050.1       31945.2      6186.7     18526.2     0.0147%
+  13    0.001     2     35100.1       41575.2       41479.2     13599.8     35104.8     0.0133%
+
+=== end-to-end latency with escalation live (ns) ===
+   d        p     T       mean        p50        p99       p999      p9999        max       contam
+  11    0.001     2    18602.4    17654.0    42571.0    59913.0    86394.0   209675.0      0.1826%
+  13    0.001     2    35188.9    33083.0    76865.0   113314.0   161454.0   320454.0      0.3384%
+
+=== streaming budget (round time 1000 ns) ===
+   d        p     T   shot_budget     worst_esc     worst_any      overrun     buffer
+  11    0.001     2       11000.0      209675.0      209675.0     198675.0         19
+  13    0.001     2       13000.0      320454.0      320454.0     307454.0         24
+
+wrote benchmarks/two_phase/results/m3_operating_point.csv

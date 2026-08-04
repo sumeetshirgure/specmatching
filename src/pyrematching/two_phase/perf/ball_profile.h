@@ -36,6 +36,10 @@ struct BallProfile {
     /// `process_timeline_until_horizon` on `H`.
     long long blossom_on_h_ns{0};
     long long harvest_ns{0};
+    /// §M3.4: tearing down an escalating shot's `H` instance without harvesting it. Non-zero only
+    /// on shots that truncate, and included in `harvest_ns`'s window, which is why it is reported
+    /// beside it rather than added to it.
+    long long abandon_ns{0};
     /// Measured end to end, deliberately *not* the sum of the parts: the gap is unattributed cost.
     long long total_ns{0};
     /// M1's Phase 1 + harvest on `G` for the same shot. Benchmark / verification mode only.
@@ -136,6 +140,7 @@ struct BallAggregateStats {
     long long sum_mwpm_build_ns{0};
     long long sum_blossom_on_h_ns{0};
     long long sum_harvest_ns{0};
+    long long sum_abandon_ns{0};
     long long sum_total_ns{0};
     long long sum_g_reference_ns{0};
 
@@ -219,6 +224,7 @@ struct BallAggregateStats {
         sum_mwpm_build_ns += profile.mwpm_build_ns;
         sum_blossom_on_h_ns += profile.blossom_on_h_ns;
         sum_harvest_ns += profile.harvest_ns;
+        sum_abandon_ns += profile.abandon_ns;
         sum_total_ns += profile.total_ns;
         sum_g_reference_ns += profile.g_reference_ns;
 

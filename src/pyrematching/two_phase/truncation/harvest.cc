@@ -153,8 +153,8 @@ void HarvestResult::clear() {
 }
 
 bool HarvestResult::identical_output_to(const HarvestResult& other) const {
-    return residual == other.residual && residual_dual_sum == other.residual_dual_sum &&
-           committed == other.committed && committed_pairs_frozen == other.committed_pairs_frozen &&
+    return residual == other.residual && residual_dual_sum == other.residual_dual_sum && committed == other.committed &&
+           committed_pairs_frozen == other.committed_pairs_frozen &&
            committed_pairs_tree == other.committed_pairs_tree &&
            committed_pairs_blossom_cycle == other.committed_pairs_blossom_cycle &&
            committed_boundary == other.committed_boundary && num_trees == other.num_trees &&
@@ -183,8 +183,7 @@ std::string HarvestResult::describe_difference(const HarvestResult& other) const
     compare_scalar("committed.weight", (long long)committed.weight, (long long)other.committed.weight);
     compare_scalar("committed_pairs_frozen", committed_pairs_frozen, other.committed_pairs_frozen);
     compare_scalar("committed_pairs_tree", committed_pairs_tree, other.committed_pairs_tree);
-    compare_scalar(
-        "committed_pairs_blossom_cycle", committed_pairs_blossom_cycle, other.committed_pairs_blossom_cycle);
+    compare_scalar("committed_pairs_blossom_cycle", committed_pairs_blossom_cycle, other.committed_pairs_blossom_cycle);
     compare_scalar("committed_boundary", committed_boundary, other.committed_boundary);
     compare_scalar("num_trees", num_trees, other.num_trees);
     compare_scalar("largest_tree_size", largest_tree_size, other.largest_tree_size);
@@ -233,6 +232,7 @@ HarvestResult Harvester::harvest_impl(
     if (use_legacy_enumeration)
         return harvest_impl_legacy(mwpm, detection_events, extract_matched, extract_exposed);
 
+    counters.full_harvests++;
     HarvestResult result;
     scratch.clear();
 
@@ -250,6 +250,7 @@ HarvestResult Harvester::harvest_impl(
     // ---- Phase A: enumerate every live region, and classify the top-level ones.
     int frozen_half_pairs = 0;
     for (pm::GraphFillRegion* region : flooder.region_arena.live) {
+        counters.regions_visited++;
         // Associative, and exact because the duals are integers, so the order this list happens to
         // be in cannot move the answer (§M2.9.3).
         pm::total_weight_int dual = region->radius.get_distance_at_time(time);
@@ -309,6 +310,7 @@ HarvestResult Harvester::harvest_impl(
     // depending on that. The copy is one memcpy of a vector that is a few tens of pointers long.
     scratch.live_nodes.assign(mwpm.node_arena.live.begin(), mwpm.node_arena.live.end());
     for (pm::AltTreeNode* node : scratch.live_nodes) {
+        counters.tree_nodes_visited++;
         if (node->inner_region == nullptr) {
             // Root. Its outer region is the residual; deferred so that every pair is committed and
             // frozen before any extraction starts touching detector nodes.
@@ -378,6 +380,7 @@ HarvestResult Harvester::harvest_impl(
         exposed->alt_tree_node = nullptr;
         mwpm.node_arena.del(root);
 
+        counters.base_descents++;
         pm::DetectorNode* base_node = find_exposed_base_node(*exposed, time);
         assert(base_node != nullptr);
         pm::total_weight_int base_dual_sum = nested_dual_sum(*base_node, time);
@@ -396,8 +399,10 @@ HarvestResult Harvester::harvest_impl(
     }
 
     // ---- Phase C: extract everything that is matched, once per pair, from its representative.
-    for (pm::GraphFillRegion* region : scratch.top_regions)
+    for (pm::GraphFillRegion* region : scratch.top_regions) {
+        counters.extractions++;
         extract_matched(region);
+    }
 
     if (collect_diagnostics) {
         result.shatter_ns = stage.elapsed_ns();
@@ -436,6 +441,92 @@ HarvestResult Harvester::harvest_impl(
         result.harvest_dependent_depth = 1 + std::max(std::max(reduce_depth, compact_depth), chase_depth);
     }
 
+    reset_for_next_shot(mwpm);
+    return result;
+}
+
+/// §M3.4's production path: phase A and phase C of the harvest above, with phases B and B2 gone.
+///
+/// The two dropped phases are the tree commits and M1.4's base descent, and both do work only when
+/// an alternating tree survives — which is exactly the condition that escalates the shot and throws
+/// their output away (§M3.1). On a `COMPLETE` timeline they are not skipped optimistically; there
+/// is provably nothing for them to do, and the `assert` below says so.
+///
+/// What this does *not* drop is the dual sum. It is a flat reduction over the same live-region walk
+/// extraction already performs — one integer read and one add per region — and the §M4.2 per-shot
+/// certificate is the cheap independent check on the primal that the design keeps precisely because
+/// the escalation path has removed every other one.
+template <typename ExtractMatched>
+HarvestResult Harvester::extract_only_impl(pm::Mwpm& mwpm, const ExtractMatched& extract_matched) {
+    counters.extract_only_harvests++;
+    HarvestResult result;
+    scratch.clear();
+
+    auto& flooder = mwpm.flooder;
+    const pm::cumulative_time_int time = flooder.queue.cur_time;
+
+    Stopwatch stage;
+    if (collect_diagnostics)
+        stage.start();
+
+    int frozen_half_pairs = 0;
+    for (pm::GraphFillRegion* region : flooder.region_arena.live) {
+        counters.regions_visited++;
+        pm::total_weight_int dual = region->radius.get_distance_at_time(time);
+        result.dual_sum_at_truncation += dual;
+        result.max_region_dual = std::max(result.max_region_dual, dual);
+
+        if (region->blossom_parent != nullptr)
+            continue;  // Nested inside a blossom; its top-level ancestor speaks for it.
+
+        // The precondition, restated where it would be violated. A top-level region in a tree on a
+        // path that has decided no tree survives means the O(1) status branch and the primal state
+        // disagree, which is the failure §M3.3 X9 exists to catch.
+        assert(region->alt_tree_node == nullptr && "extract-only path reached a region still in an alternating tree");
+
+        if (collect_diagnostics && !region->blossom_children.empty()) {
+            int depth = 0;
+            int members = 0;
+            measure_blossom(*region, depth, members);
+            result.max_blossom_nesting_depth = std::max(result.max_blossom_nesting_depth, depth);
+            result.max_blossom_members = std::max(result.max_blossom_members, members);
+            result.matched_blossom_shatters++;
+        }
+
+        if (region->match.region != nullptr) {
+            frozen_half_pairs++;
+            if (is_extraction_representative(*region))
+                scratch.top_regions.push_back(region);
+        } else {
+            assert(region->match.edge.loc_from != nullptr && "top-level region is neither matched nor in a tree");
+            result.committed_boundary++;
+            scratch.top_regions.push_back(region);
+        }
+    }
+    assert(frozen_half_pairs % 2 == 0 && "a frozen match should contribute both of its endpoints");
+    result.committed_pairs_frozen = frozen_half_pairs / 2;
+
+    if (collect_diagnostics) {
+        result.enumerate_ns = stage.elapsed_ns();
+        stage.start();
+    }
+
+    for (pm::GraphFillRegion* region : scratch.top_regions) {
+        counters.extractions++;
+        extract_matched(region);
+    }
+
+    if (collect_diagnostics) {
+        result.shatter_ns = stage.elapsed_ns();
+        // Enumeration is one step; the committed observable and weight are an associative reduction
+        // over the commits; the only chase left is the shatter of a matched blossom, one level per
+        // level of nesting. There is no base descent and no residual compaction on this path, which
+        // is the whole of what §M3.4 removes from the depth.
+        size_t commits = (size_t)result.committed_pairs_frozen + (size_t)result.committed_boundary;
+        result.harvest_dependent_depth = 1 + std::max(reduction_depth(commits), result.max_blossom_nesting_depth);
+    }
+
+    assert(result.residual.empty() && result.num_trees == 0);
     reset_for_next_shot(mwpm);
     return result;
 }
@@ -583,6 +674,14 @@ HarvestResult Harvester::harvest_impl_legacy(
     return result;
 }
 
+bool any_alternating_tree_survives_by_sweep(const pm::Mwpm& mwpm) {
+    for (const pm::GraphFillRegion* region : mwpm.flooder.region_arena.live) {
+        if (region->alt_tree_node != nullptr)
+            return true;
+    }
+    return false;
+}
+
 void reset_for_next_shot(pm::Mwpm& mwpm) {
     // Every region and alternating tree node has already been handed back to its arena by the
     // extraction above, so — unlike `Mwpm::reset` — the arenas are left alone. Destroying them
@@ -666,6 +765,28 @@ HarvestResult Harvester::harvest_to_match_edges(
             return shatter_exposed_blossom_and_extract_match_edges(
                 mwpm, exposed, mwpm.flooder.queue.cur_time, exposed_defect_out, match_edges);
         });
+}
+
+HarvestResult Harvester::extract_only_to_obs(pm::Mwpm& mwpm, const std::vector<uint64_t>& detection_events) {
+    (void)detection_events;
+    // Debug invariant 13a's second half, checked where the decision is acted on rather than only
+    // where it is taken: the O(1) branch and the full sweep must agree, on every shot (§M3.3 X9).
+    assert(!any_alternating_tree_survives(mwpm) && !any_alternating_tree_survives_by_sweep(mwpm));
+    pm::MatchingResult committed;
+    HarvestResult result = extract_only_impl(mwpm, [&](pm::GraphFillRegion* region) {
+        committed += mwpm.shatter_blossom_and_extract_matches(region);
+    });
+    result.committed = committed;
+    return result;
+}
+
+HarvestResult Harvester::extract_only_to_match_edges(
+    pm::Mwpm& mwpm, const std::vector<uint64_t>& detection_events, std::vector<pm::CompressedEdge>& match_edges) {
+    (void)detection_events;
+    assert(!any_alternating_tree_survives(mwpm) && !any_alternating_tree_survives_by_sweep(mwpm));
+    return extract_only_impl(mwpm, [&](pm::GraphFillRegion* region) {
+        mwpm.shatter_blossom_and_extract_match_edges(region, match_edges);
+    });
 }
 
 HarvestResult harvest_to_obs(pm::Mwpm& mwpm, const std::vector<uint64_t>& detection_events) {

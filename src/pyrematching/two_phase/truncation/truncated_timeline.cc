@@ -15,10 +15,12 @@
 #include "pyrematching/two_phase/truncation/truncated_timeline.h"
 
 #include <algorithm>
+#include <cassert>
 
 #include "pyrematching/sparse_blossom/driver/mwpm_decoding.h"
 #include "pyrematching/sparse_blossom/flooder/graph.h"
 #include "pyrematching/sparse_blossom/flooder/graph_fill_region.h"
+#include "pyrematching/two_phase/truncation/harvest.h"
 
 namespace pm {
 namespace two_phase {
@@ -122,7 +124,15 @@ TimelineStatus run_timeline(
 
     // Alternating tree nodes are allocated from `node_arena` and returned to it when a tree is
     // resolved, so "some node is still checked out" is exactly "some alternating tree survives".
-    bool trees_survive = mwpm.node_arena.allocated.size() != mwpm.node_arena.available.size();
+    //
+    // §M3.4 requires this decision to be O(1), because it is the branch that decides whether to run
+    // the harvest at all and an O(n) sweep to skip an O(n) pass buys nothing. It is: §M2.9.1's
+    // arena liveness vector answers it with one `empty()`. Debug builds cross-check the same
+    // question asked two slower ways — the free-list comparison this used to read, and a full sweep
+    // over live regions looking for an `alt_tree_node` (§M3.3 X9).
+    bool trees_survive = any_alternating_tree_survives(mwpm);
+    assert(trees_survive == (mwpm.node_arena.allocated.size() != mwpm.node_arena.available.size()));
+    assert(trees_survive == any_alternating_tree_survives_by_sweep(mwpm));
     if (!trees_survive)
         return TimelineStatus::COMPLETE;
 

@@ -81,6 +81,18 @@ void decode_detection_events(
 /// matched to each other via paths.
 void decode_detection_events_to_match_edges(pm::Mwpm& mwpm, const std::vector<uint64_t>& detection_events);
 
+/// Turns `mwpm.flooder.match_edges` — matched detection-event *pairs* — into the *edges* of a
+/// correction, appended to `edges` as detector id pairs with `-1` for the boundary. Flips each
+/// edge along the search graph's shortest path between the matched pair, adds the graph's own
+/// negative-weight edges, and drops any edge flipped an even number of times.
+///
+/// Factored out of `decode_detection_events_to_edges` (pyrematching M5) so that the two-phase
+/// driver's oracle front end can reuse it verbatim on a *truncated* timeline, where the match
+/// edges come from `pm::two_phase::harvest_to_match_edges` rather than from a completed decode.
+/// Copying it instead would have put the cancellation pass in two places, and the cancellation is
+/// the part with no independent check on it.
+void expand_match_edges_to_edges(pm::Mwpm& mwpm, std::vector<int64_t>& edges);
+
 /// Decode detection events using a Mwpm object and vector of detection event indices.
 /// Returns the edges in the matching: these are pairs of *detectors* forming *edges* in the
 /// matching solution (rather than pairs of detection *events* matched via *paths* as returned

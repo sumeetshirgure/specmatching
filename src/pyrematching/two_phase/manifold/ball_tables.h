@@ -102,7 +102,7 @@ struct BallTables {
     std::vector<uint32_t> ball_mask_ids;
 
     /// The canonical path of entry `e` as the node sequence `v = n_0, n_1, ..., n_k = target`; an
-    /// *edge* of the path is a consecutive pair. Populated only when `params.need_edge_lift`.
+    /// *edge* of the path is a consecutive pair. Populated only when `params.store_paths`.
     std::vector<uint64_t> ball_path_offsets;
     std::vector<uint32_t> ball_path_nodes;
 
@@ -114,7 +114,7 @@ struct BallTables {
     std::vector<uint64_t> bcost_mask_offsets;
     std::vector<uint32_t> bcost_mask_ids;
     /// Node sequence from `v` to the node carrying the boundary half-edge. Only when
-    /// `params.need_edge_lift`.
+    /// `params.store_paths`.
     std::vector<uint64_t> bcost_path_offsets;
     std::vector<uint32_t> bcost_path_nodes;
 

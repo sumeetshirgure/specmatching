@@ -380,6 +380,12 @@ int main(int argc, char** argv) {
         }
     }
 
+    // The column names are the ones the landed `results/m1_exit_artifact.csv` carries and are left
+    // alone deliberately, even though §M3 renamed two of the summary fields behind them
+    // (`c_phase2` -> `c_escalation`, `fallback_cost_ratio` -> `escalation_cost_ratio`). Both are
+    // identically zero and unchanged in value on this harness — M1 has no second phase to run — so
+    // renaming the columns would desynchronise the generator from its own recorded artifact for no
+    // information gained.
     std::ostringstream csv;
     csv << "distance,error_rate,horizon_multiple,horizon,shots,mean_defects,"
            "q_fallback_rate,mean_residual_size,max_residual_size,mean_residual_density,"
@@ -401,8 +407,8 @@ int main(int argc, char** argv) {
             << (double)stats.sum_committed_pairs_tree / shots << "," << (double)stats.sum_committed_boundary / shots
             << "," << stats.max_largest_tree_size << "," << summary.exposed_root_blossom_rate << ","
             << (double)stats.sum_exposed_root_blossoms / shots << "," << (double)stats.sum_phase1_ns / shots << ","
-            << (double)stats.sum_harvest_ns / shots << "," << summary.c_phase1 << "," << summary.c_phase2 << ","
-            << summary.amortised_mean_ns << "," << summary.measured_mean_ns << "," << summary.fallback_cost_ratio << ","
+            << (double)stats.sum_harvest_ns / shots << "," << summary.c_phase1 << "," << summary.c_escalation << ","
+            << summary.amortised_mean_ns << "," << summary.measured_mean_ns << "," << summary.escalation_cost_ratio << ","
             << (double)result.sum_untruncated_pipeline_ns / shots << "," << (double)stats.sum_exact_reference_ns / shots
             << "," << summary.p50_total_ns << "," << summary.p99_total_ns << "," << summary.p999_total_ns << ","
             << percentile(stats.per_shot_exact_ns, 0.99) << "," << summary.speedup_vs_stock << ","

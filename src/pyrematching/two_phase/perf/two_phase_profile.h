@@ -17,6 +17,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cmath>
 #include <cstdint>
 #include <vector>
 
@@ -27,26 +28,35 @@
 #include <x86intrin.h>
 #endif
 
+#if defined(__linux__)
+#include <sys/resource.h>
+#endif
+
 namespace pm {
 namespace two_phase {
 
 /// Monotonic nanosecond clock for the per-shot profile.
 ///
-/// The default backend is `std::chrono::high_resolution_clock`. Building with
-/// `-DPYREMATCHING_USE_RDTSC=ON` switches to a calibrated `rdtsc`, which is cheaper per reading but
-/// only meaningful on an invariant-TSC machine; the calibration happens once, lazily.
+/// The default backend is `std::chrono::steady_clock`, named explicitly rather than through
+/// `high_resolution_clock` — the latter is a *typedef* for `system_clock` on libstdc++, which is
+/// not monotonic and can step backwards under NTP, producing negative or absurd per-shot times in
+/// exactly the tail percentiles this design cares about (§M6.4 timer discipline).
+///
+/// Building with `-DPYREMATCHING_USE_RDTSC=ON` switches to a calibrated `rdtsc`, which is cheaper
+/// per reading but only meaningful on an invariant-TSC machine; the calibration happens once,
+/// lazily.
 struct HiResTimer {
 #if defined(PYREMATCHING_USE_RDTSC)
     static double ns_per_tick() {
         static const double calibrated = [] {
-            auto chrono_start = std::chrono::high_resolution_clock::now();
+            auto chrono_start = std::chrono::steady_clock::now();
             uint64_t tsc_start = __rdtsc();
             // Busy-wait rather than sleep: this runs once, and sleeping would measure the
             // scheduler rather than the clock.
-            while (std::chrono::high_resolution_clock::now() - chrono_start < std::chrono::milliseconds(20)) {
+            while (std::chrono::steady_clock::now() - chrono_start < std::chrono::milliseconds(20)) {
             }
             uint64_t tsc_end = __rdtsc();
-            auto chrono_end = std::chrono::high_resolution_clock::now();
+            auto chrono_end = std::chrono::steady_clock::now();
             auto elapsed_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(chrono_end - chrono_start).count();
             return (double)elapsed_ns / (double)(tsc_end - tsc_start);
         }();
@@ -62,27 +72,66 @@ struct HiResTimer {
         return (long long)((double)(__rdtsc() - start_tick) * ns_per_tick());
     }
 #else
-    std::chrono::high_resolution_clock::time_point start_time{};
+    std::chrono::steady_clock::time_point start_time{};
 
     inline void start() {
-        start_time = std::chrono::high_resolution_clock::now();
+        start_time = std::chrono::steady_clock::now();
     }
     inline long long elapsed_ns() const {
         return (long long)std::chrono::duration_cast<std::chrono::nanoseconds>(
-                   std::chrono::high_resolution_clock::now() - start_time)
+                   std::chrono::steady_clock::now() - start_time)
             .count();
     }
 #endif
 };
 
+/// Was this thread descheduled while the shot was being timed? (§M6.4 timer discipline.)
+///
+/// One preemption defines p999 outright at 2000 shots, so a percentile quoted without this is a
+/// measurement of the scheduler. `RUSAGE_THREAD` is Linux-specific; elsewhere the probe reports
+/// "not contaminated" and `contaminated_shot_rate` reads 0, which the artifact says explicitly
+/// rather than implying the machine was quiet.
+struct PreemptionProbe {
+    long voluntary{0};
+    long involuntary{0};
+    bool supported{false};
+
+    inline void sample() {
+#if defined(__linux__) && defined(RUSAGE_THREAD)
+        struct rusage usage;
+        if (getrusage(RUSAGE_THREAD, &usage) == 0) {
+            voluntary = usage.ru_nvcsw;
+            involuntary = usage.ru_nivcsw;
+            supported = true;
+            return;
+        }
+#endif
+        supported = false;
+    }
+
+    /// True when a context switch happened between `before` and this sample.
+    inline bool switched_since(const PreemptionProbe& before) const {
+        if (!supported || !before.supported)
+            return false;
+        return voluntary != before.voluntary || involuntary != before.involuntary;
+    }
+};
+
 /// Per-shot profile. Filled only when a non-null pointer is passed down the decode path, so the
 /// hot path pays nothing when profiling is off.
 struct TwoPhaseProfile {
+    /// Phase 1 on `H` (or on `G`, in the oracle configuration): everything up to and excluding the
+    /// harvest/extraction. `BallProfile` splits this further.
     long long phase1_ns{0};
+    /// Harvest on the completed path, or the extract-only reduction once §M3.4's bypass is live.
     long long harvest_ns{0};
-    long long inject_ns{0};
-    long long inner_blossom_ns{0};
-    long long lift_ns{0};
+    /// The whole escalation call on an escalating shot; 0 otherwise. Kept strictly apart from the
+    /// Phase-1 stages so the two are never conflated in a mean (§M3.1).
+    long long escalation_ns{0};
+    /// The stock exact decode *inside* that call, timed on its own. §M3.2's cost table estimated
+    /// `stock` as the mean over all shots; the escalation path runs stock on precisely the shots
+    /// that escalate, so this is the exact number and it replaces the estimate.
+    long long stock_ns{0};
     /// Measured end to end, deliberately *not* the sum of the parts: a gap between them is
     /// unattributed cost, and noticing it is the point.
     long long total_ns{0};
@@ -97,8 +146,6 @@ struct TwoPhaseProfile {
     int committed_boundary{0};
     int largest_tree_size{0};
     int exposed_root_blossoms{0};
-    int portal_collisions{0};
-    int inner_detection_events{0};
 
     /// §M2.9.6. Harvest's four stages, and the counts and depths that the critical-path model is
     /// built from. Filled only when `Harvester::collect_diagnostics` is set; see `BallProfile` for
@@ -116,15 +163,19 @@ struct TwoPhaseProfile {
     int solve_dependent_depth{0};
     int solve_events{0};
 
-    /// `Sum_S y_S <= exact optimum`.
+    /// `Sum_S y_S <= exact optimum`. Zero on an escalating shot: the truncated dual is discarded
+    /// along with the rest of Phase 1's partial result, so there is nothing to certify against.
     pm::total_weight_int dual_sum_at_truncation{0};
     pm::total_weight_int weight_out{0};
 
     /// Trees survived at `T`, equivalently the residual is non-empty.
     bool truncated{false};
-    /// Whether Phase 2 ran. Debug-asserted equal to `truncated`.
-    bool phase2_ran{false};
+    /// Whether the shot was re-decoded by stock. Debug-asserted equal to `truncated`, which is
+    /// debug invariant 12.
     bool escalated{false};
+    /// The thread was descheduled during this shot, so its time is the scheduler's, not the
+    /// decoder's. Excluded from percentiles and counted in `contaminated_shot_rate`.
+    bool contaminated{false};
 
     void clear() {
         *this = TwoPhaseProfile();
@@ -152,26 +203,39 @@ struct TwoPhaseProfile {
     }
 };
 
-/// Rates need an accumulator that the per-shot struct cannot provide. Accumulated over a campaign
-/// (inside `decode_batch` once the M3 driver exists; by the M1 exit-artifact harness until then).
+/// Rates need an accumulator that the per-shot struct cannot provide. Accumulated inside
+/// `TwoPhaseDecoder::decode_batch` whenever profiling is on (§M6.2).
 struct TwoPhaseAggregateStats {
     uint64_t shots{0};
     uint64_t shots_truncated{0};
     uint64_t shots_escalated{0};
     uint64_t shots_zero_defects{0};
+    /// Shots the scheduler interfered with. Never dropped silently: they are counted here and
+    /// excluded from the per-shot vectors, and `contaminated_shot_rate` is reported beside every
+    /// percentile (§M6 exit checkpoint).
+    uint64_t shots_contaminated{0};
 
     long long sum_phase1_ns{0};
     long long sum_harvest_ns{0};
-    /// inject + inner + lift, over truncated shots only.
-    long long sum_phase2_ns{0};
+    /// Escalating shots only.
+    long long sum_escalation_ns{0};
     long long sum_total_ns{0};
     long long sum_total_ns_truncated{0};
     long long sum_exact_reference_ns{0};
+    /// §M3.2: the stock decode measured on precisely the shots that escalate, which replaces that
+    /// section's mean-over-all-shots estimate.
+    long long sum_stock_ns_on_escalated{0};
 
-    /// Benchmark mode only: kept so percentiles can be computed. Long campaigns leave these empty.
+    /// Benchmark mode only: kept so percentiles can be computed, and holding uncontaminated shots
+    /// only. Long campaigns leave these empty.
     bool keep_per_shot{false};
     std::vector<long long> per_shot_total_ns;
     std::vector<long long> per_shot_exact_ns;
+    /// The escalating shots' end-to-end times, kept separately because they are the tail the
+    /// streaming budget is sized from and there are too few of them to find by percentile.
+    std::vector<long long> per_shot_escalated_total_ns;
+    long long max_total_ns{0};
+    long long max_escalated_total_ns{0};
 
     /// Residual sizes, capped, with the last bin acting as the overflow bin.
     static constexpr size_t RESIDUAL_HIST_BINS = 33;
@@ -199,19 +263,30 @@ struct TwoPhaseAggregateStats {
             shots_escalated++;
         if (profile.num_defects == 0)
             shots_zero_defects++;
+        if (profile.contaminated)
+            shots_contaminated++;
 
         sum_phase1_ns += profile.phase1_ns;
         sum_harvest_ns += profile.harvest_ns;
         sum_total_ns += profile.total_ns;
         sum_exact_reference_ns += profile.exact_reference_ns;
-        if (profile.truncated) {
-            sum_phase2_ns += profile.inject_ns + profile.inner_blossom_ns + profile.lift_ns;
-            sum_total_ns_truncated += profile.total_ns;
+        if (profile.escalated) {
+            sum_escalation_ns += profile.escalation_ns;
+            sum_stock_ns_on_escalated += profile.stock_ns;
         }
+        if (profile.truncated)
+            sum_total_ns_truncated += profile.total_ns;
 
-        if (keep_per_shot) {
-            per_shot_total_ns.push_back(profile.total_ns);
-            per_shot_exact_ns.push_back(profile.exact_reference_ns);
+        if (!profile.contaminated) {
+            max_total_ns = std::max(max_total_ns, profile.total_ns);
+            if (profile.escalated)
+                max_escalated_total_ns = std::max(max_escalated_total_ns, profile.total_ns);
+            if (keep_per_shot) {
+                per_shot_total_ns.push_back(profile.total_ns);
+                per_shot_exact_ns.push_back(profile.exact_reference_ns);
+                if (profile.escalated)
+                    per_shot_escalated_total_ns.push_back(profile.total_ns);
+            }
         }
 
         size_t bin = std::min((size_t)profile.residual_size, RESIDUAL_HIST_BINS - 1);
@@ -230,27 +305,44 @@ struct TwoPhaseAggregateStats {
     }
 };
 
-/// The derived quantities of the design's summary table, computed **once** here rather than
-/// re-derived in every benchmark script. `pyrematching.summarize()` (M5.3) wraps this.
+/// The derived quantities of §M6.2's table, computed **once** here rather than re-derived in every
+/// benchmark script. `pyrematching.summarize()` (§M6.3) wraps this.
 struct TwoPhaseSummary {
-    /// Fallback rate: how often Phase 2 has to run.
+    /// Escalation rate: how often the shot is re-decoded on `G`. **Always report `shots` beside
+    /// it** — a zero below `1 / shots` is a resolution floor, not a measurement (§M3.0).
     double q{0};
-    /// Common-case cost, in ns/shot. Expected to be ~ the stock blossom cost.
+    uint64_t shots{0};
+    uint64_t shots_escalated{0};
+    /// Common-case cost, in ns/shot.
     double c_phase1{0};
-    /// Cost conditional on falling back, in ns/shot.
-    double c_phase2{0};
-    /// `C_phase1 + q * C_phase2`.
+    /// Cost conditional on escalating, in ns/shot.
+    double c_escalation{0};
+    /// `C_phase1 + q * C_escalation`.
     double amortised_mean_ns{0};
     /// `sum_total_ns / shots`. Must reconcile with `amortised_mean_ns`; a gap is unattributed cost.
     double measured_mean_ns{0};
-    /// The tail heaviness this design targets.
-    double fallback_cost_ratio{0};
-    /// Headline number, and its tail.
+    /// `|amortised - measured| / measured`, so the reconciliation is a number rather than a
+    /// judgement call.
+    double amortisation_gap{0};
+    /// `q * (C_escalation / C_phase1)`: what the fallback costs the mean, as a fraction.
+    double amortised_penalty{0};
+    /// Expected `≈ 1 + crit_speedup` (§M3.2).
+    double escalation_cost_ratio{0};
+    /// §M3.2's `stock` term, measured rather than estimated.
+    double mean_stock_ns_on_escalated{0};
+    /// Headline number, and its tail. At `q ~ 3e-4` the escalation spike sits near p99.97, so p99
+    /// and p999 will not show it — hence p9999 and the max.
     double speedup_vs_stock{0};
     double p50_total_ns{0};
     double p99_total_ns{0};
     double p999_total_ns{0};
-    double p_escalated{0};
+    double p9999_total_ns{0};
+    double max_total_ns{0};
+    /// Worst-case escalation latency, which is what a streaming budget is actually sized from.
+    double max_escalated_total_ns{0};
+    /// Reported beside every percentile above (§M6 exit checkpoint).
+    double contaminated_shot_rate{0};
+
     double mean_residual_size{0};
     double mean_residual_density{0};
     double exposed_root_blossom_rate{0};
@@ -269,21 +361,35 @@ inline TwoPhaseSummary summarize(const TwoPhaseAggregateStats& stats) {
     if (stats.shots == 0)
         return summary;
     double shots = (double)stats.shots;
-    summary.q = (double)stats.shots_truncated / shots;
+    summary.shots = stats.shots;
+    summary.shots_escalated = stats.shots_escalated;
+    summary.q = (double)stats.shots_escalated / shots;
     summary.c_phase1 = (double)(stats.sum_phase1_ns + stats.sum_harvest_ns) / shots;
-    summary.c_phase2 = stats.shots_truncated ? (double)stats.sum_phase2_ns / (double)stats.shots_truncated : 0.0;
-    summary.amortised_mean_ns = summary.c_phase1 + summary.q * summary.c_phase2;
+    summary.c_escalation =
+        stats.shots_escalated ? (double)stats.sum_escalation_ns / (double)stats.shots_escalated : 0.0;
+    summary.amortised_mean_ns = summary.c_phase1 + summary.q * summary.c_escalation;
     summary.measured_mean_ns = (double)stats.sum_total_ns / shots;
+    if (summary.measured_mean_ns > 0) {
+        summary.amortisation_gap =
+            std::abs(summary.amortised_mean_ns - summary.measured_mean_ns) / summary.measured_mean_ns;
+    }
+    if (summary.c_phase1 > 0)
+        summary.amortised_penalty = summary.q * (summary.c_escalation / summary.c_phase1);
     if (stats.shots_truncated && stats.sum_total_ns) {
-        summary.fallback_cost_ratio =
+        summary.escalation_cost_ratio =
             ((double)stats.sum_total_ns_truncated / (double)stats.shots_truncated) / summary.measured_mean_ns;
     }
+    if (stats.shots_escalated)
+        summary.mean_stock_ns_on_escalated = (double)stats.sum_stock_ns_on_escalated / (double)stats.shots_escalated;
     if (stats.sum_total_ns)
         summary.speedup_vs_stock = (double)stats.sum_exact_reference_ns / (double)stats.sum_total_ns;
     summary.p50_total_ns = percentile_of(stats.per_shot_total_ns, 0.5);
     summary.p99_total_ns = percentile_of(stats.per_shot_total_ns, 0.99);
     summary.p999_total_ns = percentile_of(stats.per_shot_total_ns, 0.999);
-    summary.p_escalated = (double)stats.shots_escalated / shots;
+    summary.p9999_total_ns = percentile_of(stats.per_shot_total_ns, 0.9999);
+    summary.max_total_ns = (double)stats.max_total_ns;
+    summary.max_escalated_total_ns = (double)stats.max_escalated_total_ns;
+    summary.contaminated_shot_rate = (double)stats.shots_contaminated / shots;
     summary.mean_residual_size = (double)stats.sum_residual_size / shots;
     if (stats.sum_num_defects)
         summary.mean_residual_density = (double)stats.sum_residual_size / (double)stats.sum_num_defects;

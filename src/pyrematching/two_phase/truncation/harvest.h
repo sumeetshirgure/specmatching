@@ -143,6 +143,32 @@ struct HarvestScratch {
     void clear();
 };
 
+/// What harvest actually did, counted rather than timed (§M3.3 X9).
+///
+/// The §M3.4 bypass is a claim about which *code* runs, not about how long it takes, so it is
+/// checked as one: on the production path `tree_nodes_visited` and `base_descents` must be
+/// identically zero, on every shot, and no amount of scheduler noise can make that pass by
+/// accident. Cumulative across shots; the caller resets when it wants a per-shot reading.
+struct HarvestCounters {
+    /// Live regions the enumeration walked. This is extraction's own trip count, not overhead.
+    uint64_t regions_visited{0};
+    /// Live `AltTreeNode`s the enumeration walked. Zero on the extract-only path by construction.
+    uint64_t tree_nodes_visited{0};
+    /// Calls into M1.4's base descent — the design's highest-risk item, and the one §M3.4 exists to
+    /// take off the production path.
+    uint64_t base_descents{0};
+    /// Matched top-level regions handed to the shatter/extract step.
+    uint64_t extractions{0};
+    /// Calls to the full harvest and to the extract-only path respectively, so a test can tell
+    /// which one a decoder actually took.
+    uint64_t full_harvests{0};
+    uint64_t extract_only_harvests{0};
+
+    void reset() {
+        *this = HarvestCounters();
+    }
+};
+
 /// Extracts the committed matching and the residual from a truncated (or completed) timeline.
 ///
 /// Owns the scratch buffers, so keep one alive across shots. `tight_pairs_out`, when non-null,
@@ -151,6 +177,7 @@ struct HarvestScratch {
 struct Harvester {
     HarvestScratch scratch;
     std::vector<TightPairRecord>* tight_pairs_out{nullptr};
+    HarvestCounters counters;
 
     /// Runs the M1.3 enumeration — sweep the shot's detection events, dedup regions with a visited
     /// stamp, find each tree's root and descend `children` from it — instead of §M2.9.1's direct
@@ -173,7 +200,29 @@ struct Harvester {
     HarvestResult harvest_to_match_edges(
         pm::Mwpm& mwpm, const std::vector<uint64_t>& detection_events, std::vector<pm::CompressedEdge>& match_edges);
 
+    /// §M3.4's production path: **extraction only**.
+    ///
+    /// Valid only on a `COMPLETE` timeline, where no alternating tree survives. That is exactly the
+    /// case in which the two jobs this drops — classifying `AltTreeNode`s into tree commits, and
+    /// M1.4's base descent through an exposed root blossom — have nothing to do; a `TRUNCATED`
+    /// timeline escalates instead (§M3.1) and its Phase-1 result is discarded, so the jobs would be
+    /// computing something that is never read.
+    ///
+    /// The result carries the committed observables and weight, the frozen/boundary commit counts
+    /// and `dual_sum_at_truncation` — the last because the §M4.2 certificate reads it and it is a
+    /// flat reduction over the same live-region walk that extraction already does. `residual`,
+    /// `num_trees`, `largest_tree_size` and `exposed_root_blossoms` are zero, and are zero as
+    /// *facts* about a completed timeline rather than as unfilled fields.
+    ///
+    /// **The full harvest above stays compiled in and is the oracle** (§M3.3 X8, and §M2.6 level 1
+    /// still runs against it): deleting it would delete what licenses this.
+    HarvestResult extract_only_to_obs(pm::Mwpm& mwpm, const std::vector<uint64_t>& detection_events);
+    HarvestResult extract_only_to_match_edges(
+        pm::Mwpm& mwpm, const std::vector<uint64_t>& detection_events, std::vector<pm::CompressedEdge>& match_edges);
+
    private:
+    template <typename ExtractMatched>
+    HarvestResult extract_only_impl(pm::Mwpm& mwpm, const ExtractMatched& extract_matched);
     template <typename ExtractMatched, typename ExtractExposed>
     HarvestResult harvest_impl(
         pm::Mwpm& mwpm,
@@ -187,6 +236,39 @@ struct Harvester {
         const ExtractMatched& extract_matched,
         const ExtractExposed& extract_exposed);
 };
+
+/// Throws the shot away without harvesting it: §M3.4's `TRUNCATED` branch.
+///
+/// An escalating shot re-decodes the whole syndrome on `G` and discards Phase 1's partial result
+/// (§M3.1), so nothing that harvest would extract is ever read — but the instance still has to be
+/// left clean for the next shot, and the surviving regions and tree nodes are what harvest would
+/// otherwise have handed back to their arenas.
+///
+/// This is `Mwpm::reset` — the same teardown the stock driver runs when it cannot find a perfect
+/// matching — and it is the expensive kind: it sweeps `H`'s node vector and frees the arena pools,
+/// so the next shot re-allocates them. That is deliberate. Writing a cheaper "return everything
+/// without extracting it" would duplicate the extraction's ownership rules, which is the one part
+/// of this code with a silent failure mode; and the cost is paid on `q <= 3.25e-4` of shots, over
+/// `H`'s node count rather than `G`'s. Both bounds are measured, and §M3.2 caps what any cleverer
+/// version of this could ever be worth at ~0.02% amortised.
+inline void abandon_shot(pm::Mwpm& mwpm) {
+    mwpm.reset();
+}
+
+/// Does any alternating tree survive? **O(1)** — one `empty()` on the node arena's live vector,
+/// which §M2.9.1 maintains inside `Arena<T>` itself.
+///
+/// This is the branch §M3.4's production control flow turns on, and the reason it has to be O(1) is
+/// that an O(n) sweep over regions to decide whether to skip an O(n) harvest defeats the point.
+/// `any_alternating_tree_survives_by_sweep` is the same question answered the slow way, and the two
+/// are asserted equal on every shot in debug builds (§M3.3 X9).
+inline bool any_alternating_tree_survives(const pm::Mwpm& mwpm) {
+    return !mwpm.node_arena.live.empty();
+}
+
+/// The full sweep the O(1) branch above is checked against: a region is in a tree iff it carries an
+/// `alt_tree_node`. Tests and debug asserts only.
+bool any_alternating_tree_survives_by_sweep(const pm::Mwpm& mwpm);
 
 /// Puts the instance back into the state the next shot's timeline preamble expects. Called at the
 /// end of every harvest; exposed for tests and for callers that drive the pieces themselves.

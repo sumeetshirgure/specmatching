@@ -36,7 +36,7 @@ BallParams params_for(const pm::MatchingGraph& graph, double t_max_edges, double
     BallParams params;
     params.T_max = t_max_edges * unit;
     params.R = r_edges * unit;
-    params.need_edge_lift = paths;
+    params.store_paths = paths;
     params.certify_masks = certify;
     return params;
 }

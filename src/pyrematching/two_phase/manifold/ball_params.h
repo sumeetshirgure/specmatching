@@ -39,9 +39,16 @@ struct BallParams {
     /// the whole ball, which is the default and must always work on its own. Shell `s` covers
     /// `[s * shell_width, (s + 1) * shell_width)`.
     double shell_width{0.0};
-    /// Also store the outer node path behind every ball entry, so a correction can be lifted back
-    /// to `G`'s edges (M5). Costs a lot of memory; off by default.
-    bool need_edge_lift{false};
+    /// Also store the node path behind every ball entry and every boundary cost, so that a
+    /// committed pair can be turned into the `G` edges of a correction (M5's edges flavour). Costs
+    /// a lot of memory; off by default, and required by `TwoPhaseConfig::edges_flavor`.
+    ///
+    /// **Renamed from `need_edge_lift` in M5**, which named the removed portal lift rather than
+    /// what the flag does. §M5 retires the *portal* lift, not the storage: the edges flavour reads
+    /// exactly these arrays, so the flag stays and the name stops lying. `BALL_ARTIFACT_VERSION`
+    /// was bumped to 2 with the rename, so an artifact compiled before it is rejected at load
+    /// rather than silently reinterpreted (§M2.2).
+    bool store_paths{false};
     /// Recompute every canonical path with a perturbed tie-break and count the entries whose
     /// observable set differs. Diagnostic only — a non-zero count is expected on a surface code and
     /// never blocks compilation.
@@ -49,8 +56,8 @@ struct BallParams {
     uint64_t seed{0};
 
     bool operator==(const BallParams& rhs) const {
-        return T_max == rhs.T_max && R == rhs.R && shell_width == rhs.shell_width &&
-               need_edge_lift == rhs.need_edge_lift && certify_masks == rhs.certify_masks && seed == rhs.seed;
+        return T_max == rhs.T_max && R == rhs.R && shell_width == rhs.shell_width && store_paths == rhs.store_paths &&
+               certify_masks == rhs.certify_masks && seed == rhs.seed;
     }
     bool operator!=(const BallParams& rhs) const {
         return !(*this == rhs);

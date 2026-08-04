@@ -143,7 +143,7 @@ void BallDecoder::compute_seeded_detection_events(const std::vector<uint64_t>& d
 }
 
 template <typename HarvestOnH>
-HarvestResult BallDecoder::decode_impl(
+Phase1Outcome BallDecoder::decode_impl(
     const std::vector<uint64_t>& dets, BallProfile* prof, const HarvestOnH& harvest_on_h) {
     HiResTimer total_timer;
     HiResTimer step;
@@ -191,17 +191,17 @@ HarvestResult BallDecoder::decode_impl(
 
     if (prof != nullptr)
         step.start();
-    TimelineStatus status = config.collect_harvest_diagnostics
-                                ? process_timeline_until_horizon_measured(
-                                      h_mwpm.mwpm, h_dets_scratch, horizon, depth_model)
-                                : process_timeline_until_horizon(h_mwpm.mwpm, h_dets_scratch, horizon);
-    (void)status;
+    Phase1Outcome outcome;
+    outcome.status = config.collect_harvest_diagnostics
+                         ? process_timeline_until_horizon_measured(h_mwpm.mwpm, h_dets_scratch, horizon, depth_model)
+                         : process_timeline_until_horizon(h_mwpm.mwpm, h_dets_scratch, horizon);
     if (prof != nullptr)
         prof->blossom_on_h_ns = step.elapsed_ns();
 
     if (prof != nullptr)
         step.start();
-    HarvestResult result = harvest_on_h(h_mwpm.mwpm, h_dets_scratch);
+    outcome.harvest = harvest_on_h(h_mwpm.mwpm, h_dets_scratch, outcome.status);
+    HarvestResult& result = outcome.harvest;
     if (prof != nullptr)
         prof->harvest_ns = step.elapsed_ns();
 
@@ -257,39 +257,101 @@ HarvestResult BallDecoder::decode_impl(
         }
         prof->total_ns = total_timer.elapsed_ns();
     }
-    return result;
+    return outcome;
 }
 
-HarvestResult BallDecoder::decode_phase1(const std::vector<uint64_t>& dets, BallProfile* prof) {
-    HarvestResult result = decode_impl(dets, prof, [this](pm::Mwpm& mwpm, const std::vector<uint64_t>& h_dets) {
-        return harvester.harvest_to_obs(mwpm, h_dets);
-    });
-    if (config.verify_against_g)
-        verify_level1(dets, result, nullptr, prof);
-    return result;
-}
-
-HarvestResult BallDecoder::decode_phase1_to_match_edges(
-    const std::vector<uint64_t>& dets, std::vector<CommittedPair>& committed_pairs, BallProfile* prof) {
-    match_edge_scratch.clear();
-    HarvestResult result = decode_impl(dets, prof, [this](pm::Mwpm& mwpm, const std::vector<uint64_t>& h_dets) {
-        return harvester.harvest_to_match_edges(mwpm, h_dets, match_edge_scratch);
-    });
-
+void BallDecoder::map_match_edges_to_committed_pairs(std::vector<CommittedPair>& committed_pairs) const {
     const BallGraph& h = arena.graph;
     const pm::DetectorNode* base = h_mwpm.mwpm.flooder.graph.nodes.data();
     committed_pairs.clear();
     committed_pairs.reserve(match_edge_scratch.size());
     for (const pm::CompressedEdge& edge : match_edge_scratch) {
-        int64_t from = (int64_t)h.h_to_det[(size_t)(edge.loc_from - base)];
-        int64_t to = edge.loc_to == nullptr ? -1 : (int64_t)h.h_to_det[(size_t)(edge.loc_to - base)];
-        committed_pairs.push_back(CommittedPair{from, to});
+        size_t i = (size_t)(edge.loc_from - base);
+        int64_t from = (int64_t)h.h_to_det[i];
+        if (edge.loc_to == nullptr) {
+            committed_pairs.push_back(CommittedPair{from, -1, CommittedPair::NO_BALL_ENTRY});
+            continue;
+        }
+        size_t j = (size_t)(edge.loc_to - base);
+        int64_t to = (int64_t)h.h_to_det[j];
+        // Every committed pair is an edge of `H` — a region only ever meets another region across
+        // one — so the ball entry behind it is in `h.edges`, which is sorted by `(i, j)` with
+        // `i < j`. One binary search; no map, no per-shot allocation.
+        uint32_t lo = (uint32_t)std::min(i, j);
+        uint32_t hi = (uint32_t)std::max(i, j);
+        auto it = std::lower_bound(
+            h.edges.begin(),
+            h.edges.end(),
+            std::pair<uint32_t, uint32_t>{lo, hi},
+            [](const BallGraphEdge& e, const std::pair<uint32_t, uint32_t>& key) {
+                return e.i != key.first ? e.i < key.first : e.j < key.second;
+            });
+        assert(it != h.edges.end() && it->i == lo && it->j == hi && "a committed pair that is not an edge of H");
+        committed_pairs.push_back(CommittedPair{from, to, it->entry});
     }
     sort_pairs(committed_pairs);
+}
+
+HarvestResult BallDecoder::decode_phase1(const std::vector<uint64_t>& dets, BallProfile* prof) {
+    Phase1Outcome outcome =
+        decode_impl(dets, prof, [this](pm::Mwpm& mwpm, const std::vector<uint64_t>& h_dets, TimelineStatus) {
+            return harvester.harvest_to_obs(mwpm, h_dets);
+        });
+    if (config.verify_against_g)
+        verify_level1(dets, outcome.harvest, nullptr, prof);
+    return outcome.harvest;
+}
+
+HarvestResult BallDecoder::decode_phase1_to_match_edges(
+    const std::vector<uint64_t>& dets, std::vector<CommittedPair>& committed_pairs, BallProfile* prof) {
+    match_edge_scratch.clear();
+    Phase1Outcome outcome =
+        decode_impl(dets, prof, [this](pm::Mwpm& mwpm, const std::vector<uint64_t>& h_dets, TimelineStatus) {
+            return harvester.harvest_to_match_edges(mwpm, h_dets, match_edge_scratch);
+        });
+    map_match_edges_to_committed_pairs(committed_pairs);
 
     if (config.verify_against_g)
-        verify_level1(dets, result, &committed_pairs, prof);
-    return result;
+        verify_level1(dets, outcome.harvest, &committed_pairs, prof);
+    return outcome.harvest;
+}
+
+Phase1Outcome BallDecoder::decode_phase1_production(const std::vector<uint64_t>& dets, BallProfile* prof) {
+    return decode_impl(
+        dets, prof, [this, prof](pm::Mwpm& mwpm, const std::vector<uint64_t>& h_dets, TimelineStatus status) {
+            if (status == TimelineStatus::TRUNCATED) {
+                HiResTimer abandon;
+                if (prof != nullptr)
+                    abandon.start();
+                abandon_shot(mwpm);
+                if (prof != nullptr)
+                    prof->abandon_ns = abandon.elapsed_ns();
+                return HarvestResult();
+            }
+            return harvester.extract_only_to_obs(mwpm, h_dets);
+        });
+}
+
+Phase1Outcome BallDecoder::decode_phase1_production_to_match_edges(
+    const std::vector<uint64_t>& dets, std::vector<CommittedPair>& committed_pairs, BallProfile* prof) {
+    match_edge_scratch.clear();
+    Phase1Outcome outcome = decode_impl(
+        dets, prof, [this, prof](pm::Mwpm& mwpm, const std::vector<uint64_t>& h_dets, TimelineStatus status) {
+            if (status == TimelineStatus::TRUNCATED) {
+                HiResTimer abandon;
+                if (prof != nullptr)
+                    abandon.start();
+                abandon_shot(mwpm);
+                if (prof != nullptr)
+                    prof->abandon_ns = abandon.elapsed_ns();
+                return HarvestResult();
+            }
+            return harvester.extract_only_to_match_edges(mwpm, h_dets, match_edge_scratch);
+        });
+    // On an escalating shot `match_edge_scratch` is empty and this yields no pairs, which is the
+    // right answer: the caller is about to discard Phase 1 entirely.
+    map_match_edges_to_committed_pairs(committed_pairs);
+    return outcome;
 }
 
 HarvestResult BallDecoder::reference_phase1_on_g(

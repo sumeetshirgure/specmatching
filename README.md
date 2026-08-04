@@ -2,6 +2,37 @@
 
 PyReMatching is a Python/C++ library for accelerating the PyMatching decoder.
 
+## The two-phase decoder
+
+Truncated sparse blossom, executed on a precomputed ball graph over the shot's defects, with stock
+exact decode as the residual fallback. **The output is exact MWPM on every shot** — the fallback is
+not an approximation, it is the inherited decoder run in full on the shots the truncated phase did
+not finish.
+
+```python
+import pyrematching
+import stim
+
+circuit = stim.Circuit.generated("surface_code:rotated_memory_x", distance=11, rounds=11,
+                                 after_clifford_depolarization=1e-3)
+dem = circuit.detector_error_model(decompose_errors=True)
+
+decoder = pyrematching.two_phase_decoder(dem, T=2.0)   # T is in DEM weight units
+observables, weight = decoder.decode_to_obs(detection_event_indices)
+
+observables, weights, profile = decoder.decode_batch(shots, profile=True)
+print(pyrematching.summarize(decoder.get_aggregate_stats()))
+```
+
+`T` is the truncation horizon; the ball tables are sized from it and take `R >= 2 * T` of radius,
+which is the memory cost. Lowering `T` raises the fraction of shots that fall back — measured at
+`5e-6` to `1.3e-4` at `T = 2` and one to two orders higher at `T = 1.5`.
+
+**It is not currently faster than the inherited decoder on a CPU**: measured at 0.28–0.42x stock
+exact decode throughput. See `docs/two_phase_m6_exit.md` for why, and for the critical-path and
+local-memory measurements the design is actually argued on. The exit reports for each milestone are
+in `docs/two_phase_m*_exit.md`.
+
 
 ## Attribution
 

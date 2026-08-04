@@ -68,6 +68,8 @@ set(SOURCE_FILES_NO_MAIN
         src/pyrematching/two_phase/manifold/ball_graph.cc
         src/pyrematching/two_phase/manifold/ball_mwpm.cc
         src/pyrematching/two_phase/manifold/ball_decoding.cc
+        src/pyrematching/two_phase/escalation/escalate.cc
+        src/pyrematching/two_phase/driver/two_phase_decoding.cc
         )
 
 set(TEST_FILES
@@ -100,6 +102,8 @@ set(TEST_FILES
         tests/two_phase/manifold_ball_tables.test.cc
         tests/two_phase/manifold_ball_graph.test.cc
         tests/two_phase/manifold_ball_identity.test.cc
+        tests/two_phase/escalation_escalate.test.cc
+        tests/two_phase/two_phase_driver.test.cc
         )
 
 set(PERF_FILES
@@ -114,6 +118,7 @@ set(PERF_FILES
 set(PYTHON_API_FILES
         src/pyrematching/sparse_blossom/driver/user_graph.pybind.cc
         src/pyrematching/rand/rand_gen.pybind.cc
+        src/pyrematching/two_phase/driver/two_phase.pybind.cc
         src/pyrematching/pyrematching.pybind.cc
         )
 
@@ -174,6 +179,28 @@ if (NOT (MSVC))
     target_link_options(two_phase_m29_artifact PRIVATE -pthread -O3)
 endif ()
 target_link_libraries(two_phase_m29_artifact libstim)
+
+# M3 exit artifact: the escalation budget — `q` with its shot count, the measured
+# `mean_stock_ns_on_escalated`, the tail latency out to p99.99 with escalation live, and the
+# streaming buffer depth. Built optimised, like the other artifacts.
+add_executable(two_phase_m3_artifact benchmarks/two_phase/m3_exit_artifact.cc ${SOURCE_FILES_NO_MAIN})
+target_include_directories(two_phase_m3_artifact PRIVATE ${CMAKE_CURRENT_LIST_DIR})
+target_compile_options(two_phase_m3_artifact PRIVATE ${ARCH_OPT})
+if (NOT (MSVC))
+    target_link_options(two_phase_m3_artifact PRIVATE -pthread -O3)
+endif ()
+target_link_libraries(two_phase_m3_artifact libstim)
+
+# M6 exit artifact: §M6.4's benchmark list — latency distributions vs stock, the effective-distance
+# fit, the three-way front-end comparison, ball table cost with the structural counters, and the
+# heavy-shot drill-down.
+add_executable(two_phase_m6_artifact benchmarks/two_phase/m6_exit_artifact.cc ${SOURCE_FILES_NO_MAIN})
+target_include_directories(two_phase_m6_artifact PRIVATE ${CMAKE_CURRENT_LIST_DIR})
+target_compile_options(two_phase_m6_artifact PRIVATE ${ARCH_OPT})
+if (NOT (MSVC))
+    target_link_options(two_phase_m6_artifact PRIVATE -pthread -O3)
+endif ()
+target_link_libraries(two_phase_m6_artifact libstim)
 
 add_library(libpyrematching ${SOURCE_FILES_NO_MAIN})
 set_target_properties(libpyrematching PROPERTIES PREFIX "")

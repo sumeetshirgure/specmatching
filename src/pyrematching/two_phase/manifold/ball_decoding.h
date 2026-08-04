@@ -65,10 +65,26 @@ struct BallConfig {
 };
 
 /// One committed pair, in `G`'s detector ids. `to == -1` means matched to the boundary. This is the
-/// form §M2.6 level 1 compares and the form M5 will lift.
+/// form §M2.6 level 1 compares and the form M5 lifts to `G`'s edges.
 struct CommittedPair {
     int64_t from;
     int64_t to;
+    /// Index into the ball pools of the canonical shortest path behind this pair, or
+    /// `NO_BALL_ENTRY` when the pair is a boundary match (in which case `bcost_path_*` of `from`
+    /// holds the path instead). M5 reads this; the obs flavour does not.
+    uint64_t ball_entry;
+
+    static constexpr uint64_t NO_BALL_ENTRY = UINT64_MAX;
+};
+
+/// What §M3.4's production Phase 1 yielded.
+///
+/// `status` is the branch: `COMPLETE` means the harvest below is the answer, `TRUNCATED` means the
+/// shot escalates and `harvest` is empty because it was never run. Reading the status rather than
+/// `harvest.residual.empty()` is what keeps the two from drifting apart when the bypass is on.
+struct Phase1Outcome {
+    TimelineStatus status{TimelineStatus::COMPLETE};
+    HarvestResult harvest;
 };
 
 /// Phase 1 executed on the defect manifold (§M2.5).
@@ -109,6 +125,17 @@ struct BallDecoder {
     HarvestResult decode_phase1_to_match_edges(
         const std::vector<uint64_t>& dets, std::vector<CommittedPair>& committed_pairs, BallProfile* prof = nullptr);
 
+    /// §M3.4's production Phase 1: extraction only when the timeline completes, and no harvest at
+    /// all when it truncates — the shot escalates and Phase 1's partial result is discarded.
+    ///
+    /// The two entry points above stay exactly as they were and remain the verification path: they
+    /// are what §M2.6 level 1 compares against M1, what §M3.3 X8 compares this against, and what
+    /// debug invariants 3, 4, 18 and 19 read. **Neither is dead code and neither may be deleted**
+    /// (§M3.4, "keep the full harvest compiled in").
+    Phase1Outcome decode_phase1_production(const std::vector<uint64_t>& dets, BallProfile* prof = nullptr);
+    Phase1Outcome decode_phase1_production_to_match_edges(
+        const std::vector<uint64_t>& dets, std::vector<CommittedPair>& committed_pairs, BallProfile* prof = nullptr);
+
     /// The observable mask and weight that `G`'s negative-weight edges contribute, to be combined
     /// with `HarvestResult::committed` exactly as the stock decode path does.
     inline pm::obs_int negative_weight_obs_mask() const {
@@ -138,8 +165,13 @@ struct BallDecoder {
     TimelineDepthModel depth_model;
 
     void finish_construction(const char* ball_artifact_path);
+    /// `harvest_on_h(mwpm, h_dets, status)` decides what to do with the solved timeline: the
+    /// verification entry points always harvest in full, the production ones branch on the status.
     template <typename HarvestOnH>
-    HarvestResult decode_impl(const std::vector<uint64_t>& dets, BallProfile* prof, const HarvestOnH& harvest_on_h);
+    Phase1Outcome decode_impl(const std::vector<uint64_t>& dets, BallProfile* prof, const HarvestOnH& harvest_on_h);
+    /// Turns harvest's `CompressedEdge`s over `H` into `CommittedPair`s over `G`, ball entry and
+    /// all. Shared by the verification and production match-edge entry points.
+    void map_match_edges_to_committed_pairs(std::vector<CommittedPair>& committed_pairs) const;
     /// Asserts §M2.6 level 1 against M1 on `G`. `actual_pairs` may be null when the caller took the
     /// obs flavour, in which case the committed *pair set* is not part of the comparison.
     void verify_level1(

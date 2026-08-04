@@ -24,7 +24,7 @@ namespace two_phase {
 
 /// Bumped whenever the on-disk layout changes. Loading an artifact with a different version is a
 /// hard error, never a best-effort migration: a silently misread table changes the answer.
-constexpr uint32_t BALL_ARTIFACT_VERSION = 1;
+constexpr uint32_t BALL_ARTIFACT_VERSION = 2;
 
 /// Writes the tables to `path`. Versioned header, graph hash and `BallParams` first, then the CSR
 /// pools verbatim.

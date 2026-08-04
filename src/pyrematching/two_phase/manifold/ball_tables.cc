@@ -47,7 +47,7 @@ struct NodeBall {
     std::vector<uint32_t> bcost_mask;
     std::vector<uint32_t> bcost_path;
 
-    /// Mirrors `BallParams::need_edge_lift`; kept per-ball so the worker does not have to reach back
+    /// Mirrors `BallParams::store_paths`; kept per-ball so the worker does not have to reach back
     /// into the params on the inner loop.
     bool store_paths{false};
     uint64_t ambiguous{0};
@@ -387,15 +387,21 @@ BallTables compile_ball_tables(const pm::Mwpm& mwpm, const BallParams& params, s
     BallTables tables;
     tables.params = params;
     tables.normalising_constant = graph.normalising_constant;
-    tables.r_int = to_time_units(params.R, graph.normalising_constant);
     tables.t_max_int = to_time_units(params.T_max, graph.normalising_constant);
+    // Invariant 6 is a statement in weight units; the time-unit form is derived. Deriving it by two
+    // *independent* roundings does not preserve it — `round(2x)` can be `2 * round(x) - 1` — so at
+    // the exact-equality setting `R = 2 * T_max`, which is the natural thing for a caller to write
+    // and what the python helper defaults to, the derived form can fail by one time unit.
+    //
+    // Widening the radius is the safe direction: a ball that is one unit too big costs memory,
+    // whereas one that is one unit too small silently omits a reachable pair and changes the answer
+    // (§M2.0). `BallParams::validate` has already rejected `R < 2 * T_max` in weight units, which is
+    // the check that actually protects the theorem; this only stops a rounding artifact from
+    // presenting as a configuration error.
+    tables.r_int = std::max(to_time_units(params.R, graph.normalising_constant), 2 * tables.t_max_int);
     tables.num_nodes = graph.nodes.size();
     tables.num_observables = graph.num_observables;
     tables.graph_hash = hash_matching_graph(graph);
-
-    if (tables.r_int < 2 * tables.t_max_int)
-        throw std::invalid_argument(
-            "R >= 2 * T_max holds in weight units but not after conversion to time units; raise R.");
 
     tables.shell_width_int = params.shell_width > 0 ? to_time_units(params.shell_width, graph.normalising_constant) : 0;
     if (params.shell_width > 0 && tables.shell_width_int <= 0)
@@ -407,7 +413,7 @@ BallTables compile_ball_tables(const pm::Mwpm& mwpm, const BallParams& params, s
 
     std::vector<NodeBall> per_node(num_nodes);
     for (auto& ball : per_node)
-        ball.store_paths = params.need_edge_lift;
+        ball.store_paths = params.store_paths;
 
     if (num_threads == 0)
         num_threads = std::max<size_t>(1, std::thread::hardware_concurrency());
@@ -436,13 +442,13 @@ BallTables compile_ball_tables(const pm::Mwpm& mwpm, const BallParams& params, s
     tables.ball_offsets.reserve(num_nodes + 1);
     tables.ball_offsets.push_back(0);
     tables.ball_mask_offsets.push_back(0);
-    if (params.need_edge_lift)
+    if (params.store_paths)
         tables.ball_path_offsets.push_back(0);
     tables.has_bcost.resize(num_nodes, 0);
     tables.bcost_w_int.resize(num_nodes, 0);
     tables.bcost_mask_offsets.reserve(num_nodes + 1);
     tables.bcost_mask_offsets.push_back(0);
-    if (params.need_edge_lift) {
+    if (params.store_paths) {
         tables.bcost_path_offsets.reserve(num_nodes + 1);
         tables.bcost_path_offsets.push_back(0);
     }
@@ -458,7 +464,7 @@ BallTables compile_ball_tables(const pm::Mwpm& mwpm, const BallParams& params, s
         tables.ball_mask_ids.insert(tables.ball_mask_ids.end(), ball.mask_ids.begin(), ball.mask_ids.end());
         for (size_t e = 1; e < ball.mask_offsets.size(); e++)
             tables.ball_mask_offsets.push_back(mask_base + ball.mask_offsets[e]);
-        if (params.need_edge_lift) {
+        if (params.store_paths) {
             uint64_t path_base = tables.ball_path_nodes.size();
             tables.ball_path_nodes.insert(tables.ball_path_nodes.end(), ball.path_nodes.begin(), ball.path_nodes.end());
             for (size_t e = 1; e < ball.path_offsets.size(); e++)
@@ -492,7 +498,7 @@ BallTables compile_ball_tables(const pm::Mwpm& mwpm, const BallParams& params, s
         }
         tables.bcost_mask_ids.insert(tables.bcost_mask_ids.end(), ball.bcost_mask.begin(), ball.bcost_mask.end());
         tables.bcost_mask_offsets.push_back(tables.bcost_mask_ids.size());
-        if (params.need_edge_lift) {
+        if (params.store_paths) {
             tables.bcost_path_nodes.insert(
                 tables.bcost_path_nodes.end(), ball.bcost_path.begin(), ball.bcost_path.end());
             tables.bcost_path_offsets.push_back(tables.bcost_path_nodes.size());
