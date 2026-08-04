@@ -88,6 +88,7 @@ struct BallProfile {
     /// recorded rather than failed, and what *is* still a hard failure.
     int residual_ties{0};
     int pairing_ties{0};
+    int boundary_ties{0};
 
     /// §M2.9.6. The split of `harvest_ns` into its four stages: enumerating the live regions and
     /// alternating tree nodes, the base descent into exposed root blossoms, shattering matched
@@ -148,6 +149,7 @@ struct BallAggregateStats {
     uint64_t mask_divergences{0};
     uint64_t residual_ties{0};
     uint64_t pairing_ties{0};
+    uint64_t boundary_ties{0};
 
     /// §M2 structural counters. Sums *and* maxima: the latency budget of a hardware stage is set by
     /// the worst shot it has to absorb, not by the mean.
@@ -230,6 +232,7 @@ struct BallAggregateStats {
         mask_divergences += (uint64_t)profile.mask_divergences;
         residual_ties += (uint64_t)profile.residual_ties;
         pairing_ties += (uint64_t)profile.pairing_ties;
+        boundary_ties += (uint64_t)profile.boundary_ties;
 
         sum_isect_scan_bytes += profile.isect_scan_bytes;
         sum_isect_hit_bytes += profile.isect_hit_bytes;
@@ -307,6 +310,7 @@ struct BallSummary {
     /// §M2.6 rates, recorded in the exit artifact.
     double residual_tie_rate{0};
     double pairing_tie_rate{0};
+    double boundary_tie_rate{0};
     double mask_divergence_rate{0};
 
     /// §M2.9.6. Harvest's four stages as fractions of measured `harvest_ns`. The A/B the design
@@ -395,6 +399,7 @@ inline BallSummary summarize_ball(const BallAggregateStats& stats) {
     summary.q = (double)stats.shots_truncated / shots;
     summary.residual_tie_rate = (double)stats.residual_ties / shots;
     summary.pairing_tie_rate = (double)stats.pairing_ties / shots;
+    summary.boundary_tie_rate = (double)stats.boundary_ties / shots;
     summary.mask_divergence_rate = (double)stats.mask_divergences / shots;
 
     if (stats.sum_harvest_ns > 0) {

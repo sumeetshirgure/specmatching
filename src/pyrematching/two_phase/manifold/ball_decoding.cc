@@ -337,10 +337,17 @@ void BallDecoder::verify_level1(
     // the optimum, not necessarily on which optimum they land on when tight events coincide.
     //
     // Measured over 4800 shot-decodes across six corpora and four horizons: the dual sum, the
-    // committed weight, `num_trees`, `committed_boundary` and the observable bytes matched on every
-    // one; only the pairing (0–25% of shots, rising with defect density) and, at `T <= 1.0` on the
-    // densest corpora only, the residual choice moved. Both residuals always satisfied `Y(u) == T`.
-    // Those two are therefore counted, not thrown on; everything else is still fatal.
+    // committed weight, `num_trees` and the observable bytes matched on every one; only the pairing
+    // (0–25% of shots, rising with defect density) and, at `T <= 1.0` on the densest corpora only,
+    // the residual choice moved. Both residuals always satisfied `Y(u) == T`.
+    //
+    // `committed_boundary` belongs with those: it is a property of the chosen pairing, not of the
+    // dual solution. When a tight collision lets `H` pair two defects that `G` matched to the
+    // boundary separately — same total weight, same `num_trees`, same optimum — the boundary count
+    // moves with the pairing. It matched on all 4800 of those shot-decodes, but nothing forces it
+    // to, so it is counted rather than thrown on.
+    //
+    // Those three are therefore counted, not thrown on; everything else is still fatal.
     auto fail = [&](const std::string& what, const std::string& expected_text, const std::string& actual_text) {
         throw std::logic_error(
             "Ball-graph decode diverged from M1 on G at §M2.6 level 1 (" + what + "): G gave " + expected_text +
@@ -355,11 +362,6 @@ void BallDecoder::verify_level1(
         fail("committed weight", std::to_string(expected.committed.weight), std::to_string(actual.committed.weight));
     if (actual.num_trees != expected.num_trees)
         fail("num_trees", std::to_string(expected.num_trees), std::to_string(actual.num_trees));
-    if (actual.committed_boundary != expected.committed_boundary)
-        fail(
-            "committed_boundary",
-            std::to_string(expected.committed_boundary),
-            std::to_string(actual.committed_boundary));
     if (actual.residual.size() != expected.residual.size())
         fail("residual size", describe(expected.residual), describe(actual.residual));
     // The separation invariant, which is what says a differently-chosen residual is still a valid
@@ -370,10 +372,14 @@ void BallDecoder::verify_level1(
     }
 
     bool residual_tie = actual.residual != expected.residual;
+    bool boundary_tie = actual.committed_boundary != expected.committed_boundary;
     bool pairing_tie = false;
     if (actual_pairs != nullptr) {
-        if (actual_pairs->size() != expected_pairs.size())
-            fail("committed pair count", describe(expected_pairs), describe(*actual_pairs));
+        // The pair *count* is not independent of the boundary count: with the same number of
+        // matched defects, `pairs == (matched + committed_boundary) / 2`, so the two differ on
+        // exactly the same shots. Comparing it separately would reintroduce the check above under
+        // another name, so a difference here is the same tie.
+        //
         // Debug invariant 3: committed and residual partition the shot's detection events, each
         // classified exactly once. The committed support alone is *not* comparable across the two
         // front ends — a differently resolved residual tie moves it by the complementary defect —
@@ -391,6 +397,7 @@ void BallDecoder::verify_level1(
             actual_pairs->begin(),
             actual_pairs->end(),
             expected_pairs.begin(),
+            expected_pairs.end(),
             [](const CommittedPair& a, const CommittedPair& b) {
                 return a.from == b.from && a.to == b.to;
             });
@@ -398,6 +405,7 @@ void BallDecoder::verify_level1(
     if (prof != nullptr) {
         prof->residual_ties += residual_tie ? 1 : 0;
         prof->pairing_ties += pairing_tie ? 1 : 0;
+        prof->boundary_ties += boundary_tie ? 1 : 0;
     }
 }
 

@@ -314,7 +314,7 @@ int main(int argc, char** argv) {
     std::vector<std::string> structural_rows;
     std::printf("\n=== speedup vs M1 Phase 1 on G (%zu shots per point) ===\n", options.shots);
     std::printf(
-        "%4s %8s %5s %9s %9s %9s %8s %8s %9s %8s %8s %7s %7s %7s %7s %7s %8s %8s\n",
+        "%4s %8s %5s %9s %9s %9s %8s %8s %9s %8s %8s %7s %7s %7s %7s %7s %8s %8s %8s\n",
         "d",
         "p",
         "T",
@@ -332,7 +332,8 @@ int main(int argc, char** argv) {
         "blossom",
         "harvest",
         "res_tie",
-        "pair_tie");
+        "pair_tie",
+        "bnd_tie");
     for (size_t distance : options.distances) {
         for (double noise : options.error_rates) {
             Experiment experiment = generate(distance, noise, options.shots, options.seed + distance * 131);
@@ -395,21 +396,24 @@ int main(int argc, char** argv) {
                 std::vector<CommittedPair> pairs;
                 uint64_t residual_ties = 0;
                 uint64_t pairing_ties = 0;
+                uint64_t boundary_ties = 0;
                 for (const auto& shot : experiment.shots) {
                     HarvestResult harvest = decoder.decode_phase1_to_match_edges(shot, pairs, &tie_profile);
                     structural_stats.accumulate(tie_profile, harvest);
                     residual_ties += (uint64_t)tie_profile.residual_ties;
                     pairing_ties += (uint64_t)tie_profile.pairing_ties;
+                    boundary_ties += (uint64_t)tie_profile.boundary_ties;
                 }
                 decoder.config.collect_structural_counters = false;
                 BallSummary structural = summarize_ball(structural_stats);
                 double tie_shots = (double)std::max<size_t>(1, experiment.shots.size());
                 summary.residual_tie_rate = (double)residual_ties / tie_shots;
                 summary.pairing_tie_rate = (double)pairing_ties / tie_shots;
+                summary.boundary_tie_rate = (double)boundary_ties / tie_shots;
 
                 std::printf(
                     "%4zu %8.4f %5.2f %9.0f %9.0f %9.0f %8.2f %8.2f %9.1f %8.1f %8.2f %7.3f %7.3f %7.3f %7.3f %7.3f "
-                    "%8.4f %8.4f\n",
+                    "%8.4f %8.4f %8.4f\n",
                     distance,
                     noise,
                     t_edges,
@@ -427,7 +431,8 @@ int main(int argc, char** argv) {
                     summary.frac_blossom_on_h,
                     summary.frac_harvest,
                     summary.residual_tie_rate,
-                    summary.pairing_tie_rate);
+                    summary.pairing_tie_rate,
+                    summary.boundary_tie_rate);
 
                 emit("profile", distance, noise, t_edges, "mean_total_ns", summary.mean_total_ns);
                 emit("profile", distance, noise, t_edges, "mean_g_reference_ns", summary.mean_g_reference_ns);
@@ -449,6 +454,7 @@ int main(int argc, char** argv) {
                 emit("profile", distance, noise, t_edges, "q", summary.q);
                 emit("profile", distance, noise, t_edges, "residual_tie_rate", summary.residual_tie_rate);
                 emit("profile", distance, noise, t_edges, "pairing_tie_rate", summary.pairing_tie_rate);
+                emit("profile", distance, noise, t_edges, "boundary_tie_rate", summary.boundary_tie_rate);
                 emit("profile", distance, noise, t_edges, "mean_restarts", summary.mean_restarts);
 
                 // The §M2 structural counters: what the three stages we intend to move off the CPU

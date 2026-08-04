@@ -205,10 +205,13 @@ def structural_checks_table(table):
 def tie_table(table):
     """§M2.6 divergence rates. These are ties between optima, not errors — see the M2 notes."""
     print("\n## §M2.6 tie rates (H resolving a degeneracy differently from G)\n")
-    print(f"{'d':>4} {'p':>8} {'T':>5} {'residual':>9} {'pairing':>8}")
+    print(f"{'d':>4} {'p':>8} {'T':>5} {'residual':>9} {'pairing':>8} {'boundary':>9}")
     for d, p, t, values in sorted(rows_of(table, "profile")):
+        # boundary_tie_rate joined the artifact after the M2 checkpoint run; artifacts written
+        # before that have the other two only.
         print(f"{d:>4} {p:>8.4f} {t:>5.2f} {values['residual_tie_rate']:>9.4f} "
-              f"{values['pairing_tie_rate']:>8.4f}")
+              f"{values['pairing_tie_rate']:>8.4f} "
+              f"{values.get('boundary_tie_rate', float('nan')):>9.4f}")
 
 
 def ler_table(table):

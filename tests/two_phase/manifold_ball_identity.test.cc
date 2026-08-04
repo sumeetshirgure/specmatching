@@ -40,18 +40,21 @@ struct Level1Tally {
     uint64_t shots{0};
     uint64_t residual_ties{0};
     uint64_t pairing_ties{0};
+    uint64_t boundary_ties{0};
     uint64_t tree_shape_ties{0};
 
     void report(const std::string& what) const {
         std::printf(
             "[ INFO     ] %s: %llu shots; ties resolved differently from G — residual %llu (%.2f%%), "
-            "pairing %llu (%.2f%%), tree shape %llu (%.2f%%)\n",
+            "pairing %llu (%.2f%%), boundary %llu (%.2f%%), tree shape %llu (%.2f%%)\n",
             what.c_str(),
             (unsigned long long)shots,
             (unsigned long long)residual_ties,
             shots ? 100.0 * (double)residual_ties / (double)shots : 0.0,
             (unsigned long long)pairing_ties,
             shots ? 100.0 * (double)pairing_ties / (double)shots : 0.0,
+            (unsigned long long)boundary_ties,
+            shots ? 100.0 * (double)boundary_ties / (double)shots : 0.0,
             (unsigned long long)tree_shape_ties,
             shots ? 100.0 * (double)tree_shape_ties / (double)shots : 0.0);
     }
@@ -60,6 +63,7 @@ struct Level1Tally {
         shots += other.shots;
         residual_ties += other.residual_ties;
         pairing_ties += other.pairing_ties;
+        boundary_ties += other.boundary_ties;
         tree_shape_ties += other.tree_shape_ties;
     }
 };
@@ -70,13 +74,13 @@ struct Level1Tally {
 ///   - `Sum_S y_S` at truncation
 ///   - the total committed weight
 ///   - `num_trees`, and hence the residual *size*
-///   - the number of boundary commitments
 ///   - the partition invariant: committed and residual together are exactly the shot's
 ///     detection events, each classified once, on both sides
 ///   - the separation invariant `Y(u) == T` for every residual defect, on both sides
 ///
 /// **One documented departure from the design's list, with a measurement behind it.** §M2.6 also
-/// asks for the residual *set* and the committed *pair set* to be equal outright, on the grounds
+/// asks for the residual *set*, the committed *pair set* and `committed_boundary` to be equal
+/// outright, on the grounds
 /// that "degenerate path choice cannot move them". Path choice indeed cannot. But the *choice among
 /// optimal primal solutions* can, for a reason the theorem of §M2.0 does not cover: in `G` a growing
 /// region's flood is blocked by its neighbours' territory, so `G` never observes some tight
@@ -93,6 +97,14 @@ struct Level1Tally {
 /// `ResidualIsIdenticalAtTheOperatingHorizon`). In every divergent shot both residuals satisfied
 /// `Y(u) == T`, so both are valid exposed sets and Phase 2's error bound holds either way.
 ///
+/// `committed_boundary` and the pair *count* are grouped with the pairing rather than asserted,
+/// even though they never moved in that campaign. Neither is determined by the dual solution: when
+/// a tight collision lets `H` pair two defects that `G` matched to the boundary separately, the
+/// weight, `num_trees` and the partition are all unchanged and only the boundary count moves. And
+/// with the matched-defect count pinned by `num_trees`, the pair count satisfies
+/// `pairs == (matched + committed_boundary) / 2`, so it can only move when the boundary count
+/// does. Asserting either would be asserting a choice among optima.
+///
 /// A tie is therefore recorded, not failed. Anything else — an unequal dual sum, weight, tree
 /// count, partition, or observable — is still a hard failure with no tolerance, and remains debug
 /// invariant 10.
@@ -107,9 +119,7 @@ void expect_level1_identity(
     ASSERT_EQ(actual.dual_sum_at_truncation, expected.dual_sum_at_truncation) << label << ": dual sums differ";
     ASSERT_EQ(actual.committed.weight, expected.committed.weight) << label << ": committed weights differ";
     ASSERT_EQ(actual.num_trees, expected.num_trees) << label << ": tree counts differ";
-    ASSERT_EQ(actual.committed_boundary, expected.committed_boundary) << label << ": boundary commit counts differ";
     ASSERT_EQ(actual.residual.size(), expected.residual.size()) << label << ": residual sizes differ";
-    ASSERT_EQ(actual_pairs.size(), expected_pairs.size()) << label << ": committed pair counts differ";
 
     // The separation invariant, on both sides. If this ever fires the Phase-2 error bound is void —
     // release blocker, not a flaky test.
@@ -146,11 +156,14 @@ void expect_level1_identity(
         actual_pairs.begin(),
         actual_pairs.end(),
         expected_pairs.begin(),
+        expected_pairs.end(),
         [](const CommittedPair& a, const CommittedPair& b) {
             return a.from == b.from && a.to == b.to;
         });
     if (!same_pairing)
         tally->pairing_ties++;
+    if (actual.committed_boundary != expected.committed_boundary)
+        tally->boundary_ties++;
     if (actual.largest_tree_size != expected.largest_tree_size ||
         actual.exposed_root_blossoms != expected.exposed_root_blossoms)
         tally->tree_shape_ties++;

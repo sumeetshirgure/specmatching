@@ -58,7 +58,8 @@ Debug invariants 6, 7, 8, 9, 10 and 11 all have coverage. The full suite is 156 
 
 ## Level 1 — one documented departure from the design, with a measurement behind it
 
-§M2.6 asks for the residual *set* and the committed *pair set* to be equal outright, on the grounds
+§M2.6 asks for the residual *set*, the committed *pair set* and `committed_boundary` to be equal
+outright, on the grounds
 that "degenerate path choice cannot move them", and forbids adding a tolerance. Path choice indeed
 cannot move them. But the **choice among optimal primal solutions** can, for a reason the theorem of
 §M2.0 does not cover:
@@ -78,7 +79,7 @@ case in the suite):
 | `Sum_S y_S` at truncation | **0 / 4800** |
 | Total committed weight | **0 / 4800** |
 | `num_trees` (hence residual size) | **0 / 4800** |
-| `committed_boundary` | **0 / 4800** |
+| `committed_boundary` | **0 / 4800** (counted, not asserted — see below) |
 | Observable bytes | **0 / 4800** |
 | Committed *pairing* | 0–25%, rising with defect density |
 | Residual *set* | 0% at `T >= 1.5`; up to 58% at `T = 0.5` on the negative-weight DEM |
@@ -87,11 +88,19 @@ In every divergent shot, both residuals satisfied the separation invariant `Y(u)
 valid exposed sets and Phase 2's error bound holds either way.
 
 Level 1 is therefore asserted as: hard equality, no tolerance, on `Sum_S y_S`, the committed weight,
-`num_trees`, `committed_boundary`, the residual size, the separation invariant on both sides, and
-the partition invariant (committed ∪ residual is exactly the shot's detection events, each
-classified once). A residual or pairing difference that satisfies all of those is recorded as a
-**tie**, in `BallProfile::{residual_ties,pairing_ties}` and in the exit artifact. Anything else
+`num_trees`, the residual size, the separation invariant on both sides, and the partition invariant
+(committed ∪ residual is exactly the shot's detection events, each classified once). A residual,
+pairing or `committed_boundary` difference that satisfies all of those is recorded as a **tie**, in
+`BallProfile::{residual_ties,pairing_ties,boundary_ties}` and in the exit artifact. Anything else
 still throws, and remains debug invariant 10.
+
+`committed_boundary` sits with the pairing rather than with the asserted quantities even though it
+never moved in the campaign above, because it is a property of the chosen pairing and not of the
+dual solution: when a tight collision lets `H` pair two defects that `G` matched to the boundary
+separately, the weight, `num_trees` and the partition are all unchanged and only the boundary count
+moves. The committed *pair count* goes with it — with the matched-defect count pinned by
+`num_trees`, `pairs == (matched + committed_boundary) / 2`, so it can only differ when the boundary
+count does, and asserting it would reinstate the same check under another name.
 
 On the circuit-noise grid of the exit artifact (`d = 5..13`, `p = 5e-4..5e-3`, `T ∈ {1.5, 2}`,
 2000 shots per point) the **residual tie rate is 0.0000 at every one of the 40 points**, and the
