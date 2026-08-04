@@ -22,6 +22,26 @@
 namespace pm {
 namespace two_phase {
 
+/// What a rebuild of the `pm::Mwpm` on `H` actually writes, counted at the write sites (§M2
+/// structural counters). Filled only when a non-null pointer is passed.
+///
+/// `node_records` is the number of `DetectorNode`s whose adjacency state this rebuild resets — not
+/// `H`'s node count: the reset has to cover the *previous* shot's nodes too, so it is
+/// `max(used_nodes, |H|)`.
+///
+/// `edge_records` is the number of directed adjacency entries appended: adjacency is stored
+/// directed, so an undirected edge of `H` is two of them, and a boundary edge is one. Each record
+/// is four parallel-array element writes (`neighbors`, `neighbor_weights`, `neighbor_observables`,
+/// `neighbor_implied_weights`), the last of which is written by the resize pass over the nodes.
+struct BallMwpmCounts {
+    uint64_t node_records{0};
+    uint64_t edge_records{0};
+
+    inline uint64_t total() const {
+        return node_records + edge_records;
+    }
+};
+
 /// A `pm::Mwpm` living on the per-shot graph `H`, rebuilt in place from shot to shot.
 ///
 /// **The discretisation trap (§M2.4).** `UserGraph::to_mwpm` recomputes a normalising constant from
@@ -51,7 +71,7 @@ struct BallMwpm {
 
     /// Rewrites `mwpm`'s matching graph to be `h`. `arena` supplies the scratch for canonicalising
     /// the adjacency, so that this allocates nothing in steady state.
-    void rebuild(const BallTables& tables, const BallGraph& h, BallGraphArena& arena);
+    void rebuild(const BallTables& tables, const BallGraph& h, BallGraphArena& arena, BallMwpmCounts* counts = nullptr);
 };
 
 }  // namespace two_phase

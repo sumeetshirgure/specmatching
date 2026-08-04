@@ -54,7 +54,7 @@ void BallMwpm::configure(size_t num_observables_in, double normalising_constant_
     mwpm = pm::Mwpm();
 }
 
-void BallMwpm::rebuild(const BallTables& tables, const BallGraph& h, BallGraphArena& arena) {
+void BallMwpm::rebuild(const BallTables& tables, const BallGraph& h, BallGraphArena& arena, BallMwpmCounts* counts) {
     assert(normalising_constant == tables.normalising_constant && "H and G must share one normalising constant (§0)");
 
     size_t n = h.num_nodes();
@@ -69,6 +69,11 @@ void BallMwpm::rebuild(const BallTables& tables, const BallGraph& h, BallGraphAr
         grow_events++;
     }
 
+    // The §M2 structural counters, accumulated at the sites that do the writing. Register adds
+    // only; the store happens once, below, and only when a profile asked for it.
+    uint64_t node_records = 0;
+    uint64_t edge_records = 0;
+
     pm::MatchingGraph& graph = mwpm.flooder.graph;
     size_t stale = std::max(used_nodes, n);
     for (size_t i = 0; i < stale; i++) {
@@ -77,6 +82,7 @@ void BallMwpm::rebuild(const BallTables& tables, const BallGraph& h, BallGraphAr
         node.neighbor_weights.clear();
         node.neighbor_observables.clear();
         node.neighbor_implied_weights.clear();
+        node_records++;
     }
     used_nodes = n;
 
@@ -91,6 +97,7 @@ void BallMwpm::rebuild(const BallTables& tables, const BallGraph& h, BallGraphAr
         node.neighbors.push_back(nullptr);
         node.neighbor_weights.push_back(edge.w_int);
         node.neighbor_observables.push_back(boundary_mask_of(tables, edge.det, use_masks));
+        edge_records++;
     }
 
     // Adjacency in ascending neighbour index. Determinism (§0) asks for every output-affecting
@@ -107,13 +114,21 @@ void BallMwpm::rebuild(const BallTables& tables, const BallGraph& h, BallGraphAr
         node.neighbor_weights.push_back(edge.w_int);
         node.neighbor_observables.push_back(
             mask_of(tables, tables.ball_mask_offsets[edge.entry], tables.ball_mask_offsets[edge.entry + 1], use_masks));
+        edge_records++;
     };
     for (const BallGraphEdge& edge : h.edges)
         append(edge.j, edge.i, edge);
     for (const BallGraphEdge& edge : h.edges)
         append(edge.i, edge.j, edge);
+    // One implied-weight slot per adjacency entry already counted above; this is the fourth
+    // parallel array of the same records, not a fifth kind of record.
     for (size_t i = 0; i < n; i++)
         graph.nodes[i].neighbor_implied_weights.resize(graph.nodes[i].neighbors.size());
+
+    if (counts != nullptr) {
+        counts->node_records = node_records;
+        counts->edge_records = edge_records;
+    }
 
     // `H` is built from the post-preamble detection events and carries no negative weights, so the
     // flooder's negative-weight bookkeeping is empty by construction. The offsets that `G`'s

@@ -48,6 +48,32 @@ struct BallProfile {
     int max_degree{0};
     double mean_degree{0};
 
+    /// §M2 structural (hardware-budget) counters. `isect_ns`, `h_build_ns` and `mwpm_build_ns`
+    /// measure this laptop's DRAM latency; these measure what the three stages we intend to move
+    /// off the CPU actually *move*, which is machine-independent and can be fed to a latency model
+    /// for the target architecture.
+    ///
+    /// `isect_bytes` is build-mode dependent, hence `isect_mode_bitset` next to it, and
+    /// `isect_scan_bytes_other_mode` — what the other mode's traversal would have read on this
+    /// same shot, derived from the tables rather than measured by running it.
+    uint64_t isect_scan_bytes{0};
+    uint64_t isect_hit_bytes{0};
+    uint64_t isect_scan_bytes_other_mode{0};
+    bool isect_mode_bitset{false};
+    /// Edge records `H` construction emits: undirected defect-defect pairs, each once, plus
+    /// boundary edges. This is the crossbar's area; `max_degree` is its width.
+    int hbld_edges_written{0};
+    /// What `BallMwpm::rebuild` writes, counted at the write sites. See `BallMwpmCounts`.
+    int mwpm_init_node_elements{0};
+    int mwpm_init_edge_elements{0};
+
+    inline uint64_t isect_bytes() const {
+        return isect_scan_bytes + isect_hit_bytes;
+    }
+    inline int mwpm_init_elements() const {
+        return mwpm_init_node_elements + mwpm_init_edge_elements;
+    }
+
     /// Shells actually materialised, and rungs of the restart ladder taken (§M2.8). With the
     /// default `shell_width = 0` these are 1 and 0 on every shot.
     int shells_materialized{1};
@@ -123,6 +149,26 @@ struct BallAggregateStats {
     uint64_t residual_ties{0};
     uint64_t pairing_ties{0};
 
+    /// §M2 structural counters. Sums *and* maxima: the latency budget of a hardware stage is set by
+    /// the worst shot it has to absorb, not by the mean.
+    uint64_t sum_isect_scan_bytes{0};
+    uint64_t sum_isect_hit_bytes{0};
+    uint64_t sum_isect_bytes{0};
+    uint64_t sum_isect_scan_bytes_other_mode{0};
+    uint64_t max_isect_scan_bytes{0};
+    uint64_t max_isect_hit_bytes{0};
+    uint64_t max_isect_bytes{0};
+    uint64_t max_isect_scan_bytes_other_mode{0};
+    uint64_t sum_hbld_edges_written{0};
+    uint64_t max_hbld_edges_written{0};
+    uint64_t sum_mwpm_init_node_elements{0};
+    uint64_t sum_mwpm_init_edge_elements{0};
+    uint64_t sum_mwpm_init_elements{0};
+    uint64_t max_mwpm_init_elements{0};
+    /// Shots decoded in `BITSET` mode. Equal to `shots` or 0 in any single-mode campaign, which is
+    /// how `BallSummary::mode_bitset` decides what to label the row.
+    uint64_t shots_bitset_mode{0};
+
     /// §M2.9.6 accumulators.
     long long sum_harvest_enumerate_ns{0};
     long long sum_harvest_reduce_ns{0};
@@ -149,6 +195,11 @@ struct BallAggregateStats {
     bool keep_per_shot{false};
     std::vector<long long> per_shot_total_ns;
     std::vector<long long> per_shot_g_reference_ns;
+    /// Benchmark mode only, exactly like the wall times above, so the structural counters get the
+    /// same p99/p999 treatment.
+    std::vector<long long> per_shot_isect_bytes;
+    std::vector<long long> per_shot_hbld_edges_written;
+    std::vector<long long> per_shot_mwpm_init_elements;
 
     void reset() {
         *this = BallAggregateStats();
@@ -180,6 +231,23 @@ struct BallAggregateStats {
         residual_ties += (uint64_t)profile.residual_ties;
         pairing_ties += (uint64_t)profile.pairing_ties;
 
+        sum_isect_scan_bytes += profile.isect_scan_bytes;
+        sum_isect_hit_bytes += profile.isect_hit_bytes;
+        sum_isect_bytes += profile.isect_bytes();
+        sum_isect_scan_bytes_other_mode += profile.isect_scan_bytes_other_mode;
+        max_isect_scan_bytes = std::max(max_isect_scan_bytes, profile.isect_scan_bytes);
+        max_isect_hit_bytes = std::max(max_isect_hit_bytes, profile.isect_hit_bytes);
+        max_isect_bytes = std::max(max_isect_bytes, profile.isect_bytes());
+        max_isect_scan_bytes_other_mode =
+            std::max(max_isect_scan_bytes_other_mode, profile.isect_scan_bytes_other_mode);
+        sum_hbld_edges_written += (uint64_t)profile.hbld_edges_written;
+        max_hbld_edges_written = std::max(max_hbld_edges_written, (uint64_t)profile.hbld_edges_written);
+        sum_mwpm_init_node_elements += (uint64_t)profile.mwpm_init_node_elements;
+        sum_mwpm_init_edge_elements += (uint64_t)profile.mwpm_init_edge_elements;
+        sum_mwpm_init_elements += (uint64_t)profile.mwpm_init_elements();
+        max_mwpm_init_elements = std::max(max_mwpm_init_elements, (uint64_t)profile.mwpm_init_elements());
+        shots_bitset_mode += profile.isect_mode_bitset ? 1 : 0;
+
         sum_harvest_enumerate_ns += profile.harvest_enumerate_ns;
         sum_harvest_reduce_ns += profile.harvest_reduce_ns;
         sum_harvest_base_descent_ns += profile.harvest_base_descent_ns;
@@ -206,6 +274,9 @@ struct BallAggregateStats {
         if (keep_per_shot) {
             per_shot_total_ns.push_back(profile.total_ns);
             per_shot_g_reference_ns.push_back(profile.g_reference_ns);
+            per_shot_isect_bytes.push_back((long long)profile.isect_bytes());
+            per_shot_hbld_edges_written.push_back((long long)profile.hbld_edges_written);
+            per_shot_mwpm_init_elements.push_back((long long)profile.mwpm_init_elements());
         }
     }
 };
@@ -227,6 +298,7 @@ struct BallSummary {
     double frac_harvest{0};
 
     double mean_degree{0};
+    double max_degree{0};
     double mean_h_nodes{0};
     double mean_h_edges{0};
     double mean_residual_density{0};
@@ -259,6 +331,38 @@ struct BallSummary {
     /// The number the M2.9 exit checkpoint asks for: harvest's share of the critical path that is
     /// left once the embarrassingly parallel stages collapse, measured rather than estimated.
     double harvest_share_of_critical_path{0};
+
+    /// §M2 structural counters, per shot unless the name says otherwise.
+    ///
+    /// `isect_bytes_per_defect` is the one that gets quoted: it is the local memory a per-defect
+    /// processing element has to be able to stream, which is the M2 exit checkpoint's headline
+    /// number for the local-memory hardware argument. The divisor is `h_nodes` — the post-preamble
+    /// defects, which is exactly the loop's trip count — not the raw detection-event count.
+    bool mode_bitset{false};
+    double mean_isect_bytes{0};
+    double mean_isect_scan_bytes{0};
+    double mean_isect_hit_bytes{0};
+    double mean_isect_bytes_other_mode{0};
+    double isect_bytes_per_defect{0};
+    double isect_scan_bytes_per_defect{0};
+    double isect_hit_bytes_per_defect{0};
+    double isect_bytes_other_mode_per_defect{0};
+    double max_isect_bytes{0};
+    double max_isect_scan_bytes{0};
+    double max_isect_hit_bytes{0};
+    double max_isect_bytes_other_mode{0};
+    double p99_isect_bytes{0};
+    double p999_isect_bytes{0};
+    double mean_hbld_edges_written{0};
+    double max_hbld_edges_written{0};
+    double p99_hbld_edges_written{0};
+    double p999_hbld_edges_written{0};
+    double mean_mwpm_init_elements{0};
+    double mean_mwpm_init_node_elements{0};
+    double mean_mwpm_init_edge_elements{0};
+    double max_mwpm_init_elements{0};
+    double p99_mwpm_init_elements{0};
+    double p999_mwpm_init_elements{0};
 };
 
 inline BallSummary summarize_ball(const BallAggregateStats& stats) {
@@ -282,6 +386,7 @@ inline BallSummary summarize_ball(const BallAggregateStats& stats) {
     summary.p999_total_ns = percentile_of(stats.per_shot_total_ns, 0.999);
     summary.mean_h_nodes = (double)stats.sum_h_nodes / shots;
     summary.mean_h_edges = (double)stats.sum_h_edges / shots;
+    summary.max_degree = (double)stats.max_degree;
     if (stats.sum_h_nodes)
         summary.mean_degree = 2.0 * (double)stats.sum_h_edges / (double)stats.sum_h_nodes;
     if (stats.sum_n_defects)
@@ -312,6 +417,35 @@ inline BallSummary summarize_ball(const BallAggregateStats& stats) {
     double critical_path = summary.mean_harvest_dependent_depth + summary.mean_solve_dependent_depth;
     if (critical_path > 0)
         summary.harvest_share_of_critical_path = summary.mean_harvest_dependent_depth / critical_path;
+
+    summary.mode_bitset = stats.shots_bitset_mode == stats.shots;
+    summary.mean_isect_bytes = (double)stats.sum_isect_bytes / shots;
+    summary.mean_isect_scan_bytes = (double)stats.sum_isect_scan_bytes / shots;
+    summary.mean_isect_hit_bytes = (double)stats.sum_isect_hit_bytes / shots;
+    summary.mean_isect_bytes_other_mode = (double)stats.sum_isect_scan_bytes_other_mode / shots;
+    if (stats.sum_h_nodes) {
+        double defects = (double)stats.sum_h_nodes;
+        summary.isect_bytes_per_defect = (double)stats.sum_isect_bytes / defects;
+        summary.isect_scan_bytes_per_defect = (double)stats.sum_isect_scan_bytes / defects;
+        summary.isect_hit_bytes_per_defect = (double)stats.sum_isect_hit_bytes / defects;
+        summary.isect_bytes_other_mode_per_defect = (double)stats.sum_isect_scan_bytes_other_mode / defects;
+    }
+    summary.max_isect_bytes = (double)stats.max_isect_bytes;
+    summary.max_isect_scan_bytes = (double)stats.max_isect_scan_bytes;
+    summary.max_isect_hit_bytes = (double)stats.max_isect_hit_bytes;
+    summary.max_isect_bytes_other_mode = (double)stats.max_isect_scan_bytes_other_mode;
+    summary.p99_isect_bytes = percentile_of(stats.per_shot_isect_bytes, 0.99);
+    summary.p999_isect_bytes = percentile_of(stats.per_shot_isect_bytes, 0.999);
+    summary.mean_hbld_edges_written = (double)stats.sum_hbld_edges_written / shots;
+    summary.max_hbld_edges_written = (double)stats.max_hbld_edges_written;
+    summary.p99_hbld_edges_written = percentile_of(stats.per_shot_hbld_edges_written, 0.99);
+    summary.p999_hbld_edges_written = percentile_of(stats.per_shot_hbld_edges_written, 0.999);
+    summary.mean_mwpm_init_elements = (double)stats.sum_mwpm_init_elements / shots;
+    summary.mean_mwpm_init_node_elements = (double)stats.sum_mwpm_init_node_elements / shots;
+    summary.mean_mwpm_init_edge_elements = (double)stats.sum_mwpm_init_edge_elements / shots;
+    summary.max_mwpm_init_elements = (double)stats.max_mwpm_init_elements;
+    summary.p99_mwpm_init_elements = percentile_of(stats.per_shot_mwpm_init_elements, 0.99);
+    summary.p999_mwpm_init_elements = percentile_of(stats.per_shot_mwpm_init_elements, 0.999);
     return summary;
 }
 

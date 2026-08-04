@@ -306,6 +306,12 @@ int main(int argc, char** argv) {
     }
 
     // ------------------------------------------------------------------- section: speedup vs M1
+    //
+    // The structural counters share this section's sweep — they are per-shot quantities of the same
+    // decodes — but they are a different kind of number (bytes and elements, not nanoseconds), so
+    // they get their own table, printed after this one. Rows are buffered rather than printed
+    // inline so that the two tables do not interleave.
+    std::vector<std::string> structural_rows;
     std::printf("\n=== speedup vs M1 Phase 1 on G (%zu shots per point) ===\n", options.shots);
     std::printf(
         "%4s %8s %5s %9s %9s %9s %8s %8s %9s %8s %8s %7s %7s %7s %7s %7s %8s %8s\n",
@@ -376,15 +382,27 @@ int main(int argc, char** argv) {
                 // The §M2.6 tie rates, collected in a separate *untimed* pass. The committed pair
                 // set only exists in the match-edges flavour, so the pairing rate cannot be read
                 // off the obs-flavour hot path above without changing what is being timed.
+                //
+                // The §M2 structural counters ride along on this pass for the same reason, one
+                // step stronger: charging every pair its observable id list costs 26-44% of
+                // `intersect_ns`, so collecting them in the timed pass would corrupt the very
+                // split printed above. They are structural — a function of the shot and the
+                // tables — so measuring them here rather than there changes nothing about them.
+                decoder.config.collect_structural_counters = true;
+                BallAggregateStats structural_stats;
+                structural_stats.keep_per_shot = true;
                 BallProfile tie_profile;
                 std::vector<CommittedPair> pairs;
                 uint64_t residual_ties = 0;
                 uint64_t pairing_ties = 0;
                 for (const auto& shot : experiment.shots) {
-                    decoder.decode_phase1_to_match_edges(shot, pairs, &tie_profile);
+                    HarvestResult harvest = decoder.decode_phase1_to_match_edges(shot, pairs, &tie_profile);
+                    structural_stats.accumulate(tie_profile, harvest);
                     residual_ties += (uint64_t)tie_profile.residual_ties;
                     pairing_ties += (uint64_t)tie_profile.pairing_ties;
                 }
+                decoder.config.collect_structural_counters = false;
+                BallSummary structural = summarize_ball(structural_stats);
                 double tie_shots = (double)std::max<size_t>(1, experiment.shots.size());
                 summary.residual_tie_rate = (double)residual_ties / tie_shots;
                 summary.pairing_tie_rate = (double)pairing_ties / tie_shots;
@@ -432,9 +450,144 @@ int main(int argc, char** argv) {
                 emit("profile", distance, noise, t_edges, "residual_tie_rate", summary.residual_tie_rate);
                 emit("profile", distance, noise, t_edges, "pairing_tie_rate", summary.pairing_tie_rate);
                 emit("profile", distance, noise, t_edges, "mean_restarts", summary.mean_restarts);
+
+                // The §M2 structural counters: what the three stages we intend to move off the CPU
+                // — intersect, H build, MWPM rebuild — actually move, in bytes and element writes
+                // rather than in this laptop's nanoseconds.
+                char row[512];
+                std::snprintf(
+                    row,
+                    sizeof(row),
+                    "%4zu %8.4f %5.2f %7s %9.1f %8.1f %12.1f %10.1f %12.1f %10.1f %12.1f %9.2f %6.0f %10.2f",
+                    distance,
+                    noise,
+                    t_edges,
+                    structural.mode_bitset ? "bitset" : "scan",
+                    structural.mean_h_nodes,
+                    structural.mean_h_edges,
+                    structural.mean_isect_bytes,
+                    structural.isect_bytes_per_defect,
+                    structural.mean_isect_scan_bytes,
+                    structural.mean_isect_hit_bytes,
+                    structural.mean_isect_bytes_other_mode,
+                    structural.mean_hbld_edges_written,
+                    structural.max_degree,
+                    structural.mean_mwpm_init_elements);
+                structural_rows.emplace_back(row);
+
+                emit("profile", distance, noise, t_edges, "isect_mode_bitset", structural.mode_bitset ? 1.0 : 0.0);
+                emit("profile", distance, noise, t_edges, "isect_bytes", structural.mean_isect_bytes);
+                emit("profile", distance, noise, t_edges, "isect_scan_bytes", structural.mean_isect_scan_bytes);
+                emit("profile", distance, noise, t_edges, "isect_hit_bytes", structural.mean_isect_hit_bytes);
+                emit(
+                    "profile",
+                    distance,
+                    noise,
+                    t_edges,
+                    "isect_bytes_other_mode",
+                    structural.mean_isect_bytes_other_mode);
+                emit("profile", distance, noise, t_edges, "isect_bytes_per_defect", structural.isect_bytes_per_defect);
+                emit(
+                    "profile",
+                    distance,
+                    noise,
+                    t_edges,
+                    "isect_scan_bytes_per_defect",
+                    structural.isect_scan_bytes_per_defect);
+                emit(
+                    "profile",
+                    distance,
+                    noise,
+                    t_edges,
+                    "isect_hit_bytes_per_defect",
+                    structural.isect_hit_bytes_per_defect);
+                emit(
+                    "profile",
+                    distance,
+                    noise,
+                    t_edges,
+                    "isect_bytes_other_mode_per_defect",
+                    structural.isect_bytes_other_mode_per_defect);
+                emit("profile", distance, noise, t_edges, "max_isect_bytes", structural.max_isect_bytes);
+                emit("profile", distance, noise, t_edges, "max_isect_scan_bytes", structural.max_isect_scan_bytes);
+                emit("profile", distance, noise, t_edges, "max_isect_hit_bytes", structural.max_isect_hit_bytes);
+                emit(
+                    "profile",
+                    distance,
+                    noise,
+                    t_edges,
+                    "max_isect_bytes_other_mode",
+                    structural.max_isect_bytes_other_mode);
+                emit("profile", distance, noise, t_edges, "p99_isect_bytes", structural.p99_isect_bytes);
+                emit("profile", distance, noise, t_edges, "p999_isect_bytes", structural.p999_isect_bytes);
+                emit("profile", distance, noise, t_edges, "hbld_edges_written", structural.mean_hbld_edges_written);
+                emit("profile", distance, noise, t_edges, "max_hbld_edges_written", structural.max_hbld_edges_written);
+                emit("profile", distance, noise, t_edges, "p99_hbld_edges_written", structural.p99_hbld_edges_written);
+                emit(
+                    "profile", distance, noise, t_edges, "p999_hbld_edges_written", structural.p999_hbld_edges_written);
+                emit("profile", distance, noise, t_edges, "h_max_degree", structural.max_degree);
+                emit("profile", distance, noise, t_edges, "mwpm_init_elements", structural.mean_mwpm_init_elements);
+                emit(
+                    "profile",
+                    distance,
+                    noise,
+                    t_edges,
+                    "mwpm_init_node_elements",
+                    structural.mean_mwpm_init_node_elements);
+                emit(
+                    "profile",
+                    distance,
+                    noise,
+                    t_edges,
+                    "mwpm_init_edge_elements",
+                    structural.mean_mwpm_init_edge_elements);
+                emit("profile", distance, noise, t_edges, "max_mwpm_init_elements", structural.max_mwpm_init_elements);
+                emit("profile", distance, noise, t_edges, "p99_mwpm_init_elements", structural.p99_mwpm_init_elements);
+                emit(
+                    "profile", distance, noise, t_edges, "p999_mwpm_init_elements", structural.p999_mwpm_init_elements);
             }
         }
     }
+
+    // -------------------------------------------------------- section: structural (budget) counters
+    //
+    // Wall time for `isect`, `hbld` and `mwpm` measures this laptop's DRAM latency, not the target
+    // architecture. These are the machine-independent quantities behind those three stages: bytes
+    // moved out of the ball tables, edge records emitted, element writes into the `Mwpm` on `H`.
+    // `isect_B/def` is the per-PE local-memory budget; `other_B` is what the *other* build mode's
+    // traversal would have read on the same shots, so the SCAN/BITSET crossover can be read off
+    // without running both.
+    std::printf("\n=== structural counters, per shot (%zu shots per point) ===\n", options.shots);
+    std::printf(
+        "%4s %8s %5s %7s %9s %8s %12s %10s %12s %10s %12s %9s %6s %10s\n",
+        "d",
+        "p",
+        "T",
+        "mode",
+        "h_nodes",
+        "h_edges",
+        "isect_B",
+        "isect_B/def",
+        "scan_B",
+        "hit_B",
+        "other_B",
+        "hbld_edges",
+        "maxdeg",
+        "mwpm_init");
+    for (const std::string& row : structural_rows)
+        std::printf("%s\n", row.c_str());
+    std::printf(
+        "element sizes (bytes): ball_target %llu, ball_w_int %llu, ball_words %llu, ball_word_rank %llu, "
+        "ball_entry_by_rank %llu, ball_mask_offsets %llu, ball_mask_ids %llu, has_bcost %llu, bcost_w_int %llu\n",
+        (unsigned long long)ball_element_bytes::TARGET,
+        (unsigned long long)ball_element_bytes::WEIGHT,
+        (unsigned long long)ball_element_bytes::WORD,
+        (unsigned long long)ball_element_bytes::WORD_RANK,
+        (unsigned long long)ball_element_bytes::ENTRY_BY_RANK,
+        (unsigned long long)ball_element_bytes::MASK_OFFSET,
+        (unsigned long long)ball_element_bytes::MASK_ID,
+        (unsigned long long)ball_element_bytes::HAS_BCOST,
+        (unsigned long long)ball_element_bytes::BCOST_WEIGHT);
 
     // ------------------------------------------------- section: level 3, end-to-end logical error
     //

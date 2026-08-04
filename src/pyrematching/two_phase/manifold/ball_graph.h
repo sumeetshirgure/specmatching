@@ -97,6 +97,52 @@ struct BallGraphTiming {
     long long finalize_ns{0};
 };
 
+/// Element sizes of the ball-table pools the shot-time intersection reads, taken from the array
+/// types themselves rather than assumed. The structural counters are quoted in bytes and the
+/// conversion has to survive someone widening `pm::weight_int` or narrowing `ball_target`.
+namespace ball_element_bytes {
+inline constexpr uint64_t TARGET = sizeof(decltype(BallTables::ball_target)::value_type);
+inline constexpr uint64_t WEIGHT = sizeof(decltype(BallTables::ball_w_int)::value_type);
+inline constexpr uint64_t WORD = sizeof(decltype(BallTables::ball_words)::value_type);
+inline constexpr uint64_t WORD_RANK = sizeof(decltype(BallTables::ball_word_rank)::value_type);
+inline constexpr uint64_t ENTRY_BY_RANK = sizeof(decltype(BallTables::ball_entry_by_rank)::value_type);
+inline constexpr uint64_t MASK_OFFSET = sizeof(decltype(BallTables::ball_mask_offsets)::value_type);
+inline constexpr uint64_t MASK_ID = sizeof(decltype(BallTables::ball_mask_ids)::value_type);
+inline constexpr uint64_t HAS_BCOST = sizeof(decltype(BallTables::has_bcost)::value_type);
+inline constexpr uint64_t BCOST_WEIGHT = sizeof(decltype(BallTables::bcost_w_int)::value_type);
+inline constexpr uint64_t BCOST_MASK_OFFSET = sizeof(decltype(BallTables::bcost_mask_offsets)::value_type);
+inline constexpr uint64_t BCOST_MASK_ID = sizeof(decltype(BallTables::bcost_mask_ids)::value_type);
+}  // namespace ball_element_bytes
+
+/// What the intersection *moves*, rather than how long it takes on this laptop: the structural
+/// (hardware-budget) counters of §M2. `intersect_ns` measures this machine's DRAM latency; these
+/// measure the quantity a target architecture would have to move, and can be fed to a latency model
+/// for any architecture. Filled only when a non-null pointer is passed.
+///
+/// The counters are accumulated at the sites that do the reads, so an early-terminating loop is
+/// counted as it actually ran, not as the model would have it run.
+struct BallGraphCounts {
+    /// The traversal itself: the bitset window in `BITSET` mode, the ball entries walked in `SCAN`.
+    /// Per-node CSR offset lookups (`ball_offsets`, `ball_word_offsets`, `ball_word_base`) are
+    /// excluded in both modes — 16-20 B per defect against a ~1 kB window.
+    uint64_t isect_scan_bytes{0};
+    /// Fetched only because a candidate pair showed up: the rank -> entry indirection and the
+    /// weight in `BITSET` mode (where the bitset carries neither), the observable id list of every
+    /// pair that becomes an edge, and the `bcost_*` boundary lookups.
+    uint64_t isect_hit_bytes{0};
+    /// What the *other* build mode's traversal would have read on the same shot, derived from the
+    /// tables without running it. This is the number that says whether the `SCAN`/`BITSET`
+    /// crossover has moved at large `d`.
+    uint64_t isect_scan_bytes_other_mode{0};
+    /// Edge records emitted: undirected defect-defect pairs, each counted once, and boundary edges.
+    uint64_t edges_written{0};
+    uint64_t boundary_edges_written{0};
+
+    inline uint64_t isect_bytes() const {
+        return isect_scan_bytes + isect_hit_bytes;
+    }
+};
+
 /// Builds `H` for one shot.
 ///
 /// `seeded_dets` must be the **post-preamble** detection events: the shot's events symmetric
@@ -111,7 +157,8 @@ void build_ball_graph(
     horizon_int horizon,
     BallGraphArena& arena,
     BallGraphBuildMode mode,
-    BallGraphTiming* timing = nullptr);
+    BallGraphTiming* timing = nullptr,
+    BallGraphCounts* counts = nullptr);
 
 }  // namespace two_phase
 }  // namespace pm

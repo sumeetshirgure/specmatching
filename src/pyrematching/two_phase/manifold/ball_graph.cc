@@ -35,6 +35,44 @@ uint64_t total_capacity(const BallGraphArena& arena) {
            arena.det_to_h.capacity() + arena.syndrome_words.capacity() + arena.touched_words.capacity();
 }
 
+/// Bytes of the observable id list behind one ball entry, plus the two CSR offsets that bound it.
+/// Physically these are read by `BallMwpm::rebuild`, not by the loop below; they are charged to the
+/// intersection because the pair is what selects them, and because the hardware stage the counter
+/// is sizing does the selection and the fetch together.
+uint64_t mask_bytes(const BallTables& tables, uint64_t entry) {
+    using namespace ball_element_bytes;
+    return 2 * MASK_OFFSET + (tables.ball_mask_offsets[entry + 1] - tables.ball_mask_offsets[entry]) * MASK_ID;
+}
+
+uint64_t boundary_mask_bytes(const BallTables& tables, uint64_t det) {
+    using namespace ball_element_bytes;
+    return 2 * BCOST_MASK_OFFSET +
+           (tables.bcost_mask_offsets[det + 1] - tables.bcost_mask_offsets[det]) * BCOST_MASK_ID;
+}
+
+/// What `BITSET` would have read for `det`, without running it: the node's bitset window, clamped
+/// exactly where the loop clamps it — a window whose tail runs past the syndrome bitset is cut
+/// short there.
+uint64_t bitset_words_counterfactual(const BallTables& tables, uint64_t det, size_t syndrome_words) {
+    uint64_t base = tables.ball_word_base[det];
+    if (base >= syndrome_words)
+        return 0;
+    return std::min(tables.word_len(det), (uint64_t)syndrome_words - base);
+}
+
+/// What `SCAN` would have walked for `det` at this horizon, without running it. The entries are
+/// sorted by `(w_int, target)`, so the walk stops at the first one past `2T` — and that entry's
+/// weight is still read, which is the `+ 1`.
+uint64_t scan_entries_counterfactual(const BallTables& tables, uint64_t det, pm::cumulative_time_int two_t) {
+    auto first = tables.ball_w_int.begin() + (ptrdiff_t)tables.ball_begin(det);
+    auto last = tables.ball_w_int.begin() + (ptrdiff_t)tables.ball_end(det);
+    auto stop = std::upper_bound(first, last, two_t, [](pm::cumulative_time_int bound, pm::weight_int w) {
+        return bound < (pm::cumulative_time_int)w;
+    });
+    uint64_t walked = (uint64_t)(stop - first);
+    return stop == last ? walked : walked + 1;
+}
+
 }  // namespace
 
 void BallGraphArena::reset_for_graph(size_t num_detector_nodes) {
@@ -51,7 +89,8 @@ void build_ball_graph(
     horizon_int horizon,
     BallGraphArena& arena,
     BallGraphBuildMode mode,
-    BallGraphTiming* timing) {
+    BallGraphTiming* timing,
+    BallGraphCounts* counts) {
     if (horizon != pm::NO_HORIZON && horizon > tables.t_max_int)
         throw std::invalid_argument(
             "The requested horizon exceeds the compiled BallParams::T_max; recompile the ball tables. Decoding "
@@ -93,12 +132,24 @@ void build_ball_graph(
     }
 
     // ---- Edges. Each pair is emitted once, from its lower-id endpoint.
+    //
+    // The `structural_*` locals are the §M2 hardware-budget counters. Everything that is a plain
+    // register increment is accumulated unconditionally and stored out once at the end, so the
+    // no-profile path pays a loop-carried add and no memory traffic; anything that needs a table
+    // read the decode itself does not do sits behind `counts != nullptr`.
+    uint64_t structural_scan_entries = 0;
+    uint64_t structural_scan_words = 0;
+    uint64_t structural_hit_bytes = 0;
+    uint64_t structural_other_mode_bytes = 0;
+    uint64_t structural_edges = 0;
+    uint64_t structural_boundary_edges = 0;
     for (uint32_t i = 0; i < graph.h_to_det.size(); i++) {
         uint64_t det = graph.h_to_det[i];
 
         if (mode == BallGraphBuildMode::SCAN) {
             uint64_t end = tables.ball_end(det);
             for (uint64_t e = tables.ball_begin(det); e < end; e++) {
+                structural_scan_entries++;
                 // Entries are sorted by `(w_int, target)`, so the first entry past `2T` ends the
                 // scan: everything after it is unreachable by §M2.0, not merely unlikely.
                 if ((pm::cumulative_time_int)tables.ball_w_int[e] > two_t)
@@ -110,6 +161,9 @@ void build_ball_graph(
                 if (j == NOT_A_DEFECT)
                     continue;
                 graph.edges.push_back(BallGraphEdge{i, j, tables.ball_w_int[e], e});
+                structural_edges++;
+                if (counts != nullptr)
+                    structural_hit_bytes += mask_bytes(tables, e);
             }
         } else {
             uint64_t words_begin = tables.ball_word_offsets[det];
@@ -120,6 +174,7 @@ void build_ball_graph(
                 size_t syndrome_word = base + (k - words_begin);
                 if (syndrome_word >= arena.syndrome_words.size())
                     break;
+                structural_scan_words++;
                 uint64_t hits = tables.ball_words[k] & arena.syndrome_words[syndrome_word];
                 while (hits != 0) {
                     uint64_t bit = hits & (~hits + 1);
@@ -134,16 +189,57 @@ void build_ball_graph(
                         tables.ball_word_rank[k] + (uint32_t)__builtin_popcountll(tables.ball_words[k] & (bit - 1));
                     uint64_t entry = tables.ball_entry_by_rank[entry_begin + rank];
                     pm::weight_int w_int = tables.ball_w_int[entry];
+                    // The rank indirection and the weight are read for every candidate, including
+                    // the ones the `2T` test then rejects: the bitset carries neither, so there is
+                    // no way to apply the test without fetching them first.
+                    if (counts != nullptr)
+                        structural_hit_bytes += ball_element_bytes::WORD_RANK + ball_element_bytes::ENTRY_BY_RANK +
+                                                ball_element_bytes::WEIGHT;
                     if ((pm::cumulative_time_int)w_int > two_t)
                         continue;
                     graph.edges.push_back(BallGraphEdge{i, arena.det_to_h[target], w_int, entry});
+                    structural_edges++;
+                    if (counts != nullptr)
+                        structural_hit_bytes += mask_bytes(tables, entry);
                 }
             }
         }
 
-        if (tables.has_bcost[det] &&
-            (pm::cumulative_time_int)tables.bcost_w_int[det] <= (pm::cumulative_time_int)horizon)
+        bool has_boundary = tables.has_bcost[det] != 0;
+        bool boundary_within_horizon =
+            has_boundary && (pm::cumulative_time_int)tables.bcost_w_int[det] <= (pm::cumulative_time_int)horizon;
+        if (boundary_within_horizon) {
             graph.boundary_edges.push_back(BallBoundaryEdge{i, tables.bcost_w_int[det], det});
+            structural_boundary_edges++;
+        }
+        if (counts != nullptr) {
+            structural_hit_bytes += ball_element_bytes::HAS_BCOST;
+            if (has_boundary)
+                structural_hit_bytes += ball_element_bytes::BCOST_WEIGHT;
+            if (boundary_within_horizon)
+                structural_hit_bytes += boundary_mask_bytes(tables, det);
+            structural_other_mode_bytes +=
+                mode == BallGraphBuildMode::SCAN
+                    ? bitset_words_counterfactual(tables, det, arena.syndrome_words.size()) * ball_element_bytes::WORD
+                    : scan_entries_counterfactual(tables, det, two_t) *
+                          (ball_element_bytes::TARGET + ball_element_bytes::WEIGHT);
+        }
+    }
+
+    // The edge records emitted are exactly what `H` ends up holding: `graph.edges` is cleared at
+    // the top and only ever appended to, and each undirected pair is appended once, from its
+    // lower-id endpoint. That is what lets the aggregate read `hbld_edges_written` off `H`'s own
+    // sizes and still call it a count of writes.
+    assert(structural_edges == graph.edges.size() && "an undirected pair was emitted more than once");
+    assert(structural_boundary_edges == graph.boundary_edges.size());
+
+    if (counts != nullptr) {
+        counts->isect_scan_bytes = structural_scan_entries * (ball_element_bytes::TARGET + ball_element_bytes::WEIGHT) +
+                                   structural_scan_words * ball_element_bytes::WORD;
+        counts->isect_hit_bytes = structural_hit_bytes;
+        counts->isect_scan_bytes_other_mode = structural_other_mode_bytes;
+        counts->edges_written = structural_edges;
+        counts->boundary_edges_written = structural_boundary_edges;
     }
 
     if (timing != nullptr) {

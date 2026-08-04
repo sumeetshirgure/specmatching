@@ -130,6 +130,78 @@ def pipeline_split_table(table):
               f"{(critical / total if total else 0):>7.3f}")
 
 
+def structural_table(table):
+    """The hardware-budget counters: bytes moved and elements written, not nanoseconds.
+
+    `isect`, `hbld` and `mwpm_rebuild` are the three stages meant to move off the CPU, so their
+    wall time measures this laptop's DRAM latency rather than the target architecture. These are
+    the machine-independent quantities behind them, and they feed a latency model directly.
+
+    `isect_B/def` divides by `h_nodes` — the post-preamble defects, which is exactly the
+    intersection loop's trip count — and is the per-PE local-memory budget the M2 exit checkpoint
+    asks to be quoted. `other_B` is what the *other* build mode's traversal would have read on the
+    same shots, derived from the tables without running it: that is the SCAN/BITSET crossover.
+
+    Artifacts predating the counters print `-` throughout.
+    """
+    print("\n## Structural counters (bytes moved, elements written), per shot\n")
+    print(f"{'d':>4} {'p':>8} {'T':>5} {'mode':>7} {'h_nodes':>8} {'h_edges':>8} "
+          f"{'isect_B':>10} {'B/def':>9} {'scan_B':>10} {'hit_B':>9} {'other_B':>10} "
+          f"{'hbld_edges':>10} {'maxdeg':>6} {'mwpm_init':>9} {'max_isect_B':>11}")
+    for d, p, t, values in sorted(rows_of(table, "profile")):
+        if "isect_bytes" not in values:
+            print(f"{d:>4} {p:>8.4f} {t:>5.2f} " + " ".join(f"{'-':>{w}}" for w in
+                  (7, 8, 8, 10, 9, 10, 9, 10, 10, 6, 9, 11)))
+            continue
+        mode = "bitset" if values.get("isect_mode_bitset", 0) else "scan"
+        print(f"{d:>4} {p:>8.4f} {t:>5.2f} {mode:>7} "
+              f"{values['mean_h_nodes']:>8.1f} {values['mean_h_edges']:>8.1f} "
+              f"{values['isect_bytes']:>10.1f} {values['isect_bytes_per_defect']:>9.1f} "
+              f"{values['isect_scan_bytes']:>10.1f} {values['isect_hit_bytes']:>9.1f} "
+              f"{values['isect_bytes_other_mode']:>10.1f} "
+              f"{values['hbld_edges_written']:>10.2f} {values['h_max_degree']:>6.0f} "
+              f"{values['mwpm_init_elements']:>9.2f} {values['max_isect_bytes']:>11.0f}")
+
+
+def structural_checks_table(table):
+    """The three read-offs the counters exist for, as ratios rather than raw numbers.
+
+    - `scan_B/def` against `words x 8` (BITSET) or `mean|B| x 8` (SCAN) says whether the traversal
+      reads each defect's window exactly once. A ratio far from 1 means it does not.
+    - `scan_B/def` at fixed `d` should barely move with `p`; `hit_B/def` should grow with it.
+    - `edges/node` against the reported mean degree says which convention the edge count is in:
+      `hbld_edges_written` counts each undirected pair once, so it should sit near `deg / 2` plus
+      the boundary edges.
+    """
+    rows = [r for r in rows_of(table, "profile") if "isect_bytes" in r[3]]
+    if not rows:
+        return
+    ball = {d: values for d, _, _, values in rows_of(table, "ball")}
+    print("\n## Structural counter read-offs\n")
+    print(f"{'d':>4} {'p':>8} {'T':>5} {'mode':>7} {'scan_B/def':>10} {'window_B':>9} {'ratio':>6} "
+          f"{'hit_B/def':>10} {'edges/node':>10} {'deg':>6} {'2*edges/node/deg':>17}")
+    for d, p, t, values in sorted(rows):
+        bitset = bool(values.get("isect_mode_bitset", 0))
+        table_row = ball.get(d, {})
+        window = (table_row.get("mean_ball_word_len", 0) * 8 if bitset
+                  else table_row.get("mean_ball_size", 0) * 8)
+        scan_per_defect = values["isect_scan_bytes_per_defect"]
+        nodes = values["mean_h_nodes"]
+        edges_per_node = values["hbld_edges_written"] / nodes if nodes else 0
+        degree = values["mean_degree"]
+        print(f"{d:>4} {p:>8.4f} {t:>5.2f} {'bitset' if bitset else 'scan':>7} "
+              f"{scan_per_defect:>10.1f} {window:>9.1f} "
+              f"{(scan_per_defect / window if window else 0):>6.2f} "
+              f"{values['isect_hit_bytes_per_defect']:>10.1f} {edges_per_node:>10.2f} "
+              f"{degree:>6.2f} "
+              f"{(2 * edges_per_node / degree if degree else 0):>17.2f}")
+    print("\n`window_B` is the ball section's node-average window, and the ball section is compiled "
+          "once per `d`,\nat the highest `p` in the sweep. The tables themselves are recompiled per "
+          "`(d, p)` — `R` is quoted in\nmedian edge weights and the median edge weight moves with "
+          "`p` — so a `ratio` that steps with `p` is that\nmismatch, not the traversal: at fixed "
+          "`(d, p)` the scan component is identical across horizons.")
+
+
 def tie_table(table):
     """§M2.6 divergence rates. These are ties between optima, not errors — see the M2 notes."""
     print("\n## §M2.6 tie rates (H resolving a degeneracy differently from G)\n")
@@ -192,12 +264,16 @@ def main():
     ball_table(table)
     speedup_table(table)
     pipeline_split_table(table)
+    structural_table(table)
+    structural_checks_table(table)
     tie_table(table)
     ler_table(table)
     exit_read(table)
     print("\nAll wall times are microseconds per shot. The only speedup reported is "
           "`stock_us / crit_us`, with `crit_us = m2_us * (blsm + hrvst)`: intersect, H build, "
-          "MWPM build and the unattributed remainder are taken as pipelined out.")
+          "MWPM build and the unattributed remainder are taken as pipelined out. The structural "
+          "counters are bytes and element writes per shot, and are machine-independent: they are "
+          "what the off-CPU stages move, whatever the memory system underneath.")
 
 
 if __name__ == "__main__":

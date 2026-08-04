@@ -154,13 +154,27 @@ HarvestResult BallDecoder::decode_impl(
 
     compute_seeded_detection_events(dets, seeded_scratch);
 
+    // The structural counters need a profile *and* the flag: they are cheap enough to leave in the
+    // profiled path only for the parts that are register increments, and the parts that are not
+    // would move `intersect_ns` under their own measurement. See `BallConfig`.
+    bool structural = prof != nullptr && config.collect_structural_counters;
+
     BallGraphTiming timing;
-    build_ball_graph(tables, seeded_scratch, horizon, arena, config.mode, prof != nullptr ? &timing : nullptr);
+    BallGraphCounts counts;
+    build_ball_graph(
+        tables,
+        seeded_scratch,
+        horizon,
+        arena,
+        config.mode,
+        prof != nullptr ? &timing : nullptr,
+        structural ? &counts : nullptr);
     const BallGraph& h = arena.graph;
 
+    BallMwpmCounts mwpm_counts;
     if (prof != nullptr)
         step.start();
-    h_mwpm.rebuild(tables, h, arena);
+    h_mwpm.rebuild(tables, h, arena, structural ? &mwpm_counts : nullptr);
     if (prof != nullptr)
         prof->mwpm_build_ns = step.elapsed_ns();
 
@@ -205,6 +219,20 @@ HarvestResult BallDecoder::decode_impl(
         prof->h_nodes = (int)h.num_nodes();
         prof->h_edges = (int)h.edges.size();
         prof->h_boundary_edges = (int)h.boundary_edges.size();
+        // §M2 structural counters, left at zero unless they were collected, so that a profile
+        // never reports a counter it did not measure. `hbld_edges_written` is the count taken at
+        // the `push_back`s, not `h_edges + h_boundary_edges` read back off the vectors —
+        // `build_ball_graph` asserts the two agree, which is where the "each undirected pair once"
+        // claim is checked.
+        if (structural) {
+            prof->isect_scan_bytes = counts.isect_scan_bytes;
+            prof->isect_hit_bytes = counts.isect_hit_bytes;
+            prof->isect_scan_bytes_other_mode = counts.isect_scan_bytes_other_mode;
+            prof->isect_mode_bitset = config.mode == BallGraphBuildMode::BITSET;
+            prof->hbld_edges_written = (int)(counts.edges_written + counts.boundary_edges_written);
+            prof->mwpm_init_node_elements = (int)mwpm_counts.node_records;
+            prof->mwpm_init_edge_elements = (int)mwpm_counts.edge_records;
+        }
         prof->shells_materialized = 1;
         prof->restarts = 0;
         prof->blossom_formations = (int)(pm::blossom_formation_stats.formations - formations_before);

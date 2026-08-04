@@ -81,6 +81,52 @@ TEST(ManifoldBallGraph, B5ScanMatchesBitset) {
     ASSERT_GT(shots_with_edges, 0u) << "the corpus produced no edges at all; the comparison is vacuous";
 }
 
+// The §M2 structural counters are observational, so what there is to check is that they describe
+// the loop that actually ran. Two things do that: the edge count has to be `H`'s own size (which is
+// what lets the aggregate call `h_edges + h_boundary_edges` a count of writes), and each mode's
+// counterfactual for the other mode has to equal the other mode's *measured* traversal on the same
+// shot — including the early break, which is the part a model would get wrong.
+TEST(ManifoldBallGraph, StructuralCountersDescribeTheTraversalThatRan) {
+    Corpus corpus = small_corpus();
+    auto mwpm = corpus.to_mwpm();
+    // `T = 1.5` on purpose: `2T < R` there, so SCAN *does* break early and the counterfactual is
+    // not simply the whole ball. At the operating point `T = 2` it is.
+    BallConfig config = config_for(mwpm.flooder.graph, 1.5);
+    BallDecoder decoder = BallDecoder::from_mwpm(std::move(mwpm), config);
+
+    BallGraphArena scan_arena;
+    BallGraphArena bitset_arena;
+    scan_arena.reset_for_graph(decoder.tables.num_nodes);
+    bitset_arena.reset_for_graph(decoder.tables.num_nodes);
+
+    std::vector<uint64_t> seeded;
+    uint64_t total_scan_bytes = 0;
+    for (const auto& shot : corpus.shots) {
+        decoder.compute_seeded_detection_events(shot, seeded);
+        BallGraphCounts scan_counts;
+        BallGraphCounts bitset_counts;
+        build_ball_graph(
+            decoder.tables, seeded, decoder.horizon, scan_arena, BallGraphBuildMode::SCAN, nullptr, &scan_counts);
+        build_ball_graph(
+            decoder.tables, seeded, decoder.horizon, bitset_arena, BallGraphBuildMode::BITSET, nullptr, &bitset_counts);
+
+        ASSERT_EQ(scan_counts.edges_written, scan_arena.graph.edges.size());
+        ASSERT_EQ(scan_counts.boundary_edges_written, scan_arena.graph.boundary_edges.size());
+        ASSERT_EQ(bitset_counts.edges_written, scan_counts.edges_written) << "B5 says the two build the same H";
+        ASSERT_EQ(bitset_counts.boundary_edges_written, scan_counts.boundary_edges_written);
+
+        ASSERT_EQ(scan_counts.isect_scan_bytes_other_mode, bitset_counts.isect_scan_bytes)
+            << "the BITSET counterfactual is not what BITSET reads";
+        ASSERT_EQ(bitset_counts.isect_scan_bytes_other_mode, scan_counts.isect_scan_bytes)
+            << "the SCAN counterfactual is not what SCAN reads";
+        // BITSET has to fetch the weight and the rank indirection per candidate; SCAN has them in
+        // the entry it already walked. So the hit side is strictly the heavier one for BITSET.
+        ASSERT_GE(bitset_counts.isect_hit_bytes, scan_counts.isect_hit_bytes);
+        total_scan_bytes += scan_counts.isect_scan_bytes;
+    }
+    ASSERT_GT(total_scan_bytes, 0u) << "no traversal was counted at all; the comparison is vacuous";
+}
+
 // Every pair within `2T` is in `H` and nothing beyond it is — the other half of debug invariant 9,
 // checked against the table's own metric rather than against the builder's loop.
 TEST(ManifoldBallGraph, EdgeSetIsExactlyThePairsWithinTwoT) {

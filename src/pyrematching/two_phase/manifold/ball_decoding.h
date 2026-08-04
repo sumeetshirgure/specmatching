@@ -46,6 +46,17 @@ struct BallConfig {
     /// than some of the stages they are measuring — the M2.9 exit artifact takes them in a separate
     /// untimed pass, exactly as it already does for the §M2.6 tie rates.
     bool collect_harvest_diagnostics{false};
+    /// Fill the §M2 structural counters — `isect_*_bytes`, `hbld_edges_written`,
+    /// `mwpm_init_elements`. Off by default for the same reason as the flag above, and measured:
+    /// the byte counting adds 26% (`d = 13`) to 44% (`d = 23`) to `intersect_ns` at `p = 1e-3`,
+    /// because charging a pair its observable id list means touching `ball_mask_offsets`, which the
+    /// intersection itself never reads. Leaving it on would move the numbers in the timing table
+    /// next to it. The M2 exit artifact therefore collects the counters in a separate *untimed*
+    /// pass, exactly as it already does for the §M2.6 tie rates and the §M2.9.6 diagnostics.
+    ///
+    /// The counters are structural, so the separate pass costs nothing in fidelity: they are a
+    /// function of the shot and the tables, not of when they were measured.
+    bool collect_structural_counters{false};
     /// Harvest with M1.3's enumeration instead of §M2.9.1's. The output is identical either way
     /// (that is H1); this exists so that the A/B of §M2.9.6 can be run as two passes of one process
     /// rather than as two runs of two binaries, which is the only way the difference — a few
