@@ -170,9 +170,17 @@ HarvestResult BallDecoder::decode_impl(
     for (size_t i = 0; i < h.num_nodes(); i++)
         h_dets_scratch.push_back(i);
 
+    // §M2.9.6 measurement 3. A process-wide counter, so it is read as a delta around the solve.
+    uint64_t formations_before = pm::blossom_formation_stats.formations;
+    harvester.collect_diagnostics = config.collect_harvest_diagnostics;
+    harvester.use_legacy_enumeration = config.use_legacy_harvest_enumeration;
+
     if (prof != nullptr)
         step.start();
-    TimelineStatus status = process_timeline_until_horizon(h_mwpm.mwpm, h_dets_scratch, horizon);
+    TimelineStatus status = config.collect_harvest_diagnostics
+                                ? process_timeline_until_horizon_measured(
+                                      h_mwpm.mwpm, h_dets_scratch, horizon, depth_model)
+                                : process_timeline_until_horizon(h_mwpm.mwpm, h_dets_scratch, horizon);
     (void)status;
     if (prof != nullptr)
         prof->blossom_on_h_ns = step.elapsed_ns();
@@ -199,6 +207,20 @@ HarvestResult BallDecoder::decode_impl(
         prof->h_boundary_edges = (int)h.boundary_edges.size();
         prof->shells_materialized = 1;
         prof->restarts = 0;
+        prof->blossom_formations = (int)(pm::blossom_formation_stats.formations - formations_before);
+        prof->harvest_enumerate_ns = result.enumerate_ns;
+        prof->harvest_reduce_ns = result.reduce_ns;
+        prof->harvest_base_descent_ns = result.base_descent_ns;
+        prof->harvest_shatter_ns = result.shatter_ns;
+        prof->max_blossom_nesting_depth = result.max_blossom_nesting_depth;
+        prof->max_blossom_members = result.max_blossom_members;
+        prof->max_exposed_blossom_depth = result.max_exposed_blossom_depth;
+        prof->max_exposed_blossom_members = result.max_exposed_blossom_members;
+        prof->matched_blossom_shatters = result.matched_blossom_shatters;
+        prof->largest_tree_size = result.largest_tree_size;
+        prof->harvest_dependent_depth = result.harvest_dependent_depth;
+        prof->solve_dependent_depth = config.collect_harvest_diagnostics ? depth_model.depth : 0;
+        prof->solve_events = config.collect_harvest_diagnostics ? depth_model.events : 0;
         if (h.num_nodes() != 0) {
             prof->mean_degree = 2.0 * (double)h.edges.size() / (double)h.num_nodes();
             for (size_t i = 0; i < h.num_nodes(); i++) {

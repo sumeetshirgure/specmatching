@@ -100,6 +100,22 @@ struct TwoPhaseProfile {
     int portal_collisions{0};
     int inner_detection_events{0};
 
+    /// §M2.9.6. Harvest's four stages, and the counts and depths that the critical-path model is
+    /// built from. Filled only when `Harvester::collect_diagnostics` is set; see `BallProfile` for
+    /// what each one means.
+    long long harvest_enumerate_ns{0};
+    long long harvest_reduce_ns{0};
+    long long harvest_base_descent_ns{0};
+    long long harvest_shatter_ns{0};
+    int blossom_formations{0};
+    int max_blossom_nesting_depth{0};
+    int matched_blossom_shatters{0};
+    /// Profiling builds only: harvest's modelled serial depth, and the solve's, so that the two can
+    /// be compared in the units the M2.9 exit checkpoint asks for.
+    int harvest_dependent_depth{0};
+    int solve_dependent_depth{0};
+    int solve_events{0};
+
     /// `Sum_S y_S <= exact optimum`.
     pm::total_weight_int dual_sum_at_truncation{0};
     pm::total_weight_int weight_out{0};
@@ -125,6 +141,14 @@ struct TwoPhaseProfile {
         exposed_root_blossoms = harvest.exposed_root_blossoms;
         dual_sum_at_truncation = harvest.dual_sum_at_truncation;
         truncated = !harvest.residual.empty();
+
+        harvest_enumerate_ns = harvest.enumerate_ns;
+        harvest_reduce_ns = harvest.reduce_ns;
+        harvest_base_descent_ns = harvest.base_descent_ns;
+        harvest_shatter_ns = harvest.shatter_ns;
+        max_blossom_nesting_depth = harvest.max_blossom_nesting_depth;
+        matched_blossom_shatters = harvest.matched_blossom_shatters;
+        harvest_dependent_depth = harvest.harvest_dependent_depth;
     }
 };
 

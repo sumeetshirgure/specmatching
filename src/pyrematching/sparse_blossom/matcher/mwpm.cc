@@ -104,8 +104,9 @@ AltTreeNode *Mwpm::make_child(
     GraphFillRegion *child_outer_region,
     const CompressedEdge &child_inner_to_outer_edge,
     const CompressedEdge &child_compressed_edge) {
-    auto child = node_arena.alloc_unconstructed();
-    new (child) AltTreeNode(child_inner_region, child_outer_region, child_inner_to_outer_edge);
+    // `alloc_constructed` rather than `alloc_unconstructed` + placement-new, so that the arena can
+    // install this node's liveness link once its lifetime has begun (pyrematching §M2.9.1).
+    auto child = node_arena.alloc_constructed(child_inner_region, child_outer_region, child_inner_to_outer_edge);
     auto child_alt_tree_edge = AltTreeEdge(child, child_compressed_edge);
     parent.add_child(child_alt_tree_edge);
     return child;
@@ -416,8 +417,8 @@ void Mwpm::shatter_blossom_and_extract_match_edges(GraphFillRegion *region, std:
 
 void Mwpm::create_detection_event(DetectorNode *node) {
     auto region = flooder.region_arena.alloc_default_constructed();
-    auto alt_tree_node = node_arena.alloc_unconstructed();
-    new (alt_tree_node) AltTreeNode(region);
+    // `alloc_constructed`: see `make_child`.
+    auto alt_tree_node = node_arena.alloc_constructed(region);
     region->alt_tree_node = alt_tree_node;
     flooder.do_region_created_at_empty_detector_node(*region, *node);
 }

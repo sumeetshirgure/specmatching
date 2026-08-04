@@ -41,6 +41,16 @@ struct BallConfig {
     BallGraphBuildMode mode{BallGraphBuildMode::SCAN};
     /// Threads used to compile the ball tables. 0 means hardware concurrency.
     size_t compile_threads{0};
+    /// Fill the §M2.9.6 measurements: harvest's stage split, the blossom counts and depths, and the
+    /// dependent-event chain depth of the solve. Off by default, because collecting them costs more
+    /// than some of the stages they are measuring — the M2.9 exit artifact takes them in a separate
+    /// untimed pass, exactly as it already does for the §M2.6 tie rates.
+    bool collect_harvest_diagnostics{false};
+    /// Harvest with M1.3's enumeration instead of §M2.9.1's. The output is identical either way
+    /// (that is H1); this exists so that the A/B of §M2.9.6 can be run as two passes of one process
+    /// rather than as two runs of two binaries, which is the only way the difference — a few
+    /// percent of a shot — is measurable above run-to-run noise.
+    bool use_legacy_harvest_enumeration{false};
 };
 
 /// One committed pair, in `G`'s detector ids. `to == -1` means matched to the boundary. This is the
@@ -113,6 +123,8 @@ struct BallDecoder {
     std::vector<uint64_t> h_dets_scratch;
     mutable std::vector<uint64_t> sort_scratch;
     std::vector<pm::CompressedEdge> match_edge_scratch;
+    /// §M2.9.6 measurement 4, over `H`. Only touched when `collect_harvest_diagnostics` is set.
+    TimelineDepthModel depth_model;
 
     void finish_construction(const char* ball_artifact_path);
     template <typename HarvestOnH>

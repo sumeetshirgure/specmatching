@@ -296,6 +296,10 @@ int main(int argc, char** argv) {
             auto reference_mwpm = pm::detector_error_model_to_mwpm(experiment.dem, NUM_DISTINCT_WEIGHTS);
             auto unit = median_edge_weight(mwpm.flooder.graph);
             Harvester harvester;
+            // `max_largest_tree_size` is one of this artifact's reported columns, and since §M2.9.1
+            // it is a profiling-only diagnostic rather than a free by-product of the enumeration.
+            // Ask for it, so the artifact keeps reporting the same quantity it always did.
+            harvester.collect_diagnostics = true;
 
             for (double multiple : options.horizon_multiples) {
                 ConfigResult result;

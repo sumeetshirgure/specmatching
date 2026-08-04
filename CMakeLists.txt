@@ -62,6 +62,7 @@ set(SOURCE_FILES_NO_MAIN
         src/pyrematching/two_phase/truncation/truncated_timeline.cc
         src/pyrematching/two_phase/truncation/harvest.cc
         src/pyrematching/two_phase/truncation/exposed_blossom.cc
+        src/pyrematching/two_phase/truncation/split_experiment.cc
         src/pyrematching/two_phase/manifold/ball_tables.cc
         src/pyrematching/two_phase/manifold/ball_serialize.cc
         src/pyrematching/two_phase/manifold/ball_graph.cc
@@ -92,6 +93,8 @@ set(TEST_FILES
         src/pyrematching/sparse_blossom/driver/user_graph.test.cc
         tests/two_phase/truncation_timeline.test.cc
         tests/two_phase/truncation_harvest.test.cc
+        tests/two_phase/truncation_harvest_m29.test.cc
+        tests/two_phase/truncation_split_experiment.test.cc
         tests/two_phase/truncation_exposed_blossom.test.cc
         tests/two_phase/truncation_fuzz.test.cc
         tests/two_phase/manifold_ball_tables.test.cc
@@ -162,6 +165,15 @@ if (NOT (MSVC))
     target_link_options(two_phase_m2_artifact PRIVATE -pthread -O3)
 endif ()
 target_link_libraries(two_phase_m2_artifact libstim)
+
+# M2.9 exit artifact: the §M2.9.6 measurements in counts and depths, the harvest stage-split A/B,
+# and the §M2.9.5 E1/E2 experiments. Built optimised, like the other two.
+add_executable(two_phase_m29_artifact benchmarks/two_phase/m29_exit_artifact.cc ${SOURCE_FILES_NO_MAIN})
+target_compile_options(two_phase_m29_artifact PRIVATE ${ARCH_OPT})
+if (NOT (MSVC))
+    target_link_options(two_phase_m29_artifact PRIVATE -pthread -O3)
+endif ()
+target_link_libraries(two_phase_m29_artifact libstim)
 
 add_library(libpyrematching ${SOURCE_FILES_NO_MAIN})
 set_target_properties(libpyrematching PROPERTIES PREFIX "")

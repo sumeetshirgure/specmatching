@@ -63,6 +63,35 @@ struct BallProfile {
     int residual_ties{0};
     int pairing_ties{0};
 
+    /// §M2.9.6. The split of `harvest_ns` into its four stages: enumerating the live regions and
+    /// alternating tree nodes, the base descent into exposed root blossoms, shattering matched
+    /// blossoms, and the reductions plus residual compaction. This is the software A/B that says
+    /// how much of harvest's 7–17% of the total was enumeration rather than extraction.
+    long long harvest_enumerate_ns{0};
+    long long harvest_reduce_ns{0};
+    long long harvest_base_descent_ns{0};
+    long long harvest_shatter_ns{0};
+
+    /// §M2.9.6 measurements 2 and 3, in counts and depths rather than nanoseconds.
+    ///
+    /// `blossom_formations` is the number of blossoms created during this shot's solve — the
+    /// quantity §M2.9.4's eager-cached-base option has to be rarer than base readouts to be worth
+    /// its field and its mutation site. The other two describe the blossoms alive at truncation.
+    int blossom_formations{0};
+    int max_blossom_nesting_depth{0};
+    int max_blossom_members{0};
+    int matched_blossom_shatters{0};
+    /// The exposed-root-blossom restriction of the two above. §M2.9.4's base descent walks these
+    /// and only these, so these are the numbers that choose its mechanism.
+    int max_exposed_blossom_depth{0};
+    int max_exposed_blossom_members{0};
+
+    /// §M2.9.6 measurements 1 and 4, and harvest's own modelled depth. Profiling builds only.
+    int largest_tree_size{0};
+    int harvest_dependent_depth{0};
+    int solve_dependent_depth{0};
+    int solve_events{0};
+
     void clear() {
         *this = BallProfile();
     }
@@ -93,6 +122,29 @@ struct BallAggregateStats {
     uint64_t mask_divergences{0};
     uint64_t residual_ties{0};
     uint64_t pairing_ties{0};
+
+    /// §M2.9.6 accumulators.
+    long long sum_harvest_enumerate_ns{0};
+    long long sum_harvest_reduce_ns{0};
+    long long sum_harvest_base_descent_ns{0};
+    long long sum_harvest_shatter_ns{0};
+    uint64_t sum_blossom_formations{0};
+    uint64_t max_blossom_nesting_depth{0};
+    uint64_t max_blossom_members{0};
+    uint64_t max_exposed_blossom_depth{0};
+    uint64_t max_exposed_blossom_members{0};
+    /// Histogram of the exposed-root-blossom nesting depth, capped, last bin overflowing. This is
+    /// the distribution the M2.9 exit checkpoint asks be written down next to §M2.9.4's decision.
+    static constexpr size_t DEPTH_HIST_BINS = 9;
+    std::vector<uint64_t> exposed_depth_hist = std::vector<uint64_t>(DEPTH_HIST_BINS, 0);
+    uint64_t sum_matched_blossom_shatters{0};
+    uint64_t max_largest_tree_size{0};
+    uint64_t sum_largest_tree_size{0};
+    uint64_t max_harvest_dependent_depth{0};
+    uint64_t sum_harvest_dependent_depth{0};
+    uint64_t max_solve_dependent_depth{0};
+    uint64_t sum_solve_dependent_depth{0};
+    uint64_t sum_solve_events{0};
 
     bool keep_per_shot{false};
     std::vector<long long> per_shot_total_ns;
@@ -128,6 +180,29 @@ struct BallAggregateStats {
         residual_ties += (uint64_t)profile.residual_ties;
         pairing_ties += (uint64_t)profile.pairing_ties;
 
+        sum_harvest_enumerate_ns += profile.harvest_enumerate_ns;
+        sum_harvest_reduce_ns += profile.harvest_reduce_ns;
+        sum_harvest_base_descent_ns += profile.harvest_base_descent_ns;
+        sum_harvest_shatter_ns += profile.harvest_shatter_ns;
+        sum_blossom_formations += (uint64_t)profile.blossom_formations;
+        max_blossom_nesting_depth = std::max(max_blossom_nesting_depth, (uint64_t)profile.max_blossom_nesting_depth);
+        max_blossom_members = std::max(max_blossom_members, (uint64_t)profile.max_blossom_members);
+        max_exposed_blossom_depth = std::max(max_exposed_blossom_depth, (uint64_t)profile.max_exposed_blossom_depth);
+        max_exposed_blossom_members =
+            std::max(max_exposed_blossom_members, (uint64_t)profile.max_exposed_blossom_members);
+        if (profile.max_exposed_blossom_depth > 0) {
+            size_t bin = std::min((size_t)profile.max_exposed_blossom_depth, DEPTH_HIST_BINS - 1);
+            exposed_depth_hist[bin]++;
+        }
+        sum_matched_blossom_shatters += (uint64_t)profile.matched_blossom_shatters;
+        max_largest_tree_size = std::max(max_largest_tree_size, (uint64_t)profile.largest_tree_size);
+        sum_largest_tree_size += (uint64_t)profile.largest_tree_size;
+        max_harvest_dependent_depth = std::max(max_harvest_dependent_depth, (uint64_t)profile.harvest_dependent_depth);
+        sum_harvest_dependent_depth += (uint64_t)profile.harvest_dependent_depth;
+        max_solve_dependent_depth = std::max(max_solve_dependent_depth, (uint64_t)profile.solve_dependent_depth);
+        sum_solve_dependent_depth += (uint64_t)profile.solve_dependent_depth;
+        sum_solve_events += (uint64_t)profile.solve_events;
+
         if (keep_per_shot) {
             per_shot_total_ns.push_back(profile.total_ns);
             per_shot_g_reference_ns.push_back(profile.g_reference_ns);
@@ -161,6 +236,29 @@ struct BallSummary {
     double residual_tie_rate{0};
     double pairing_tie_rate{0};
     double mask_divergence_rate{0};
+
+    /// §M2.9.6. Harvest's four stages as fractions of measured `harvest_ns`. The A/B the design
+    /// asks for is `frac_harvest_enumerate`: if most of harvest was enumeration rather than
+    /// extraction, §M2.9.1–§M2.9.2 are a CPU win as well as a critical-path one.
+    double frac_harvest_enumerate{0};
+    double frac_harvest_reduce{0};
+    double frac_harvest_base_descent{0};
+    double frac_harvest_shatter{0};
+
+    /// Measurements 1–4, in counts and depths.
+    double mean_blossom_formations{0};
+    double mean_matched_blossom_shatters{0};
+    double mean_largest_tree_size{0};
+    double max_largest_tree_size{0};
+    double max_blossom_nesting_depth{0};
+    double mean_harvest_dependent_depth{0};
+    double max_harvest_dependent_depth{0};
+    double mean_solve_dependent_depth{0};
+    double max_solve_dependent_depth{0};
+    double mean_solve_events{0};
+    /// The number the M2.9 exit checkpoint asks for: harvest's share of the critical path that is
+    /// left once the embarrassingly parallel stages collapse, measured rather than estimated.
+    double harvest_share_of_critical_path{0};
 };
 
 inline BallSummary summarize_ball(const BallAggregateStats& stats) {
@@ -193,6 +291,27 @@ inline BallSummary summarize_ball(const BallAggregateStats& stats) {
     summary.residual_tie_rate = (double)stats.residual_ties / shots;
     summary.pairing_tie_rate = (double)stats.pairing_ties / shots;
     summary.mask_divergence_rate = (double)stats.mask_divergences / shots;
+
+    if (stats.sum_harvest_ns > 0) {
+        double harvest = (double)stats.sum_harvest_ns;
+        summary.frac_harvest_enumerate = (double)stats.sum_harvest_enumerate_ns / harvest;
+        summary.frac_harvest_reduce = (double)stats.sum_harvest_reduce_ns / harvest;
+        summary.frac_harvest_base_descent = (double)stats.sum_harvest_base_descent_ns / harvest;
+        summary.frac_harvest_shatter = (double)stats.sum_harvest_shatter_ns / harvest;
+    }
+    summary.mean_blossom_formations = (double)stats.sum_blossom_formations / shots;
+    summary.mean_matched_blossom_shatters = (double)stats.sum_matched_blossom_shatters / shots;
+    summary.mean_largest_tree_size = (double)stats.sum_largest_tree_size / shots;
+    summary.max_largest_tree_size = (double)stats.max_largest_tree_size;
+    summary.max_blossom_nesting_depth = (double)stats.max_blossom_nesting_depth;
+    summary.mean_harvest_dependent_depth = (double)stats.sum_harvest_dependent_depth / shots;
+    summary.max_harvest_dependent_depth = (double)stats.max_harvest_dependent_depth;
+    summary.mean_solve_dependent_depth = (double)stats.sum_solve_dependent_depth / shots;
+    summary.max_solve_dependent_depth = (double)stats.max_solve_dependent_depth;
+    summary.mean_solve_events = (double)stats.sum_solve_events / shots;
+    double critical_path = summary.mean_harvest_dependent_depth + summary.mean_solve_dependent_depth;
+    if (critical_path > 0)
+        summary.harvest_share_of_critical_path = summary.mean_harvest_dependent_depth / critical_path;
     return summary;
 }
 

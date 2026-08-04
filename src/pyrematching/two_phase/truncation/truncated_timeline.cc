@@ -14,13 +14,95 @@
 
 #include "pyrematching/two_phase/truncation/truncated_timeline.h"
 
+#include <algorithm>
+
 #include "pyrematching/sparse_blossom/driver/mwpm_decoding.h"
+#include "pyrematching/sparse_blossom/flooder/graph.h"
+#include "pyrematching/sparse_blossom/flooder/graph_fill_region.h"
 
 namespace pm {
 namespace two_phase {
 
-TimelineStatus process_timeline_until_horizon(
-    pm::Mwpm& mwpm, const std::vector<uint64_t>& detection_events, horizon_int horizon) {
+void TimelineDepthModel::begin(const pm::MatchingGraph& graph) {
+    node_depth.assign(graph.nodes.size(), 0);
+    node_base = graph.nodes.data();
+    depth = 0;
+    events = 0;
+}
+
+void TimelineDepthModel::observe(const pm::MwpmEvent& event) {
+    if (node_base == nullptr || event.event_type == pm::NO_EVENT)
+        return;
+    events++;
+
+    auto index_of = [&](const pm::DetectorNode* node) -> size_t {
+        if (node == nullptr)
+            return SIZE_MAX;
+        size_t index = (size_t)(node - node_base);
+        return index < node_depth.size() ? index : SIZE_MAX;
+    };
+
+    // Collect the nodes this event depends on, take the deepest, and write one deeper back to all
+    // of them. `touched` is a small stack buffer for the common case; a blossom shatter falls back
+    // to a sweep of the blossom's area.
+    size_t touched[2] = {SIZE_MAX, SIZE_MAX};
+    int deepest = 0;
+
+    switch (event.event_type) {
+        case pm::REGION_HIT_REGION: {
+            const pm::CompressedEdge& edge = event.region_hit_region_event_data.edge;
+            touched[0] = index_of(edge.loc_from);
+            touched[1] = index_of(edge.loc_to);
+            break;
+        }
+        case pm::REGION_HIT_BOUNDARY: {
+            const pm::CompressedEdge& edge = event.region_hit_boundary_event_data.edge;
+            touched[0] = index_of(edge.loc_from);
+            touched[1] = index_of(edge.loc_to);
+            break;
+        }
+        case pm::BLOSSOM_SHATTER: {
+            // A shatter names regions rather than an edge, and it un-does a merge, so it depends on
+            // everything the blossom had absorbed. Sweeping its area is the faithful reading, and
+            // this path only runs under measurement.
+            pm::GraphFillRegion* blossom = event.blossom_shatter_event_data.blossom_region;
+            std::vector<size_t> members;
+            blossom->do_op_for_each_node_in_total_area([&](pm::DetectorNode* node) {
+                size_t index = index_of(node);
+                if (index != SIZE_MAX) {
+                    members.push_back(index);
+                    deepest = std::max(deepest, node_depth[index]);
+                }
+            });
+            for (size_t index : members)
+                node_depth[index] = std::max(node_depth[index], deepest + 1);
+            depth = std::max(depth, deepest + 1);
+            return;
+        }
+        default:
+            return;
+    }
+
+    for (size_t index : touched) {
+        if (index != SIZE_MAX)
+            deepest = std::max(deepest, node_depth[index]);
+    }
+    for (size_t index : touched) {
+        if (index != SIZE_MAX)
+            node_depth[index] = deepest + 1;
+    }
+    depth = std::max(depth, deepest + 1);
+}
+
+namespace {
+
+/// The timeline proper. `depth_model` is null on the hot path, and the only difference the measured
+/// path makes is one virtual-free call per event.
+TimelineStatus run_timeline(
+    pm::Mwpm& mwpm,
+    const std::vector<uint64_t>& detection_events,
+    horizon_int horizon,
+    TimelineDepthModel* depth_model) {
     // Reuses the stock preamble verbatim: empty-queue precondition, cur_time = 0, and the
     // negative-weight detection event marking dance.
     pm::begin_timeline(mwpm, detection_events);
@@ -33,6 +115,8 @@ TimelineStatus process_timeline_until_horizon(
         auto event = mwpm.flooder.run_until_next_mwpm_notification();
         if (event.event_type == pm::NO_EVENT)
             break;
+        if (depth_model != nullptr)
+            depth_model->observe(event);
         mwpm.process_event(event);
     }
 
@@ -50,6 +134,22 @@ TimelineStatus process_timeline_until_horizon(
         mwpm.flooder.queue.cur_time = horizon;
     }
     return TimelineStatus::TRUNCATED;
+}
+
+}  // namespace
+
+TimelineStatus process_timeline_until_horizon(
+    pm::Mwpm& mwpm, const std::vector<uint64_t>& detection_events, horizon_int horizon) {
+    return run_timeline(mwpm, detection_events, horizon, nullptr);
+}
+
+TimelineStatus process_timeline_until_horizon_measured(
+    pm::Mwpm& mwpm,
+    const std::vector<uint64_t>& detection_events,
+    horizon_int horizon,
+    TimelineDepthModel& depth_model) {
+    depth_model.begin(mwpm.flooder.graph);
+    return run_timeline(mwpm, detection_events, horizon, &depth_model);
 }
 
 }  // namespace two_phase

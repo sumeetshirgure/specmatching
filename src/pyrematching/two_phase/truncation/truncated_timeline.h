@@ -66,6 +66,41 @@ struct HorizonGuard {
 TimelineStatus process_timeline_until_horizon(
     pm::Mwpm& mwpm, const std::vector<uint64_t>& detection_events, horizon_int horizon);
 
+/// §M2.9.6 measurement 4: the serial depth of the solve, in dependent events.
+///
+/// Harvest's critical path only means something next to the solve's, and "harvest is roughly a
+/// third of what remains" was an estimate that the M2.9 exit checkpoint requires be replaced by a
+/// measurement. Wall time will not do — it is dominated by this machine's cache hierarchy, and the
+/// architecture the critical-path metric is *for* has a different one.
+///
+/// The model is a longest-chain count over the detector graph. Each detector node carries a depth;
+/// an event that names nodes `u` and `v` has depth `1 + max(depth[u], depth[v])`, and writes that
+/// back to both. A blossom shatter names no edge, so it takes the max over every node the blossom
+/// owns and writes back to all of them. `depth` is then the length of the longest chain of events
+/// that had to happen in order, which is what a machine with unbounded width would still pay.
+struct TimelineDepthModel {
+    /// Per-node chain depth, indexed by detector id. Reset per shot.
+    std::vector<int> node_depth;
+    /// Base of the graph's node vector, so that a `DetectorNode*` can be turned into an index.
+    const pm::DetectorNode* node_base{nullptr};
+    /// The shot's answer: the deepest chain of dependent events.
+    int depth{0};
+    /// Events processed, so that "depth vs count" — the available parallelism — can be reported.
+    int events{0};
+
+    void begin(const pm::MatchingGraph& graph);
+    void observe(const pm::MwpmEvent& event);
+};
+
+/// As `process_timeline_until_horizon`, and additionally fills `depth_model`. Split out rather than
+/// defaulted so that the measured path and the hot path are visibly the same loop with one extra
+/// call in it.
+TimelineStatus process_timeline_until_horizon_measured(
+    pm::Mwpm& mwpm,
+    const std::vector<uint64_t>& detection_events,
+    horizon_int horizon,
+    TimelineDepthModel& depth_model);
+
 }  // namespace two_phase
 }  // namespace pm
 
