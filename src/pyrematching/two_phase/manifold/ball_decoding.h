@@ -32,9 +32,29 @@ namespace pm {
 namespace two_phase {
 
 struct BallConfig {
-    /// The truncation horizon, in DEM float weight units. Must be `<= ball.T_max`.
+    /// The horizon, in DEM float weight units. Must be `<= ball.T_max`.
+    ///
+    /// On the truncated path this is the *truncation* horizon. On §M7's stock path it is a pure
+    /// runtime scalar with exactly two uses: the `2 * T_int` / `T_int` filter that builds `H`, and
+    /// the `max_u Y(u) >= T_int` escalation threshold. It is never handed to the flooder there.
     double T{2.0};
     BallParams ball;
+
+    /// §M7 — run **stock** (untruncated) sparse blossom on `H` and decide exactness from a max-dual
+    /// certificate, instead of truncating the timeline at `T` and harvesting.
+    ///
+    /// The `H` that is solved is the same graph either way: the `2 * T_int` / `T_int` ball filter is
+    /// untouched, and so are the ball tables, `BallMwpm::rebuild`, and stock's own extraction. What
+    /// changes is the front end. The flooder runs with its `pm::NO_HORIZON` sentinel — no funnel
+    /// gating, no shrink exemption, no RAII horizon guard — and the shot is kept iff it completed on
+    /// `H` with `max_u Y(u) <= T_int`, which certifies it a *global* MWPM (§M7.0). Everything else
+    /// escalates to stock on `G`, exactly as the truncated path's residual does.
+    ///
+    /// The §M1.3 harvest and §M1.4's exposed-root-blossom base descent are not reachable on this
+    /// path at all: a certified shot completed, so it has no surviving trees, no residual and no
+    /// exposed root blossoms. The truncated path and its M1 oracle stay exactly as they are; this is
+    /// an alternative front end, not a replacement (§M7 non-goals).
+    bool stock_on_h{false};
     /// Run M1's path on `G` for every shot and assert §M2.6 level 1 inline. CI and benchmarks only;
     /// off by default because it costs more than the decode it is checking.
     bool verify_against_g{false};
@@ -118,10 +138,18 @@ struct BallDecoder {
     static BallDecoder from_mwpm(pm::Mwpm g_mwpm, BallConfig config, const char* ball_artifact_path = nullptr);
 
     /// Same contract and same struct as M1's harvest, in `G`'s detector ids.
+    ///
+    /// **Rejected under `stock_on_h`.** The two verification entry points return only a
+    /// `HarvestResult`, and on the truncated path the caller reads the escalation decision off
+    /// `residual.empty()`. Under the certificate that reading is wrong in precisely the case §M7.0
+    /// calls the most important correctness point in the design: a shot that completes on `H` with a
+    /// suboptimal matching and `max_u Y(u) > T` has an empty residual and must still escalate. So
+    /// rather than leave a signature whose obvious use is a silent wrong answer, these throw.
     HarvestResult decode_phase1(const std::vector<uint64_t>& dets, BallProfile* prof = nullptr);
 
     /// As `decode_phase1`, and additionally the committed pairs in `G`'s detector ids. Works for
-    /// any number of observables, which the obs flavour does not.
+    /// any number of observables, which the obs flavour does not. Rejected under `stock_on_h` for
+    /// the reason above.
     HarvestResult decode_phase1_to_match_edges(
         const std::vector<uint64_t>& dets, std::vector<CommittedPair>& committed_pairs, BallProfile* prof = nullptr);
 
@@ -153,6 +181,16 @@ struct BallDecoder {
     /// M1's Phase 1 on `G` for the same shot — the oracle §M2.6 level 1 is compared against.
     HarvestResult reference_phase1_on_g(
         const std::vector<uint64_t>& dets, std::vector<CommittedPair>* committed_pairs = nullptr);
+
+    /// §M7.7's `q_current_on_same_corpus`: would the **landed truncated scheme** have escalated this
+    /// shot? Rebuilds the same `H` at the same `T` and runs `process_timeline_until_horizon` on it,
+    /// then tears the instance down without harvesting.
+    ///
+    /// Benchmark mode only, and it costs a second full Phase 1 on `H`. Call it *after* the shot's
+    /// real decode has finished and released `h_mwpm`, never around it. It exists so that the
+    /// design's `q_this <= q_current` claim is replayed on identical shots instead of compared
+    /// across campaigns.
+    bool truncated_scheme_escalates(const std::vector<uint64_t>& dets);
 
     void save_ball_artifact(const std::string& path) const;
 

@@ -88,6 +88,18 @@ TwoPhaseDecoder TwoPhaseDecoder::from_detector_error_model(
             "edges an unbounded run needs (§M4.1). Route it through phase1_on_ball_graph = false.");
     if (config.verify_against_g && !config.phase1_on_ball_graph)
         throw std::invalid_argument("verify_against_g compares H against G; it needs phase1_on_ball_graph = true.");
+    if (config.stock_on_h && !config.phase1_on_ball_graph)
+        throw std::invalid_argument(
+            "stock_on_h is a front end for the ball graph H (§M7); it needs phase1_on_ball_graph = true. Stock "
+            "blossom on G with no horizon is simply the inherited decoder.");
+    if (config.stock_on_h && (config.verify_against_g || config.full_harvest_for_verification))
+        throw std::invalid_argument(
+            "The §M7 stock-on-H path produces no truncated intermediate state, so the M1 harvest oracle has "
+            "nothing to reproduce. Its oracle is stock exact decode on G (§M7.6 level 1).");
+    if (config.measure_truncated_reference && !config.phase1_on_ball_graph)
+        throw std::invalid_argument(
+            "measure_truncated_reference replays the truncated scheme's decision on H; it needs "
+            "phase1_on_ball_graph = true.");
     if (config.edges_flavor && config.phase1_on_ball_graph && !config.ball.store_paths)
         throw std::invalid_argument(
             "The edges flavour lifts a committed pair through the ball tables' stored path, so it needs "
@@ -112,6 +124,7 @@ TwoPhaseDecoder TwoPhaseDecoder::from_detector_error_model(
         BallConfig ball_config;
         ball_config.T = config.T;
         ball_config.ball = config.ball;
+        ball_config.stock_on_h = config.stock_on_h;
         ball_config.verify_against_g = config.verify_against_g;
         ball_config.mode = config.mode;
         ball_config.compile_threads = config.compile_threads;
@@ -202,7 +215,21 @@ void TwoPhaseDecoder::copy_phase1_stats(const Phase1Outcome& outcome, TwoPhasePr
         prof->blossom_formations = ball_profile.blossom_formations;
         prof->solve_dependent_depth = ball_profile.solve_dependent_depth;
         prof->solve_events = ball_profile.solve_events;
+        // §M7.7. Zero on the truncated path, where there is no certificate to report.
+        prof->dual_scan_ns = ball_profile.dual_scan_ns;
+        prof->certified = ball_profile.certified;
+        prof->h_no_perfect_matching = ball_profile.h_no_perfect_matching;
+        prof->max_dual_at_completion = ball_profile.max_dual_at_completion;
     }
+}
+
+void TwoPhaseDecoder::record_truncated_reference(const std::vector<uint64_t>& dets, TwoPhaseProfile* prof) {
+    if (!config.measure_truncated_reference || ball == nullptr || prof == nullptr)
+        return;
+    // Deliberately after `total_ns` has been read: this is a second full Phase 1 on `H`, and folding
+    // it into the timed window would make every benchmark number the sum of two schemes.
+    prof->truncated_reference_measured = true;
+    prof->truncated_reference_escalates = ball->truncated_scheme_escalates(dets);
 }
 
 void TwoPhaseDecoder::obs_from_committed_pairs(uint8_t* obs, pm::total_weight_int& weight) const {
@@ -272,7 +299,10 @@ void TwoPhaseDecoder::decode_to_obs(
             after.sample();
             prof->contaminated = after.switched_since(before);
         }
-        assert(prof->escalated == prof->truncated && "invariant 12: escalation fires iff the residual is non-empty");
+        assert(
+            prof->escalated == prof->truncated &&
+            "invariant 12: escalation fires iff Phase 1 has no usable answer, and nothing else");
+        record_truncated_reference(dets, prof);
     }
 }
 
@@ -367,7 +397,10 @@ void TwoPhaseDecoder::decode_to_edges(
             after.sample();
             prof->contaminated = after.switched_since(before);
         }
-        assert(prof->escalated == prof->truncated && "invariant 12: escalation fires iff the residual is non-empty");
+        assert(
+            prof->escalated == prof->truncated &&
+            "invariant 12: escalation fires iff Phase 1 has no usable answer, and nothing else");
+        record_truncated_reference(dets, prof);
     }
 }
 

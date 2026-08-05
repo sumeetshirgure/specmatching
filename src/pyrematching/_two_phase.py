@@ -32,6 +32,7 @@ def two_phase_decoder(
     T: float = 2.0,
     T_max: Optional[float] = None,
     R: Optional[float] = None,
+    stock_on_h: Optional[bool] = None,
     config: Optional[TwoPhaseConfig] = None,
     num_distinct_weights: Optional[int] = None,
     ball_artifact_path: str = "",
@@ -42,13 +43,20 @@ def two_phase_decoder(
     to ``2 * T_max``, which is the hard requirement of the exactness theorem (§M2.0) with no slack:
     a larger ``R`` is never wrong, a smaller one silently changes the answer.
 
-    Pass ``config`` to set anything else; the three horizon arguments are applied on top of it.
+    ``stock_on_h=True`` selects §M7's front end: stock (untruncated) sparse blossom on the ball
+    graph, kept when its terminal duals certify the shot globally optimal and escalated otherwise.
+    The output is exact MWPM either way; ``T`` stops being a truncation horizon and becomes a pure
+    runtime scalar.
+
+    Pass ``config`` to set anything else; the arguments above are applied on top of it.
     """
     if config is None:
         config = TwoPhaseConfig()
     config.T = T
     config.ball_T_max = T if T_max is None else T_max
     config.ball_R = 2 * config.ball_T_max if R is None else R
+    if stock_on_h is not None:
+        config.stock_on_h = stock_on_h
     if num_distinct_weights is None:
         # Whatever the extension's own default is, which is the same discretisation
         # `Matching.from_detector_error_model` uses. Naming a different one here would silently

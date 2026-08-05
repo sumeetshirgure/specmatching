@@ -61,6 +61,30 @@ Mwpm detector_error_model_to_mwpm(
 /// copying it.
 void begin_timeline(pm::Mwpm& mwpm, const std::vector<uint64_t>& detection_events);
 
+/// Did the timeline complete, or is the graph one on which no perfect matching exists?
+enum class CompletionStatus {
+    /// The queue drained with no alternating tree standing: the primal is a perfect
+    /// matching-with-boundary and the dual is optimal.
+    COMPLETE,
+    /// Alternating trees survived the drained queue, so the graph admits no perfect matching on
+    /// this syndrome. An *expected* outcome for a caller that has somewhere to escalate to, which
+    /// is why this is reported rather than thrown (§M7.2).
+    NO_PERFECT_MATCHING,
+};
+
+/// Stock sparse blossom, run to completion, reporting rather than throwing.
+///
+/// Identical to `process_timeline_until_completion` in every respect except the failure mode: where
+/// that one calls `Mwpm::reset` and throws `std::invalid_argument`, this returns
+/// `NO_PERFECT_MATCHING` and **leaves the instance untouched**, so the caller owns the teardown and
+/// can inspect the state first. `process_timeline_until_completion` is implemented on top of this,
+/// so there is one timeline loop and one tree-survival test, not two.
+///
+/// No horizon is set, consulted or restored: `GraphFlooder::horizon` keeps its `pm::NO_HORIZON`
+/// sentinel throughout, which is the machine-checkable form of §M7.1's "no hardcoded horizon".
+CompletionStatus process_timeline_until_completion_or_report(
+    pm::Mwpm& mwpm, const std::vector<uint64_t>& detection_events);
+
 MatchingResult decode_detection_events_for_up_to_64_observables(
     pm::Mwpm& mwpm, const std::vector<uint64_t>& detection_events, bool edge_correlations);
 

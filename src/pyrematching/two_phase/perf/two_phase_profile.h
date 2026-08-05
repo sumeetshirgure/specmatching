@@ -125,6 +125,11 @@ struct TwoPhaseProfile {
     long long phase1_ns{0};
     /// Harvest on the completed path, or the extract-only reduction once §M3.4's bypass is live.
     long long harvest_ns{0};
+    /// §M7.7. The one terminal `max_u Y(u)` scan on shots that completed on `H`, on the stock-on-`H`
+    /// path only. Counted inside `phase1_ns`'s window and reported separately, because it is the
+    /// only cost the certificate adds and the §M7.8 read has to net it off the gating overhead the
+    /// swap removes.
+    long long dual_scan_ns{0};
     /// The whole escalation call on an escalating shot; 0 otherwise. Kept strictly apart from the
     /// Phase-1 stages so the two are never conflated in a mean (§M3.1).
     long long escalation_ns{0};
@@ -167,8 +172,27 @@ struct TwoPhaseProfile {
     /// along with the rest of Phase 1's partial result, so there is nothing to certify against.
     pm::total_weight_int dual_sum_at_truncation{0};
     pm::total_weight_int weight_out{0};
+    /// §M7.7. `max_u Y(u)` at completion — the quantity the certificate tests. Zero when `H` could
+    /// not complete, and on the truncated-`H` path, where there is no certificate.
+    pm::total_weight_int max_dual_at_completion{0};
 
-    /// Trees survived at `T`, equivalently the residual is non-empty.
+    /// §M7. 1 iff the shot completed on `H` with `max_u Y(u) <= T_int`, i.e. iff `H`'s answer was
+    /// kept as certified globally optimal.
+    int certified{0};
+    /// §M7. 1 iff `H` admitted no perfect matching — the escalation trigger that announces itself,
+    /// as opposed to the completing-but-over-`T` one that does not.
+    int h_no_perfect_matching{0};
+    /// §M7.7 benchmark mode: would the landed truncated-`H` scheme have escalated this same shot?
+    /// Replayed on the identical shot so that `q_current - q_this` is measured rather than asserted.
+    /// `..._measured` says the replay actually ran, so that a campaign which left it off reports no
+    /// `q_current` at all rather than reporting a spurious zero.
+    bool truncated_reference_escalates{false};
+    bool truncated_reference_measured{false};
+
+    /// Phase 1 did not yield a usable answer, so the shot escalates. On the truncated-`H` path that
+    /// is "trees survived at `T`", equivalently "the residual is non-empty"; on §M7's path it is
+    /// "the certificate did not hold". Same branch, same downstream contract, and it stays the
+    /// quantity invariant 12 is written against.
     bool truncated{false};
     /// Whether the shot was re-decoded by stock. Debug-asserted equal to `truncated`, which is
     /// debug invariant 12.
@@ -210,6 +234,16 @@ struct TwoPhaseAggregateStats {
     uint64_t shots_truncated{0};
     uint64_t shots_escalated{0};
     uint64_t shots_zero_defects{0};
+    /// §M7. Shots the certificate kept, and the split of the escalating ones by trigger.
+    uint64_t shots_certified{0};
+    uint64_t shots_h_no_perfect_matching{0};
+    /// §M7.7 benchmark mode: shots the **landed truncated scheme** would have escalated, replayed
+    /// on the identical corpus. `q_current_on_same_corpus` is this over `shots`, and the design's
+    /// `q_this <= q_current` claim is read off the pair rather than assumed.
+    uint64_t shots_escalated_truncated_reference{0};
+    /// Shots on which that replay actually ran, so a campaign that left `measure_truncated_reference`
+    /// off reports no `q_current` rather than reporting zero.
+    uint64_t shots_with_truncated_reference{0};
     /// Shots the scheduler interfered with. Never dropped silently: they are counted here and
     /// excluded from the per-shot vectors, and `contaminated_shot_rate` is reported beside every
     /// percentile (§M6 exit checkpoint).
@@ -217,6 +251,8 @@ struct TwoPhaseAggregateStats {
 
     long long sum_phase1_ns{0};
     long long sum_harvest_ns{0};
+    /// §M7.7. Inside `sum_phase1_ns`, and reported beside it.
+    long long sum_dual_scan_ns{0};
     /// Escalating shots only.
     long long sum_escalation_ns{0};
     long long sum_total_ns{0};
@@ -265,9 +301,17 @@ struct TwoPhaseAggregateStats {
             shots_zero_defects++;
         if (profile.contaminated)
             shots_contaminated++;
+        shots_certified += (uint64_t)profile.certified;
+        shots_h_no_perfect_matching += (uint64_t)profile.h_no_perfect_matching;
+        if (profile.truncated_reference_measured) {
+            shots_with_truncated_reference++;
+            if (profile.truncated_reference_escalates)
+                shots_escalated_truncated_reference++;
+        }
 
         sum_phase1_ns += profile.phase1_ns;
         sum_harvest_ns += profile.harvest_ns;
+        sum_dual_scan_ns += profile.dual_scan_ns;
         sum_total_ns += profile.total_ns;
         sum_exact_reference_ns += profile.exact_reference_ns;
         if (profile.escalated) {
@@ -309,10 +353,24 @@ struct TwoPhaseAggregateStats {
 /// benchmark script. `pyrematching.summarize()` (§M6.3) wraps this.
 struct TwoPhaseSummary {
     /// Escalation rate: how often the shot is re-decoded on `G`. **Always report `shots` beside
-    /// it** — a zero below `1 / shots` is a resolution floor, not a measurement (§M3.0).
+    /// it** — a zero below `1 / shots` is a resolution floor, not a measurement (§M3.0). On §M7's
+    /// path this is that section's `q_this`, and the bindings expose it under both names.
     double q{0};
     uint64_t shots{0};
     uint64_t shots_escalated{0};
+    /// §M7.7. The landed truncated scheme's decision replayed on the identical shots, so that
+    /// `q_this <= q_current` is a measurement rather than an assertion. `-1` when the replay was not
+    /// run, which is not the same statement as `0`.
+    double q_current_on_same_corpus{-1};
+    uint64_t shots_with_truncated_reference{0};
+    /// §M7. Fraction of shots the certificate kept, and the share of *all* shots that escalated
+    /// because `H` had no perfect matching (as against completing with a dual over `T`). The two
+    /// escalation triggers are reported apart because only the second one is silent, and it is the
+    /// one invariant 4 guards.
+    double certified_rate{0};
+    double h_no_perfect_matching_rate{0};
+    /// §M7.7: the certificate's own cost, per shot. Compare against `c_phase1`.
+    double mean_dual_scan_ns{0};
     /// Common-case cost, in ns/shot.
     double c_phase1{0};
     /// Cost conditional on escalating, in ns/shot.
@@ -364,6 +422,14 @@ inline TwoPhaseSummary summarize(const TwoPhaseAggregateStats& stats) {
     summary.shots = stats.shots;
     summary.shots_escalated = stats.shots_escalated;
     summary.q = (double)stats.shots_escalated / shots;
+    summary.certified_rate = (double)stats.shots_certified / shots;
+    summary.h_no_perfect_matching_rate = (double)stats.shots_h_no_perfect_matching / shots;
+    summary.mean_dual_scan_ns = (double)stats.sum_dual_scan_ns / shots;
+    summary.shots_with_truncated_reference = stats.shots_with_truncated_reference;
+    if (stats.shots_with_truncated_reference) {
+        summary.q_current_on_same_corpus =
+            (double)stats.shots_escalated_truncated_reference / (double)stats.shots_with_truncated_reference;
+    }
     summary.c_phase1 = (double)(stats.sum_phase1_ns + stats.sum_harvest_ns) / shots;
     summary.c_escalation =
         stats.shots_escalated ? (double)stats.sum_escalation_ns / (double)stats.shots_escalated : 0.0;

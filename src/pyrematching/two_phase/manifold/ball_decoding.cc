@@ -19,6 +19,7 @@
 #include <iterator>
 #include <sstream>
 
+#include "pyrematching/two_phase/certificate/max_dual.h"
 #include "pyrematching/two_phase/manifold/ball_serialize.h"
 
 namespace pm {
@@ -81,6 +82,14 @@ void BallDecoder::finish_construction(const char* ball_artifact_path) {
     if (config.T > config.ball.T_max)
         throw std::invalid_argument(
             "BallConfig::T exceeds BallParams::T_max; the compiled tables do not cover that horizon.");
+    // §M7: the M1 oracle does not apply on the stock path, because that path produces no truncated
+    // intermediate state to reproduce. Its oracle is stock exact decode on `G` (§M7.6 level 1),
+    // which the M7 test suite runs; silently accepting the flag and comparing against a harvest
+    // that never happens would be worse than refusing it.
+    if (config.stock_on_h && config.verify_against_g)
+        throw std::invalid_argument(
+            "verify_against_g compares H's truncated harvest against M1 on G; the stock-on-H path (§M7) has no "
+            "truncated harvest. Its oracle is stock exact decode on G — see §M7.6 level 1.");
 
     const pm::MatchingGraph& graph = g_mwpm.flooder.graph;
     horizon = to_time_units(config.T, graph.normalising_constant);
@@ -189,14 +198,58 @@ Phase1Outcome BallDecoder::decode_impl(
     harvester.collect_diagnostics = config.collect_harvest_diagnostics;
     harvester.use_legacy_enumeration = config.use_legacy_harvest_enumeration;
 
-    if (prof != nullptr)
-        step.start();
     Phase1Outcome outcome;
-    outcome.status = config.collect_harvest_diagnostics
-                         ? process_timeline_until_horizon_measured(h_mwpm.mwpm, h_dets_scratch, horizon, depth_model)
-                         : process_timeline_until_horizon(h_mwpm.mwpm, h_dets_scratch, horizon);
-    if (prof != nullptr)
-        prof->blossom_on_h_ns = step.elapsed_ns();
+    if (config.stock_on_h) {
+        // §M7. Stock blossom on `H`, no horizon, run to completion; the certificate is then read
+        // once off the terminal dual. `TimelineStatus::TRUNCATED` keeps its meaning as *the branch*
+        // — "Phase 1 has no usable answer, escalate" — which is all M3–M6 downstream consume; on
+        // this path the timeline was never truncated, and `HarvestResult` is empty rather than
+        // partial.
+        if (prof != nullptr)
+            step.start();
+        CertificateOutcome certificate = run_stock_and_certify(h_mwpm.mwpm, h_dets_scratch, horizon, prof != nullptr);
+        if (prof != nullptr) {
+            // The solve proper, with the certificate's own scan netted out, so the two stages are
+            // additive and §M7.8's read can charge the scan separately from the blossom work.
+            prof->blossom_on_h_ns = step.elapsed_ns() - certificate.dual_scan_ns;
+            prof->dual_scan_ns = certificate.dual_scan_ns;
+            prof->certified = certificate.certified() ? 1 : 0;
+            prof->h_no_perfect_matching = certificate.status == CertificateStatus::NO_PERFECT_MATCHING ? 1 : 0;
+            prof->max_dual_at_completion = certificate.max_dual;
+        }
+        outcome.status = certificate.certified() ? TimelineStatus::COMPLETE : TimelineStatus::TRUNCATED;
+
+        // Debug invariant 3: the shot escalates **iff** `H` had no perfect matching or it completed
+        // with `max_u Y(u) > T_int`, read off the certificate's own recomputed dual rather than off
+        // a proxy such as "the residual is empty" or "the solve threw".
+        assert(
+            (outcome.status == TimelineStatus::TRUNCATED) ==
+                (certificate.status == CertificateStatus::NO_PERFECT_MATCHING || certificate.max_dual > horizon) &&
+            "invariant 3: the escalation trigger and the certificate disagree");
+        // Debug invariant 4, the machine guard against §M7.0's "catching the throw is enough"
+        // fallacy: a run that *completed* on `H` with a dual over `T` must escalate. Trivially true
+        // where it is written, and written anyway, because a refactor that reintroduced the fallacy
+        // would be silent everywhere else.
+        assert(
+            !(certificate.status == CertificateStatus::DUAL_EXCEEDS_HORIZON &&
+              outcome.status == TimelineStatus::COMPLETE) &&
+            "invariant 4: a completing-but-over-T H-matching escaped as if it were certified");
+    } else {
+        if (prof != nullptr)
+            step.start();
+        outcome.status =
+            config.collect_harvest_diagnostics
+                ? process_timeline_until_horizon_measured(h_mwpm.mwpm, h_dets_scratch, horizon, depth_model)
+                : process_timeline_until_horizon(h_mwpm.mwpm, h_dets_scratch, horizon);
+        if (prof != nullptr)
+            prof->blossom_on_h_ns = step.elapsed_ns();
+    }
+
+    // Invariant 5's second half: no exposed-root-blossom routine may be entered on a certified shot.
+    // §M1.4 is unreachable here — its precondition is a *surviving* tree root — and this is that
+    // statement asked of the code that would have run it rather than of the argument for why it
+    // cannot.
+    uint64_t base_descents_before = harvester.counters.base_descents;
 
     if (prof != nullptr)
         step.start();
@@ -204,6 +257,12 @@ Phase1Outcome BallDecoder::decode_impl(
     HarvestResult& result = outcome.harvest;
     if (prof != nullptr)
         prof->harvest_ns = step.elapsed_ns();
+
+    assert(
+        (!config.stock_on_h || outcome.status != TimelineStatus::COMPLETE ||
+         harvester.counters.base_descents == base_descents_before) &&
+        "invariant 5: a certified shot entered the exposed-root-blossom base descent");
+    (void)base_descents_before;
 
     // Back to `G`'s detector ids. `h_to_det` is strictly ascending, so a residual sorted in `H`
     // stays sorted in `G` — nothing downstream of harvest has to know `H` existed.
@@ -247,8 +306,12 @@ Phase1Outcome BallDecoder::decode_impl(
         prof->matched_blossom_shatters = result.matched_blossom_shatters;
         prof->largest_tree_size = result.largest_tree_size;
         prof->harvest_dependent_depth = result.harvest_dependent_depth;
-        prof->solve_dependent_depth = config.collect_harvest_diagnostics ? depth_model.depth : 0;
-        prof->solve_events = config.collect_harvest_diagnostics ? depth_model.events : 0;
+        // §M2.9.6 measurement 4 is a property of the *truncated* timeline loop, which is the only
+        // one instrumented; §M7's front end runs stock's loop untouched, which is the point, so it
+        // reports no solve depth rather than a stale one from the previous shot.
+        bool measured_solve = config.collect_harvest_diagnostics && !config.stock_on_h;
+        prof->solve_dependent_depth = measured_solve ? depth_model.depth : 0;
+        prof->solve_events = measured_solve ? depth_model.events : 0;
         if (h.num_nodes() != 0) {
             prof->mean_degree = 2.0 * (double)h.edges.size() / (double)h.num_nodes();
             for (size_t i = 0; i < h.num_nodes(); i++) {
@@ -292,7 +355,22 @@ void BallDecoder::map_match_edges_to_committed_pairs(std::vector<CommittedPair>&
     sort_pairs(committed_pairs);
 }
 
+namespace {
+
+/// Why the two harvest-flavoured entry points are closed on the stock path. See the header.
+[[noreturn]] void reject_harvest_entry_point() {
+    throw std::invalid_argument(
+        "decode_phase1/decode_phase1_to_match_edges return a HarvestResult, and their callers read the escalation "
+        "decision off an empty residual. Under the §M7 certificate that reading is wrong exactly where it matters: "
+        "a shot that completes on H with a suboptimal matching and max_u Y(u) > T has an empty residual and must "
+        "still escalate. Use decode_phase1_production*(), which carries the certificate's own status.");
+}
+
+}  // namespace
+
 HarvestResult BallDecoder::decode_phase1(const std::vector<uint64_t>& dets, BallProfile* prof) {
+    if (config.stock_on_h)
+        reject_harvest_entry_point();
     Phase1Outcome outcome =
         decode_impl(dets, prof, [this](pm::Mwpm& mwpm, const std::vector<uint64_t>& h_dets, TimelineStatus) {
             return harvester.harvest_to_obs(mwpm, h_dets);
@@ -304,6 +382,8 @@ HarvestResult BallDecoder::decode_phase1(const std::vector<uint64_t>& dets, Ball
 
 HarvestResult BallDecoder::decode_phase1_to_match_edges(
     const std::vector<uint64_t>& dets, std::vector<CommittedPair>& committed_pairs, BallProfile* prof) {
+    if (config.stock_on_h)
+        reject_harvest_entry_point();
     match_edge_scratch.clear();
     Phase1Outcome outcome =
         decode_impl(dets, prof, [this](pm::Mwpm& mwpm, const std::vector<uint64_t>& h_dets, TimelineStatus) {
@@ -352,6 +432,27 @@ Phase1Outcome BallDecoder::decode_phase1_production_to_match_edges(
     // right answer: the caller is about to discard Phase 1 entirely.
     map_match_edges_to_committed_pairs(committed_pairs);
     return outcome;
+}
+
+bool BallDecoder::truncated_scheme_escalates(const std::vector<uint64_t>& dets) {
+    // The same `H`, built from the same tables at the same `T` filter — the two schemes differ only
+    // in the front end, so replaying the decision means replaying the solve, not rebuilding the
+    // problem differently.
+    compute_seeded_detection_events(dets, seeded_scratch);
+    build_ball_graph(tables, seeded_scratch, horizon, arena, config.mode, nullptr, nullptr);
+    const BallGraph& h = arena.graph;
+    h_mwpm.rebuild(tables, h, arena, nullptr);
+
+    h_dets_scratch.clear();
+    h_dets_scratch.reserve(h.num_nodes());
+    for (size_t i = 0; i < h.num_nodes(); i++)
+        h_dets_scratch.push_back(i);
+
+    TimelineStatus status = process_timeline_until_horizon(h_mwpm.mwpm, h_dets_scratch, horizon);
+    // Nothing is harvested and nothing is read: only the *decision* is wanted. `abandon_shot` is
+    // the teardown that works from either outcome, and it is what an escalating shot pays anyway.
+    abandon_shot(h_mwpm.mwpm);
+    return status == TimelineStatus::TRUNCATED;
 }
 
 HarvestResult BallDecoder::reference_phase1_on_g(

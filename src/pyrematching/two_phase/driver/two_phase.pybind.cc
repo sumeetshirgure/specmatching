@@ -42,8 +42,21 @@ py::dict summary_to_dict(const TwoPhaseSummary& summary) {
     // Always beside `q`, never without it: a zero below `1 / shots` is a resolution floor rather
     // than a measurement (§M3.0).
     out["q"] = summary.q;
+    // §M7.7 asks for the escalation rate under the name `q_this`, next to the landed scheme's
+    // `q_current` on the same shots. It is the same number as `q`; both names are exposed so that
+    // an M7 report and an M3–M6 report can each use their own vocabulary without a second field.
+    out["q_this"] = summary.q;
     out["shots"] = summary.shots;
     out["shots_escalated"] = summary.shots_escalated;
+    // `None` rather than 0 when the replay was not run: "not measured" and "measured, zero" are
+    // different claims, and at these rates the second one is usually a resolution floor anyway.
+    out["q_current_on_same_corpus"] = summary.q_current_on_same_corpus < 0
+                                          ? py::cast<py::object>(py::none())
+                                          : py::cast<py::object>(py::float_(summary.q_current_on_same_corpus));
+    out["shots_with_truncated_reference"] = summary.shots_with_truncated_reference;
+    out["certified_rate"] = summary.certified_rate;
+    out["h_no_perfect_matching_rate"] = summary.h_no_perfect_matching_rate;
+    out["mean_dual_scan_ns"] = summary.mean_dual_scan_ns;
     out["c_phase1_ns"] = summary.c_phase1;
     out["c_escalation_ns"] = summary.c_escalation;
     out["amortised_mean_ns"] = summary.amortised_mean_ns;
@@ -73,8 +86,13 @@ py::dict stats_to_dict(const TwoPhaseAggregateStats& stats) {
     out["shots_escalated"] = stats.shots_escalated;
     out["shots_zero_defects"] = stats.shots_zero_defects;
     out["shots_contaminated"] = stats.shots_contaminated;
+    out["shots_certified"] = stats.shots_certified;
+    out["shots_h_no_perfect_matching"] = stats.shots_h_no_perfect_matching;
+    out["shots_escalated_truncated_reference"] = stats.shots_escalated_truncated_reference;
+    out["shots_with_truncated_reference"] = stats.shots_with_truncated_reference;
     out["sum_phase1_ns"] = stats.sum_phase1_ns;
     out["sum_harvest_ns"] = stats.sum_harvest_ns;
+    out["sum_dual_scan_ns"] = stats.sum_dual_scan_ns;
     out["sum_escalation_ns"] = stats.sum_escalation_ns;
     out["sum_total_ns"] = stats.sum_total_ns;
     out["sum_total_ns_truncated"] = stats.sum_total_ns_truncated;
@@ -142,6 +160,7 @@ py::dict profiles_to_dict(const std::vector<TwoPhaseProfile>& profiles) {
     py::dict out;
     out["phase1_ns"] = column_i64(&TwoPhaseProfile::phase1_ns);
     out["harvest_ns"] = column_i64(&TwoPhaseProfile::harvest_ns);
+    out["dual_scan_ns"] = column_i64(&TwoPhaseProfile::dual_scan_ns);
     out["escalation_ns"] = column_i64(&TwoPhaseProfile::escalation_ns);
     out["stock_ns"] = column_i64(&TwoPhaseProfile::stock_ns);
     out["total_ns"] = column_i64(&TwoPhaseProfile::total_ns);
@@ -153,20 +172,28 @@ py::dict profiles_to_dict(const std::vector<TwoPhaseProfile>& profiles) {
     out["committed_pairs_tree"] = column_int(&TwoPhaseProfile::committed_pairs_tree);
     out["committed_boundary"] = column_int(&TwoPhaseProfile::committed_boundary);
     out["exposed_root_blossoms"] = column_int(&TwoPhaseProfile::exposed_root_blossoms);
+    out["certified"] = column_int(&TwoPhaseProfile::certified);
+    out["h_no_perfect_matching"] = column_int(&TwoPhaseProfile::h_no_perfect_matching);
     out["truncated"] = column_bool(&TwoPhaseProfile::truncated);
     out["escalated"] = column_bool(&TwoPhaseProfile::escalated);
     out["contaminated"] = column_bool(&TwoPhaseProfile::contaminated);
+    out["truncated_reference_escalates"] = column_bool(&TwoPhaseProfile::truncated_reference_escalates);
+    out["truncated_reference_measured"] = column_bool(&TwoPhaseProfile::truncated_reference_measured);
 
     py::array_t<double> dual_sum((py::ssize_t)n);
     py::array_t<double> weight_out((py::ssize_t)n);
+    py::array_t<double> max_dual((py::ssize_t)n);
     auto dual_view = dual_sum.mutable_unchecked<1>();
     auto weight_view = weight_out.mutable_unchecked<1>();
+    auto max_dual_view = max_dual.mutable_unchecked<1>();
     for (size_t i = 0; i < n; i++) {
         dual_view((py::ssize_t)i) = (double)profiles[i].dual_sum_at_truncation;
         weight_view((py::ssize_t)i) = (double)profiles[i].weight_out;
+        max_dual_view((py::ssize_t)i) = (double)profiles[i].max_dual_at_completion;
     }
     out["dual_sum_at_truncation"] = dual_sum;
     out["weight_out"] = weight_out;
+    out["max_dual_at_completion"] = max_dual;
     return out;
 }
 
@@ -223,6 +250,8 @@ compiled ball tables and must satisfy `ball_R >= 2 * ball_T_max` (§M2.0). `T` m
             self.ball.certify_masks = value;
         });
     config.def_readwrite("phase1_on_ball_graph", &TwoPhaseConfig::phase1_on_ball_graph);
+    config.def_readwrite("stock_on_h", &TwoPhaseConfig::stock_on_h);
+    config.def_readwrite("measure_truncated_reference", &TwoPhaseConfig::measure_truncated_reference);
     config.def_readwrite("unbounded_horizon", &TwoPhaseConfig::unbounded_horizon);
     config.def_readwrite("full_harvest_for_verification", &TwoPhaseConfig::full_harvest_for_verification);
     config.def_readwrite("edges_flavor", &TwoPhaseConfig::edges_flavor);

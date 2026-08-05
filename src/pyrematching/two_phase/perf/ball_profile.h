@@ -33,9 +33,15 @@ struct BallProfile {
     long long h_build_ns{0};
     /// Rewriting the `pm::Mwpm` on `H`.
     long long mwpm_build_ns{0};
-    /// `process_timeline_until_horizon` on `H`.
+    /// The solve on `H`: `process_timeline_until_horizon` on the truncated path, or stock blossom
+    /// run to completion on §M7's. On the latter it excludes `dual_scan_ns`, so the two are
+    /// additive and the certificate's cost is visible on its own.
     long long blossom_on_h_ns{0};
     long long harvest_ns{0};
+    /// §M7.7. The one terminal `max_u Y(u)` scan, paid only on shots that completed on `H`. This is
+    /// the only cost the certificate scheme adds over an unmodified stock-on-`H` solve, and the
+    /// §M7.8 read subtracts it from the gating overhead the swap removes.
+    long long dual_scan_ns{0};
     /// §M3.4: tearing down an escalating shot's `H` instance without harvesting it. Non-zero only
     /// on shots that truncate, and included in `harvest_ns`'s window, which is why it is reported
     /// beside it rather than added to it.
@@ -51,6 +57,20 @@ struct BallProfile {
     int h_boundary_edges{0};
     int max_degree{0};
     double mean_degree{0};
+
+    /// §M7.7's per-shot certificate readout. All three are zero on the truncated-`H` path, where
+    /// there is no certificate to report; on §M7's path exactly one of `certified` and
+    /// "escalates" holds, and `h_no_perfect_matching` says which of the two escalation triggers
+    /// fired.
+    ///
+    /// 1 iff the shot completed on `H` **and** `max_u Y(u) <= T_int` — i.e. iff the shot is
+    /// certified globally optimal and `H`'s answer is kept.
+    int certified{0};
+    /// 1 iff `H` admitted no perfect matching. A valid escalation trigger, not a failure (§M7.0).
+    int h_no_perfect_matching{0};
+    /// `max_u Y(u)` at completion: the quantity the certificate tests. Undefined, and left at zero,
+    /// when `H` could not complete.
+    pm::total_weight_int max_dual_at_completion{0};
 
     /// §M2 structural (hardware-budget) counters. `isect_ns`, `h_build_ns` and `mwpm_build_ns`
     /// measure this laptop's DRAM latency; these measure what the three stages we intend to move
@@ -134,12 +154,18 @@ struct BallAggregateStats {
     uint64_t shots{0};
     uint64_t shots_truncated{0};
     uint64_t shots_zero_defects{0};
+    /// §M7.7. Zero on the truncated-`H` path; on §M7's path `shots_certified` and
+    /// `shots - shots_certified` are the kept and the escalating shots respectively.
+    uint64_t shots_certified{0};
+    uint64_t shots_h_no_perfect_matching{0};
+    uint64_t max_dual_at_completion{0};
 
     long long sum_intersect_ns{0};
     long long sum_h_build_ns{0};
     long long sum_mwpm_build_ns{0};
     long long sum_blossom_on_h_ns{0};
     long long sum_harvest_ns{0};
+    long long sum_dual_scan_ns{0};
     long long sum_abandon_ns{0};
     long long sum_total_ns{0};
     long long sum_g_reference_ns{0};
@@ -224,7 +250,11 @@ struct BallAggregateStats {
         sum_mwpm_build_ns += profile.mwpm_build_ns;
         sum_blossom_on_h_ns += profile.blossom_on_h_ns;
         sum_harvest_ns += profile.harvest_ns;
+        sum_dual_scan_ns += profile.dual_scan_ns;
         sum_abandon_ns += profile.abandon_ns;
+        shots_certified += (uint64_t)profile.certified;
+        shots_h_no_perfect_matching += (uint64_t)profile.h_no_perfect_matching;
+        max_dual_at_completion = std::max(max_dual_at_completion, (uint64_t)profile.max_dual_at_completion);
         sum_total_ns += profile.total_ns;
         sum_g_reference_ns += profile.g_reference_ns;
 
@@ -305,6 +335,15 @@ struct BallSummary {
     double frac_mwpm_build{0};
     double frac_blossom_on_h{0};
     double frac_harvest{0};
+    /// §M7.7/§M7.8: the certificate's own share of the shot, so the stage split of the M7 read
+    /// (`intersect / h_build / mwpm_build / blossom_on_h / dual_scan`) is complete.
+    double frac_dual_scan{0};
+    double mean_dual_scan_ns{0};
+    /// §M7: fraction of shots kept on `H` under the certificate, and the share of the escalating
+    /// ones that escalated because `H` had no perfect matching rather than because the terminal
+    /// dual escaped `T`. Both zero on the truncated-`H` path.
+    double certified_rate{0};
+    double h_no_perfect_matching_rate{0};
 
     double mean_degree{0};
     double max_degree{0};
@@ -388,7 +427,11 @@ inline BallSummary summarize_ball(const BallAggregateStats& stats) {
         summary.frac_mwpm_build = (double)stats.sum_mwpm_build_ns / total;
         summary.frac_blossom_on_h = (double)stats.sum_blossom_on_h_ns / total;
         summary.frac_harvest = (double)stats.sum_harvest_ns / total;
+        summary.frac_dual_scan = (double)stats.sum_dual_scan_ns / total;
     }
+    summary.mean_dual_scan_ns = (double)stats.sum_dual_scan_ns / shots;
+    summary.certified_rate = (double)stats.shots_certified / shots;
+    summary.h_no_perfect_matching_rate = (double)stats.shots_h_no_perfect_matching / shots;
     summary.mean_total_ns = (double)stats.sum_total_ns / shots;
     summary.mean_g_reference_ns = (double)stats.sum_g_reference_ns / shots;
     summary.p50_total_ns = percentile_of(stats.per_shot_total_ns, 0.5);

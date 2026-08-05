@@ -130,7 +130,8 @@ void pm::begin_timeline(pm::Mwpm& mwpm, const std::vector<uint64_t>& detection_e
     }
 }
 
-void process_timeline_until_completion(pm::Mwpm& mwpm, const std::vector<uint64_t>& detection_events) {
+pm::CompletionStatus pm::process_timeline_until_completion_or_report(
+    pm::Mwpm& mwpm, const std::vector<uint64_t>& detection_events) {
     pm::begin_timeline(mwpm, detection_events);
 
     while (true) {
@@ -140,8 +141,15 @@ void process_timeline_until_completion(pm::Mwpm& mwpm, const std::vector<uint64_
         mwpm.process_event(event);
     }
 
-    // If some alternating tree nodes remain, a perfect matching cannot be found
-    if (mwpm.node_arena.allocated.size() != mwpm.node_arena.available.size()) {
+    // If some alternating tree nodes remain, a perfect matching cannot be found.
+    if (mwpm.node_arena.allocated.size() != mwpm.node_arena.available.size())
+        return pm::CompletionStatus::NO_PERFECT_MATCHING;
+    return pm::CompletionStatus::COMPLETE;
+}
+
+void process_timeline_until_completion(pm::Mwpm& mwpm, const std::vector<uint64_t>& detection_events) {
+    if (pm::process_timeline_until_completion_or_report(mwpm, detection_events) ==
+        pm::CompletionStatus::NO_PERFECT_MATCHING) {
         mwpm.reset();
         throw std::invalid_argument(
             "No perfect matching could be found. This likely means that the syndrome has odd "

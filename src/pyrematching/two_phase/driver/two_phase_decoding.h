@@ -30,9 +30,32 @@ namespace pm {
 namespace two_phase {
 
 struct TwoPhaseConfig {
-    /// The truncation horizon, in DEM float weight units.
+    /// The horizon, in DEM float weight units. A truncation horizon on the landed path; a pure
+    /// runtime scalar — ball filter plus escalation threshold, never a flooder field — under
+    /// `stock_on_h` (§M7.1).
     double T{2.0};
     BallParams ball;
+
+    /// §M7 — swap Phase 1's front end for **stock** sparse blossom on `H` plus a max-dual
+    /// certificate. Requires `phase1_on_ball_graph`. See `BallConfig::stock_on_h`.
+    ///
+    /// The output is exact MWPM on every shot either way. What this buys is a cleaner exact
+    /// certificate — direct equality against stock-on-`G` rather than bit-exactness against a
+    /// truncated harvest — plus the removed gating and harvest overhead, and an escalation rate
+    /// that is no higher than the truncated scheme's (§M7.0's corollary). It is **not** expected to
+    /// move the headline speedup: the common path does the same blossom work in both schemes.
+    bool stock_on_h{false};
+
+    /// §M7.7 benchmark mode: replay the landed truncated scheme's escalation decision on every shot
+    /// so that `q_current_on_same_corpus` — and therefore `q_current - q_this` — is measured on
+    /// identical shots rather than compared across campaigns. Only meaningful with `stock_on_h`.
+    ///
+    /// **Read `q` from such a campaign, never a time.** The replay costs a second full Phase 1 on
+    /// `H`, and it tears its instance down with `Mwpm::reset`, which frees the arena pools — so the
+    /// *next* shot re-allocates them and its `total_ns` is not a steady-state number. The replay
+    /// itself runs outside the timed window, but that does not undo what it leaves behind. §M7.8's
+    /// speedup read therefore runs two decoders alternately rather than turning this on.
+    bool measure_truncated_reference{false};
 
     /// Run Phase 1 on the defect manifold `H` (§M2). `false` runs M1's decode on `G` instead and
     /// compiles no ball tables at all — the oracle path, and the only one that supports
@@ -183,6 +206,9 @@ struct TwoPhaseDecoder {
     /// off the ball tables' observable id lists. `obs` and `weight` are overwritten.
     void obs_from_committed_pairs(uint8_t* obs, pm::total_weight_int& weight) const;
     void copy_phase1_stats(const Phase1Outcome& outcome, TwoPhaseProfile* prof) const;
+    /// §M7.7's `q_current_on_same_corpus`. Runs **outside** the shot's timed window, after
+    /// `total_ns` has been read, because it is a second full Phase 1 on `H`.
+    void record_truncated_reference(const std::vector<uint64_t>& dets, TwoPhaseProfile* prof);
 };
 
 }  // namespace two_phase

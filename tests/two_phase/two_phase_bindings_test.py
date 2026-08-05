@@ -142,6 +142,58 @@ def test_ball_artifact_round_trips(corpus):
             np.testing.assert_array_equal(loaded.decode_to_obs(shot)[0], decoder.decode_to_obs(shot)[0])
 
 
+def test_stock_on_h_is_exact_against_stock(corpus):
+    """§M7 from python: the certificate front end is exact MWPM on every shot, and reports itself."""
+    dem, shots = corpus
+    decoder = pyrematching.two_phase_decoder(dem, T=2.0, stock_on_h=True)
+    expected = _stock_predictions(dem, shots)
+    for shot, (want_obs, want_weight) in zip(shots, expected):
+        got_obs, got_weight = decoder.decode_to_obs(shot)
+        np.testing.assert_array_equal(got_obs, want_obs)
+        assert got_weight == pytest.approx(want_weight, rel=1e-9, abs=1e-9)
+
+    _, _, profile = decoder.decode_batch(shots, profile=True)
+    # Exactly one of the two branches, on every shot.
+    np.testing.assert_array_equal(profile["certified"] == 1, ~profile["escalated"])
+    # A shot that escalated because `H` had no perfect matching has no dual to report.
+    assert np.all(profile["max_dual_at_completion"][profile["h_no_perfect_matching"] == 1] == 0)
+
+
+def test_stock_on_h_reports_q_this_against_q_current(corpus):
+    """§M7.7: the landed scheme's decision replayed on identical shots, so the reduction is measured.
+
+    `q_current_on_same_corpus` is `None` rather than `0` when the replay was not run — "not measured"
+    and "measured, zero" are different claims, and at these rates the second is a resolution floor.
+    """
+    dem, shots = corpus
+    config = pyrematching.TwoPhaseConfig()
+    config.stock_on_h = True
+    config.measure_truncated_reference = True
+    decoder = pyrematching.two_phase_decoder(dem, T=1.0, config=config)
+    decoder.decode_batch(shots, profile=True)
+
+    summary = pyrematching.summarize(decoder.get_aggregate_stats())
+    assert summary["q_this"] == summary["q"]
+    assert summary["shots_with_truncated_reference"] == len(shots)
+    assert summary["q_current_on_same_corpus"] is not None
+    # §M7.0's corollary, on identical shots.
+    assert summary["q"] <= summary["q_current_on_same_corpus"]
+
+    without_replay = pyrematching.two_phase_decoder(dem, T=1.0, stock_on_h=True)
+    without_replay.decode_batch(shots, profile=True)
+    assert pyrematching.summarize(without_replay.get_aggregate_stats())["q_current_on_same_corpus"] is None
+
+
+def test_stock_on_h_rejects_the_m1_harvest_oracle(corpus):
+    """The M1 oracle has no truncated intermediate state to reproduce here; M7's oracle is stock-on-G."""
+    dem, _ = corpus
+    config = pyrematching.TwoPhaseConfig()
+    config.stock_on_h = True
+    config.verify_against_g = True
+    with pytest.raises(ValueError):
+        pyrematching.two_phase_decoder(dem, T=2.0, config=config)
+
+
 def test_unbounded_horizon_requires_the_oracle_front_end(corpus):
     dem, _ = corpus
     config = pyrematching.TwoPhaseConfig()

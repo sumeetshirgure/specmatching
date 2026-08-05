@@ -28,6 +28,13 @@ print(pyrematching.summarize(decoder.get_aggregate_stats()))
 which is the memory cost. Lowering `T` raises the fraction of shots that fall back — measured at
 `5e-6` to `1.3e-4` at `T = 2` and one to two orders higher at `T = 1.5`.
 
+`pyrematching.two_phase_decoder(dem, T=2.0, stock_on_h=True)` selects an alternative front end:
+**stock** (untruncated) sparse blossom on the ball graph, kept when its terminal duals certify the
+shot globally optimal and escalated otherwise. Same exact output, same escalation rate (measured
+identical over 10⁶ shots), about 3% slower, and a cleaner correctness argument — it is checked by
+direct equality against stock exact decode rather than against a truncated intermediate state. See
+`docs/two_phase_m7_exit.md`.
+
 **It is not currently faster than the inherited decoder on a CPU**: measured at 0.28–0.42x stock
 exact decode throughput. See `docs/two_phase_m6_exit.md` for why, and for the critical-path and
 local-memory measurements the design is actually argued on. The exit reports for each milestone are

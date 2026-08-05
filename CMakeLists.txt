@@ -68,6 +68,7 @@ set(SOURCE_FILES_NO_MAIN
         src/pyrematching/two_phase/manifold/ball_graph.cc
         src/pyrematching/two_phase/manifold/ball_mwpm.cc
         src/pyrematching/two_phase/manifold/ball_decoding.cc
+        src/pyrematching/two_phase/certificate/max_dual.cc
         src/pyrematching/two_phase/escalation/escalate.cc
         src/pyrematching/two_phase/driver/two_phase_decoding.cc
         )
@@ -103,6 +104,7 @@ set(TEST_FILES
         tests/two_phase/manifold_ball_graph.test.cc
         tests/two_phase/manifold_ball_identity.test.cc
         tests/two_phase/escalation_escalate.test.cc
+        tests/two_phase/stock_on_h_certificate.test.cc
         tests/two_phase/two_phase_driver.test.cc
         )
 
@@ -201,6 +203,17 @@ if (NOT (MSVC))
     target_link_options(two_phase_m6_artifact PRIVATE -pthread -O3)
 endif ()
 target_link_libraries(two_phase_m6_artifact libstim)
+
+# M7 exit artifact: §M7.8's read — the stock-on-H front end against the landed truncated-H path with
+# the stage split, the identity count against stock exact decode on G, and `q_this` against
+# `q_current_on_same_corpus` replayed on identical shots.
+add_executable(two_phase_m7_artifact benchmarks/two_phase/m7_exit_artifact.cc ${SOURCE_FILES_NO_MAIN})
+target_include_directories(two_phase_m7_artifact PRIVATE ${CMAKE_CURRENT_LIST_DIR})
+target_compile_options(two_phase_m7_artifact PRIVATE ${ARCH_OPT})
+if (NOT (MSVC))
+    target_link_options(two_phase_m7_artifact PRIVATE -pthread -O3)
+endif ()
+target_link_libraries(two_phase_m7_artifact libstim)
 
 add_library(libpyrematching ${SOURCE_FILES_NO_MAIN})
 set_target_properties(libpyrematching PROPERTIES PREFIX "")
