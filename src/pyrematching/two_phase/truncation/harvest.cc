@@ -16,9 +16,9 @@
 
 #include <algorithm>
 #include <cassert>
-#include <chrono>
 #include <sstream>
 
+#include "pyrematching/perf/thread_timer.h"
 #include "pyrematching/sparse_blossom/flooder/graph.h"
 #include "pyrematching/sparse_blossom/matcher/alternating_tree.h"
 #include "pyrematching/sparse_blossom/tracker/flood_check_event.h"
@@ -28,20 +28,11 @@ namespace two_phase {
 
 namespace {
 
-/// A nanosecond stopwatch, local to this file so that `harvest.h` stays free of the profile headers
-/// (`two_phase_profile.h` includes it, not the other way around).
-struct Stopwatch {
-    std::chrono::high_resolution_clock::time_point start_time{};
-
-    inline void start() {
-        start_time = std::chrono::high_resolution_clock::now();
-    }
-    inline long long elapsed_ns() const {
-        return (long long)std::chrono::duration_cast<std::chrono::nanoseconds>(
-                   std::chrono::high_resolution_clock::now() - start_time)
-            .count();
-    }
-};
+/// The same thread-scoped stopwatch the rest of the profile uses, aliased locally so that
+/// `harvest.h` stays free of the profile headers (`two_phase_profile.h` includes it, not the other
+/// way around). Harvest's stage split is summed against `harvest_ns`, which is timed by
+/// `HiResTimer`, so the two must be the same clock or the reconciliation is meaningless.
+using Stopwatch = pm::perf::ThreadTimer;
 
 /// Nesting depth and member count of a region's blossom structure. Depth 0 is a plain region.
 void measure_blossom(const pm::GraphFillRegion& region, int& depth_out, int& members_out) {

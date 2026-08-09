@@ -9,7 +9,7 @@ end, and §M6.4's benchmark list.
 | Design item | Where |
 |---|---|
 | §M6.1 per-shot profile, reworked for escalation | `two_phase/perf/two_phase_profile.h`, `TwoPhaseProfile` |
-| §M6.1 timer backends | `HiResTimer`, `steady_clock` by default, `rdtsc` under `-DPYREMATCHING_USE_RDTSC=ON` |
+| §M6.1 timer backends | `HiResTimer` = `pm::perf::ThreadTimer`, `perf/thread_timer.h` (see the note below — the backend was replaced after this campaign) |
 | §M6.2 aggregate stats and `summarize()` | same file, `TwoPhaseAggregateStats` / `TwoPhaseSummary` |
 | §M6.3 bindings | `two_phase/driver/two_phase.pybind.{h,cc}`, registered in `pyrematching.pybind.cc` |
 | §M6.3 python entry point | `pyrematching.two_phase_decoder`, `src/pyrematching/_two_phase.py` |
@@ -50,6 +50,25 @@ implying the machine was quiet.
 This run was made on an ordinary desktop with no core pinning and no frequency-scaling lockout. The
 design asks for both; the contamination rate is what says how much to discount the numbers, and it
 is why it is printed next to them rather than in a footnote.
+
+#### Superseded: the clock is now thread-scoped
+
+Everything above describes a **wall-clock** timer, and the discipline built around it — detect the
+scheduler's interference, then discard the shots it touched. `HiResTimer` has since been replaced by
+`pm::perf::ThreadTimer` (`src/pyrematching/perf/thread_timer.h`), which does not need discarding:
+it is a per-thread `perf_event` cycle counter read with `rdpmc`, virtualised by the kernel so that it
+advances **only while the thread is on a CPU**. Measured at 8.3 ns per reading against `steady_clock`'s
+22.8 ns, so the change was not paid for in overhead.
+
+Note that `rdtsc` — the obvious "high precision" answer, and the one the retired
+`-DPYREMATCHING_USE_RDTSC=ON` path took — would not have helped: the TSC is free-running and keeps
+counting through a context switch, so it is exactly as contaminated as `steady_clock` and, on a
+`clocksource=tsc` machine, is the same counter `steady_clock` already reads through the vDSO.
+
+The numbers recorded in this report predate the swap and are left as measured. `PreemptionProbe` and
+`contaminated_shot_rate` are kept — see the comment on `PreemptionProbe` for why a descheduled shot
+is still an outlier once its off-CPU time is no longer charged to it, and why the two together are
+now a cross-check on the clock rather than a correction to it.
 
 ### Bindings
 

@@ -17,10 +17,11 @@
 #ifndef _PYREMATCHING_PERF_UTIL_PERF_H
 #define _PYREMATCHING_PERF_UTIL_PERF_H
 
-#include <chrono>
 #include <functional>
 #include <string>
 #include <vector>
+
+#include "pyrematching/perf/thread_timer.h"
 
 extern double BENCHMARK_CONFIG_TARGET_SECONDS;
 
@@ -93,14 +94,18 @@ BenchmarkResult &benchmark_go(FUNC body) {
                 reps = 1;
             }
         }
-        auto start = std::chrono::steady_clock::now();
+        // Thread run time, not wall time: a benchmark that loses the CPU mid-batch would otherwise
+        // report the scheduler's time as the body's. `total_seconds` is therefore also the loop's
+        // budget in *thread* seconds — on a busy machine the run takes longer in wall time and
+        // still measures the same thing. See `perf/thread_timer.h`.
+        pm::perf::ThreadTimer batch;
+        batch.start();
         for (size_t rep = 0; rep < reps; rep++) {
             body();
         }
-        auto end = std::chrono::steady_clock::now();
-        auto micros = std::chrono::duration_cast<std::chrono::microseconds>(end - start).count();
+        auto nanos = batch.elapsed_ns();
         total_reps += reps;
-        total_seconds += (double)micros / 1000.0 / 1000.0;
+        total_seconds += (double)nanos / 1000.0 / 1000.0 / 1000.0;
     }
 
     running_benchmark->results.push_back({total_seconds, total_reps});

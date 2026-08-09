@@ -16,17 +16,13 @@
 #define PYREMATCHING_TWO_PHASE_PERF_TWO_PHASE_PROFILE_H
 
 #include <algorithm>
-#include <chrono>
 #include <cmath>
 #include <cstdint>
 #include <vector>
 
+#include "pyrematching/perf/thread_timer.h"
 #include "pyrematching/sparse_blossom/ints.h"
 #include "pyrematching/two_phase/truncation/harvest.h"
-
-#if defined(PYREMATCHING_USE_RDTSC)
-#include <x86intrin.h>
-#endif
 
 #if defined(__linux__)
 #include <sys/resource.h>
@@ -35,62 +31,25 @@
 namespace pm {
 namespace two_phase {
 
-/// Monotonic nanosecond clock for the per-shot profile.
-///
-/// The default backend is `std::chrono::steady_clock`, named explicitly rather than through
-/// `high_resolution_clock` — the latter is a *typedef* for `system_clock` on libstdc++, which is
-/// not monotonic and can step backwards under NTP, producing negative or absurd per-shot times in
-/// exactly the tail percentiles this design cares about (§M6.4 timer discipline).
-///
-/// Building with `-DPYREMATCHING_USE_RDTSC=ON` switches to a calibrated `rdtsc`, which is cheaper
-/// per reading but only meaningful on an invariant-TSC machine; the calibration happens once,
-/// lazily.
-struct HiResTimer {
-#if defined(PYREMATCHING_USE_RDTSC)
-    static double ns_per_tick() {
-        static const double calibrated = [] {
-            auto chrono_start = std::chrono::steady_clock::now();
-            uint64_t tsc_start = __rdtsc();
-            // Busy-wait rather than sleep: this runs once, and sleeping would measure the
-            // scheduler rather than the clock.
-            while (std::chrono::steady_clock::now() - chrono_start < std::chrono::milliseconds(20)) {
-            }
-            uint64_t tsc_end = __rdtsc();
-            auto chrono_end = std::chrono::steady_clock::now();
-            auto elapsed_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(chrono_end - chrono_start).count();
-            return (double)elapsed_ns / (double)(tsc_end - tsc_start);
-        }();
-        return calibrated;
-    }
-
-    uint64_t start_tick{0};
-
-    inline void start() {
-        start_tick = __rdtsc();
-    }
-    inline long long elapsed_ns() const {
-        return (long long)((double)(__rdtsc() - start_tick) * ns_per_tick());
-    }
-#else
-    std::chrono::steady_clock::time_point start_time{};
-
-    inline void start() {
-        start_time = std::chrono::steady_clock::now();
-    }
-    inline long long elapsed_ns() const {
-        return (long long)std::chrono::duration_cast<std::chrono::nanoseconds>(
-                   std::chrono::steady_clock::now() - start_time)
-            .count();
-    }
-#endif
-};
+/// The stopwatch every stage of the profile is timed with (§M6.1 timer backends, §M6.4 timer
+/// discipline). Thread-scoped: it advances only while this thread is on a CPU, so a shot the
+/// scheduler interrupts is no longer charged for the time it spent off the CPU. See
+/// `perf/thread_timer.h` for the backends, their measured per-reading costs, and what "thread run
+/// time" excludes.
+using HiResTimer = pm::perf::ThreadTimer;
 
 /// Was this thread descheduled while the shot was being timed? (§M6.4 timer discipline.)
 ///
-/// One preemption defines p999 outright at 2000 shots, so a percentile quoted without this is a
-/// measurement of the scheduler. `RUSAGE_THREAD` is Linux-specific; elsewhere the probe reports
-/// "not contaminated" and `contaminated_shot_rate` reads 0, which the artifact says explicitly
-/// rather than implying the machine was quiet.
+/// `HiResTimer` no longer *charges* the shot for time spent off the CPU, so this is no longer what
+/// stands between a percentile and the scheduler. It is kept because being descheduled costs the
+/// shot more than the wall time it loses — the caches and branch predictors it resumes on are not
+/// the ones it left — so an interrupted shot is still an outlier, just a far smaller one. It is
+/// also the cross-check on the clock: on a thread-scoped backend a contaminated shot should now
+/// look much like its neighbours, and if it does not, the backend is not doing what it claims.
+///
+/// `RUSAGE_THREAD` is Linux-specific; elsewhere the probe reports "not contaminated" and
+/// `contaminated_shot_rate` reads 0, which the artifact says explicitly rather than implying the
+/// machine was quiet.
 struct PreemptionProbe {
     long voluntary{0};
     long involuntary{0};
@@ -197,8 +156,9 @@ struct TwoPhaseProfile {
     /// Whether the shot was re-decoded by stock. Debug-asserted equal to `truncated`, which is
     /// debug invariant 12.
     bool escalated{false};
-    /// The thread was descheduled during this shot, so its time is the scheduler's, not the
-    /// decoder's. Excluded from percentiles and counted in `contaminated_shot_rate`.
+    /// The thread was descheduled during this shot. Its timings no longer *include* the off-CPU
+    /// time — `HiResTimer` is thread-scoped — but it resumed on cold caches, so it is still an
+    /// outlier. Excluded from percentiles and counted in `contaminated_shot_rate`.
     bool contaminated{false};
 
     void clear() {
