@@ -47,18 +47,43 @@ def load(path):
     return table
 
 
+def select(table, distances, ps):
+    """Keeps only the requested `d` and `p` values. `None` on either axis keeps all of it.
+
+    The aggregates below (min/mean/max, the identity total) are computed over what survives here, so
+    a filtered run reports the filtered grid and not the whole campaign.
+    """
+    if distances is None and ps is None:
+        return table
+    kept = {
+        key: row
+        for key, row in table.items()
+        if (distances is None or key[1] in distances) and (ps is None or key[2] in ps)
+    }
+    missing_d = sorted(set(distances or ()) - {key[1] for key in table})
+    missing_p = sorted(set(ps or ()) - {key[2] for key in table})
+    for value in missing_d:
+        print(f"  note: no rows at d={value:g} in this artifact.")
+    for value in missing_p:
+        print(f"  note: no rows at p={value:g} in this artifact.")
+    return kept
+
+
 def points(table, section):
     return sorted(key for key in table if key[0] == section)
 
 
 def report_identity(table):
+    keys = points(table, "identity")
+    if not keys:
+        return
     print("\n== §M7.6 identity against stock exact decode on G ==")
     print(
         f"{'d':>4} {'p':>8} {'T':>5} {'shots':>9} {'wt_disagr':>10} {'obs_disagr':>11} "
         f"{'certified':>10} {'escalated':>10} {'no_pm':>7}"
     )
     total = 0
-    for key in points(table, "identity"):
+    for key in keys:
         row = table[key]
         total += row["weight_disagreements"] + row["obs_disagreements"]
         print(
@@ -167,8 +192,25 @@ def report_speedup(table):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("csv_path")
+    parser.add_argument(
+        "--p",
+        type=float,
+        nargs="+",
+        metavar="P",
+        help="only report these physical error rates; default is every p in the artifact",
+    )
+    parser.add_argument(
+        "--distances",
+        type=int,
+        nargs="+",
+        metavar="D",
+        help="only report these code distances; default is every d in the artifact",
+    )
     args = parser.parse_args()
-    table = load(args.csv_path)
+    table = select(load(args.csv_path), args.distances, args.p)
+    if not table:
+        print("  nothing selected; no rows match the requested d/p.")
+        return
     report_identity(table)
     report_speedup(table)
 
