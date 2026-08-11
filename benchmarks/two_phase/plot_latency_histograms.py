@@ -49,15 +49,19 @@ how many shots fell past it.
 The same numbers also go to a text table — `latency_speedups.txt`, written into the same directory as
 the figures — so the run is readable without opening an image, and diffable between runs. `--table`
 prints that table to the terminal too.
+
+A million-shot campaign is read a chunk at a time and never held as Python objects: see `load` and
+`series_of` for what that costs and what it buys.
 """
 
 import argparse
-import csv
+import itertools
 import math
 import os
 import sys
 
 import matplotlib
+import numpy as np
 
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt  # noqa: E402
@@ -86,14 +90,38 @@ THEMES = {
 STOCK_LABEL = "stock decode on G"
 SPARSE_LABEL = "stock decode on sparsified H"
 
+# Rows are parsed in blocks of this many, so the transient cost of a read is set by the block and not
+# by the length of the campaign. Big enough that the per-block overhead is lost in the parse, small
+# enough that a block of text is a few megabytes rather than the whole file.
+CHUNK_ROWS = 100_000
+
+# The only columns any series needs. Everything else in the row — `shot`, `defects`, `certified`,
+# `total_ns` — is never read, so it is never parsed either.
+NEEDED = (
+    "contaminated",
+    "escalated",
+    "stock_g_ns",
+    "blossom_ns",
+    "dscan_ns",
+    "hrvst_ns",
+    "escal_stock_ns",
+    "excluded_ns",
+)
+AT = {name: position for position, name in enumerate(NEEDED)}
+
 
 class Log:
-    """One `(d, p, T, mode)` log file: its `#` metadata and its per-shot rows."""
+    """One `(d, p, T, mode)` log file: its `#` metadata and its column header.
 
-    def __init__(self, path, meta, rows):
+    Deliberately not its rows. The rows stay on disk and are streamed by `series_of`; a `Log` is
+    small enough that `main` can hold one per file for the whole run, which is what the summary table
+    at the end needs.
+    """
+
+    def __init__(self, path, meta, columns):
         self.path = path
         self.meta = meta
-        self.rows = rows
+        self.columns = columns
 
     @property
     def title(self):
@@ -107,22 +135,45 @@ class Log:
         return os.path.splitext(os.path.basename(self.path))[0]
 
 
-def load(path):
+def read_header(handle):
+    """Consumes the `#` metadata and the column header, leaving `handle` on the first shot row."""
     meta = {}
-    rows = []
+    for line in handle:
+        if line.startswith("#"):
+            key, _, value = line[1:].strip().partition("=")
+            meta[key.strip()] = value.strip()
+        elif line.strip():
+            return meta, [name.strip() for name in line.strip().split(",")]
+    return meta, []
+
+
+def load(path):
+    """Reads the header. The shot rows are left on disk for `series_of` to stream.
+
+    A million-shot log is ~50 MB of text, and materialising it the obvious way — a list of lines,
+    then a list of per-shot dicts — costs upwards of a gigabyte for that one file, because a dict of
+    twelve boxed ints per row is nearly two orders of magnitude wider than the two numbers actually
+    wanted from it. Holding one of those per log file, which is what a summary table over a campaign
+    implies, is what runs the machine out of memory rather than any single figure.
+
+    So a `Log` is its header and nothing else, and the rows are read once, in blocks, straight into
+    two `float64` arrays. Whether the columns needed are even present is settled here, before a
+    figure is started, so a malformed log is reported by name like any other bad file.
+    """
     with open(path) as handle:
-        lines = []
-        for line in handle:
-            if line.startswith("#"):
-                key, _, value = line[1:].strip().partition("=")
-                meta[key.strip()] = value.strip()
-            else:
-                lines.append(line)
-    for row in csv.DictReader(lines):
-        rows.append({key: int(value) for key, value in row.items()})
-    if not rows:
-        raise ValueError(f"{path}: no shot rows")
-    return Log(path, meta, rows)
+        meta, columns = read_header(handle)
+        if not columns:
+            raise ValueError(f"{path}: no column header")
+        if next(handle, None) is None:
+            raise ValueError(f"{path}: no shot rows")
+    # v1 logged one pre-summed `sparse_ns` column and no stage split, so it cannot be re-read under
+    # the definition in `series_of`. Named rather than reported as a pile of absent columns.
+    if meta.get("schema") not in (None, "two_phase_latency_v2"):
+        raise ValueError(f"schema {meta['schema']}; this script reads two_phase_latency_v2")
+    missing = [name for name in NEEDED if name not in columns]
+    if missing:
+        raise ValueError(f"{path}: header is missing {', '.join(missing)}")
+    return Log(path, meta, columns)
 
 
 def collect(paths):
@@ -154,67 +205,113 @@ def series_of(log, include_contaminated, include_excluded):
     Contaminated shots — the thread was descheduled mid-shot — are dropped from **both** series
     before anything is computed, so the two stay paired shot for shot. The count is returned rather
     than swallowed.
+
+    The file is walked once, `CHUNK_ROWS` rows at a time, and each block is dropped as soon as the
+    two columns it contributes have been appended. The filter and the stage sum are done on the block
+    while it is still integer nanoseconds, so a contaminated shot is never converted at all. What
+    survives the read is two `float64` arrays — 8 MB each per million kept shots, against roughly a
+    hundred times that for the same rows as Python objects.
     """
-    stock = []
-    sparse = []
+    usecols = tuple(log.columns.index(name) for name in NEEDED)
+    stock_chunks = []
+    sparse_chunks = []
     escalated = 0
     dropped = 0
-    for row in log.rows:
-        if row["contaminated"] and not include_contaminated:
-            dropped += 1
-            continue
-        stock.append(row["stock_g_ns"] / 1000.0)
-        value = row["blossom_ns"] + row["dscan_ns"] + row["hrvst_ns"] + row["escal_stock_ns"]
-        if include_excluded:
-            value += row["excluded_ns"]
-        sparse.append(value / 1000.0)
-        escalated += row["escalated"]
+    with open(log.path) as handle:
+        read_header(handle)
+        while True:
+            text = list(itertools.islice(handle, CHUNK_ROWS))
+            if not text:
+                break
+            block = np.loadtxt(text, delimiter=",", usecols=usecols, dtype=np.int64, ndmin=2)
+            del text
+            if not block.size:
+                continue
+            if include_contaminated:
+                kept = block
+            else:
+                clean = block[:, AT["contaminated"]] == 0
+                dropped += int(block.shape[0] - np.count_nonzero(clean))
+                kept = block[clean]
+            del block
+            if not kept.shape[0]:
+                continue
+            escalated += int(kept[:, AT["escalated"]].sum())
+            value = (
+                kept[:, AT["blossom_ns"]]
+                + kept[:, AT["dscan_ns"]]
+                + kept[:, AT["hrvst_ns"]]
+                + kept[:, AT["escal_stock_ns"]]
+            )
+            if include_excluded:
+                value += kept[:, AT["excluded_ns"]]
+            stock_chunks.append(kept[:, AT["stock_g_ns"]] / 1000.0)
+            sparse_chunks.append(value / 1000.0)
+    empty = np.empty(0, dtype=np.float64)
+    stock = np.concatenate(stock_chunks) if stock_chunks else empty
+    stock_chunks.clear()
+    sparse = np.concatenate(sparse_chunks) if sparse_chunks else empty
+    sparse_chunks.clear()
     return stock, sparse, escalated, dropped
 
 
 def percentile(values, fraction):
-    """Only ever used to choose where the x axis stops; nothing reported is a percentile."""
-    if not values:
+    """Only ever used to choose where the x axis stops; nothing reported is a percentile.
+
+    A partial sort, not a full one: the axis needs one order statistic, and selecting it costs a
+    linear pass over one scratch copy instead of sorting a two-million-element pool.
+    """
+    if values.size == 0:
         return float("nan")
-    ordered = sorted(values)
-    index = min(int(fraction * (len(ordered) - 1)), len(ordered) - 1)
-    return ordered[index]
+    index = min(int(fraction * (values.size - 1)), values.size - 1)
+    return float(np.partition(values, index)[index])
 
 
 def mean_of(values):
-    return sum(values) / len(values) if values else float("nan")
+    return float(values.mean()) if values.size else float("nan")
 
 
 def stats_of(values):
     return {
-        "n": len(values),
+        "n": int(values.size),
         "mean": mean_of(values),
-        "max": max(values) if values else float("nan"),
+        "max": float(values.max()) if values.size else float("nan"),
     }
 
 
-def bin_edges(values, x_max, bins, log_x):
-    """Shared edges for both series — two histograms on different bins are not comparable."""
-    low = min(v for v in values if v > 0) if log_x else min(values)
-    low = max(low, 1e-3)
+def bin_edges(stock, sparse, x_max, bins, log_x):
+    """Shared edges for both series — two histograms on different bins are not comparable.
+
+    Takes the two series rather than a pooled copy of them: the low edge is a minimum, and a minimum
+    over a union is the smaller of the two minima.
+    """
+    if log_x:
+        lows = [float(side[side > 0].min()) for side in (stock, sparse) if np.any(side > 0)]
+    else:
+        lows = [float(side.min()) for side in (stock, sparse) if side.size]
+    low = max(min(lows), 1e-3) if lows else 1e-3
     high = max(x_max, low * (1.0 + 1e-6))
     if log_x:
-        return [10 ** (math.log10(low) + i * (math.log10(high) - math.log10(low)) / bins) for i in range(bins + 1)]
-    return [low + i * (high - low) / bins for i in range(bins + 1)]
+        return np.logspace(math.log10(low), math.log10(high), bins + 1)
+    return np.linspace(low, high, bins + 1)
 
 
 def draw(log, args, theme):
     stock, sparse, escalated, dropped = series_of(log, args.include_contaminated, args.include_excluded)
-    if not stock:
+    if not stock.size:
         print(f"  {log.stem}: every shot was contaminated; nothing to plot")
         return None
 
-    both = stock + sparse
     # The axis has to reach past both means with room for their labels, or the escalation tail pushes
     # a mean off the right edge and the figure loses the number it is built around.
-    x_max = max(percentile(both, args.x_max_percentile / 100.0), 1.15 * max(mean_of(stock), mean_of(sparse)))
-    clipped = sum(1 for value in both if value > x_max)
-    edges = bin_edges(both, x_max, args.bins, args.log_x)
+    #
+    # The pooled copy exists only for that one order statistic and is released before anything is
+    # drawn; the count past the edge is two counts summed, which needs no pool at all.
+    pooled = np.concatenate((stock, sparse))
+    x_max = max(percentile(pooled, args.x_max_percentile / 100.0), 1.15 * max(mean_of(stock), mean_of(sparse)))
+    del pooled
+    clipped = int(np.count_nonzero(stock > x_max) + np.count_nonzero(sparse > x_max))
+    edges = bin_edges(stock, sparse, x_max, args.bins, args.log_x)
 
     fig, ax = plt.subplots(figsize=(9.0, 5.0))
     fig.patch.set_facecolor(theme["surface"])
@@ -224,10 +321,15 @@ def draw(log, args, theme):
         (stock, theme["series"][0], STOCK_LABEL),
         (sparse, theme["series"][1], SPARSE_LABEL),
     ):
+        # Binned once and drawn twice. `ax.hist` would re-bin the whole series for each of the two
+        # passes and keep a copy of it inside the axes; past a few hundred thousand shots that is the
+        # difference between a figure and a swap storm, and the counts are identical either way.
+        #
         # Filled at low alpha so the overlap is legible either way round, with a 2px edge that keeps
         # each series readable where the fills stack.
-        ax.hist(values, bins=edges, color=colour, alpha=0.45, label=label, zorder=2)
-        ax.hist(values, bins=edges, color=colour, histtype="step", linewidth=2.0, zorder=3)
+        counts, _ = np.histogram(values, bins=edges)
+        ax.stairs(counts, edges, color=colour, alpha=0.45, fill=True, label=label, zorder=2)
+        ax.stairs(counts, edges, color=colour, linewidth=2.0, zorder=3)
 
     # Selective direct labels: the two means, and nothing else. A number on every bar is noise.
     # Stacked at different heights and always set to the right of their line, because the two means
@@ -393,7 +495,14 @@ def main():
     )
     parser.add_argument("--out-dir", help="where the figures go; default is beside each log file")
     parser.add_argument("--formats", default="png", help="comma-separated: png,pdf,svg")
-    parser.add_argument("--bins", type=int, default=80)
+    parser.add_argument(
+        "--bins",
+        type=int,
+        default=200,
+        help="bins per series, shared between the two so they stay comparable; the default suits a"
+        " campaign of ~1e6 shots, where a coarser binning flattens the escalation tail into the bulk"
+        " (default 200)",
+    )
     parser.add_argument("--dpi", type=int, default=160)
     parser.add_argument(
         "--x-max-percentile",
@@ -439,17 +548,14 @@ def main():
     theme = THEMES[args.theme]
     results = []
     for path in files:
+        # `draw` is inside the same guard as `load`, because with the rows streamed rather than
+        # pre-parsed a malformed row is first seen while the figure is being built. One bad file
+        # still costs the run one file.
         try:
-            log = load(path)
+            result = draw(load(path), args, theme)
         except (OSError, ValueError, KeyError) as error:
             print(f"  skipping {path}: {error}")
             continue
-        # v1 logged one pre-summed `sparse_ns` column and no stage split, so it cannot be re-read
-        # under the definition above. Named rather than guessed at.
-        if log.meta.get("schema") not in (None, "two_phase_latency_v2"):
-            print(f"  skipping {path}: schema {log.meta['schema']}; this script reads two_phase_latency_v2")
-            continue
-        result = draw(log, args, theme)
         if result is None:
             continue
         results.append(result)
