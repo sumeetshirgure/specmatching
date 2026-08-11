@@ -58,12 +58,24 @@
 ///   two_phase_latency_profiler [--distances 5,7,9,11,13] [--error-rates 0.001]
 ///                              [--horizons 1.5,2.0] [--shots 20000] [--modes scan,bitset]
 ///                              [--warmup 256] [--seed N] [--out-dir DIR] [--tag NAME]
+///                              [--progress auto|always|never]
 ///
 /// One log file per `(d, p, T, mode)`, named `latency_d{d}_p{p}_T{T}_{mode}.csv`, written to
 /// `--out-dir`. See `write_header` for the schema.
+///
+/// A progress bar is drawn per grid point when stderr is a terminal (`ProgressBar`, `--progress`).
+/// It says the run is alive; it does not keep the machine awake. On a laptop, hold the wake lock
+/// separately — `caffeinate -dimsu two_phase_latency_profiler ...` on macOS — because a sweep whose
+/// second half is measured in a different power state than its first is two distributions.
 
+#include <chrono>
 #include <cstdio>
+#include <cstdlib>
 #include <filesystem>
+
+#if defined(__unix__) || defined(__APPLE__)
+#include <unistd.h>
+#endif
 
 #include "benchmarks/two_phase/artifact_util.h"
 #include "pyrematching/two_phase/driver/two_phase_decoding.h"
@@ -72,6 +84,8 @@ using namespace pm::two_phase;
 using namespace pm::two_phase::artifact;
 
 namespace {
+
+enum class ProgressMode { AUTO, ALWAYS, NEVER };
 
 struct Options {
     std::vector<size_t> distances = {5, 7, 9, 11, 13};
@@ -87,11 +101,149 @@ struct Options {
     uint64_t seed = 20260907;
     std::string out_dir = "benchmarks/two_phase/results/latency";
     std::string tag;
+    /// `AUTO` draws the bar when stderr is a terminal and stays quiet when it is not, so a
+    /// redirected run's log is not a megabyte of carriage returns. `always` forces it on, and into
+    /// a file or a pipe it degrades to one plain line per 10% — which is what a `nohup`'d overnight
+    /// run wants.
+    ProgressMode progress = ProgressMode::AUTO;
 };
 
 const char* mode_name(BallGraphBuildMode mode) {
     return mode == BallGraphBuildMode::BITSET ? "bitset" : "scan";
 }
+
+bool stderr_is_terminal() {
+#if defined(__unix__) || defined(__APPLE__)
+    if (isatty(fileno(stderr)) != 1)
+        return false;
+    const char* term = std::getenv("TERM");
+    // A dumb terminal takes neither the carriage return nor the erase-to-end-of-line below.
+    return term != nullptr && std::string(term) != "dumb";
+#else
+    return false;
+#endif
+}
+
+std::string format_duration(double seconds) {
+    if (!(seconds >= 0) || seconds > 1e7)
+        return "--";
+    char buffer[32];
+    int whole = (int)(seconds + 0.5);
+    if (whole >= 3600)
+        std::snprintf(buffer, sizeof(buffer), "%dh%02dm", whole / 3600, (whole % 3600) / 60);
+    else if (whole >= 60)
+        std::snprintf(buffer, sizeof(buffer), "%dm%02ds", whole / 60, whole % 60);
+    else
+        std::snprintf(buffer, sizeof(buffer), "%ds", whole);
+    return buffer;
+}
+
+/// A per-job progress bar on stderr, sized so that drawing it cannot show up in the numbers.
+///
+/// What it is for: a sweep left running unattended on a laptop is a sweep whose second half may be
+/// measured on a machine in a different power state than its first half, and a distribution taken
+/// across that boundary is two distributions. A drawn bar is not itself a wake lock — on macOS,
+/// `caffeinate -dimsu two_phase_latency_profiler ...` is what actually holds the machine up — but it
+/// is what tells a run that is still moving apart from one that has stalled, and it keeps the
+/// terminal from being a dark, idle window for an hour.
+///
+/// It cannot perturb what is being measured, by construction:
+///
+///  - `tick` is called between shots only, after the stock decode's second `PreemptionProbe` sample
+///    and before the next shot's decode takes its first. Every timer is stopped and every probe
+///    interval is closed when it runs, so a redraw that blocks on the terminal lands in no
+///    measurement window and cannot flag a shot as contaminated either.
+///  - On all but one shot in `total/100` (one in `total/10` when not a terminal), `tick` is a
+///    compare against a precomputed threshold and a return. The clock reading and the write happen
+///    at most ~101 times per job, against 20000-odd shots.
+///  - It writes to stderr, so the summary table on stdout survives a redirect unmixed, and the bar
+///    is still on the screen when stdout is redirected away.
+struct ProgressBar {
+    static const size_t WIDTH = 32;
+
+    bool enabled{false};
+    bool interactive{false};
+    std::string label;
+    size_t total{0};
+    /// Shots between redraws. Precomputed so the per-shot cost is one comparison.
+    size_t step{1};
+    size_t next_redraw{0};
+    std::chrono::steady_clock::time_point started;
+
+    /// Starts a job's bar. `label` — the job's grid point — is set by the caller beforehand.
+    void begin(size_t job_total) {
+        total = job_total;
+        step = std::max<size_t>(1, job_total / (interactive ? 100 : 10));
+        next_redraw = step;
+        started = std::chrono::steady_clock::now();
+        if (enabled && interactive)
+            draw(0);
+    }
+
+    /// Called once per shot from inside the loop; `done` counts shots retired, warmup included.
+    void tick(size_t done) {
+        if (!enabled || done < next_redraw)
+            return;
+        next_redraw = done + step;
+        draw(done);
+    }
+
+    /// Interactively, the line is erased and left to whatever is printed next: the job's row on
+    /// stdout is the record, and a half-drawn bar above it is not worth keeping. In a log, the job
+    /// gets one closing line at 100% so its wall time is on the record too.
+    void finish() {
+        if (!enabled)
+            return;
+        if (interactive)
+            std::fprintf(stderr, "\r\x1b[K");
+        else
+            draw(total);
+        std::fflush(stderr);
+    }
+
+    /// A line that is not part of a bar — what the run is doing while no job is in flight.
+    void note(const std::string& text) {
+        if (!enabled)
+            return;
+        std::fprintf(stderr, "%s%s\n", interactive ? "\r\x1b[K" : "", text.c_str());
+        std::fflush(stderr);
+    }
+
+    void draw(size_t done) {
+        double fraction = total > 0 ? (double)done / (double)total : 1.0;
+        double elapsed = std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count();
+        double left = fraction > 0.0 ? elapsed * (1.0 - fraction) / fraction : -1.0;
+        if (!interactive) {
+            std::fprintf(
+                stderr,
+                "%s  %3.0f%%  %zu/%zu  %s elapsed\n",
+                label.c_str(),
+                100.0 * fraction,
+                done,
+                total,
+                format_duration(elapsed).c_str());
+            std::fflush(stderr);
+            return;
+        }
+        char cells[WIDTH + 1];
+        size_t filled = std::min(WIDTH, (size_t)(fraction * (double)WIDTH));
+        for (size_t i = 0; i < WIDTH; i++)
+            cells[i] = i < filled ? '#' : '.';
+        cells[WIDTH] = '\0';
+        // `\x1b[K` erases the tail of the previous, possibly longer, line; `\r` alone would leave it.
+        std::fprintf(
+            stderr,
+            "\r%s [%s] %3.0f%%  %zu/%zu  %s elapsed, %s left\x1b[K",
+            label.c_str(),
+            cells,
+            100.0 * fraction,
+            done,
+            total,
+            format_duration(elapsed).c_str(),
+            format_duration(left).c_str());
+        std::fflush(stderr);
+    }
+};
 
 Options parse_options(int argc, char** argv) {
     Options options;
@@ -131,6 +283,19 @@ Options parse_options(int argc, char** argv) {
             options.out_dir = next();
         } else if (flag == "--tag") {
             options.tag = next();
+        } else if (flag == "--progress") {
+            std::string value = next();
+            if (value == "auto") {
+                options.progress = ProgressMode::AUTO;
+            } else if (value == "always" || value == "on") {
+                options.progress = ProgressMode::ALWAYS;
+            } else if (value == "never" || value == "off") {
+                options.progress = ProgressMode::NEVER;
+            } else {
+                throw std::invalid_argument("unrecognised --progress " + value + " (want auto, always or never)");
+            }
+        } else if (flag == "--no-progress") {
+            options.progress = ProgressMode::NEVER;
         } else {
             throw std::invalid_argument("unrecognised flag " + flag);
         }
@@ -209,7 +374,8 @@ void write_header(
     double noise,
     double horizon,
     BallGraphBuildMode mode,
-    double unit) {
+    double unit,
+    const ProgressBar& progress) {
     out << "# schema=two_phase_latency_v2\n";
     out << "# d=" << distance << "\n";
     out << "# p=" << noise << "\n";
@@ -224,6 +390,9 @@ void write_header(
     out << "# timer_backend=" << pm::perf::current_backend_name() << "\n";
     out << "# timer_thread_scoped=" << (pm::perf::backend_is_thread_scoped(pm::perf::current_backend()) ? 1 : 0)
         << "\n";
+    // Recorded for the same reason the backend is: it is a write this process made while the loop
+    // was running. It happens between shots, outside every timed window, at most ~101 times a job.
+    out << "# progress_bar=" << (progress.enabled ? (progress.interactive ? "bar" : "lines") : "off") << "\n";
     // What each latency column is, stated in the file rather than left to the plotting script.
     out << "# stock_g_ns=stock exact sparse blossom on the original detector graph G\n";
     out << "# sparse_ns=blossom_ns+dscan_ns+hrvst_ns+escal_stock_ns, summed by the reader\n";
@@ -239,11 +408,15 @@ void write_header(
 }
 
 /// Both decoders on every shot, `H` first. Returns one row per shot, in shot order.
+///
+/// `progress` is ticked once per shot, warmup included, from between-shot positions only; see
+/// `ProgressBar` for why that placement is the one that cannot disturb a measurement.
 std::vector<ShotRow> run_point(
     const stim::DetectorErrorModel& dem,
     const TwoPhaseConfig& config,
     const std::vector<std::vector<uint64_t>>& shots,
-    size_t warmup) {
+    size_t warmup,
+    ProgressBar& progress) {
     auto decoder = TwoPhaseDecoder::from_detector_error_model(dem, config, NUM_DISTINCT_WEIGHTS);
     // Stock exact decode gets its own instance, so timing it does not disturb the front end's
     // `Mwpm(G)` — which the escalating path shares with the negative-weight preamble.
@@ -251,9 +424,13 @@ std::vector<ShotRow> run_point(
     std::vector<uint8_t> obs(std::max<size_t>(1, decoder.num_observables), 0);
     pm::total_weight_int weight = 0;
 
-    for (size_t i = 0; i < std::min(warmup, shots.size()); i++) {
+    size_t warmup_shots = std::min(warmup, shots.size());
+    progress.begin(warmup_shots + shots.size());
+    size_t retired = 0;
+    for (size_t i = 0; i < warmup_shots; i++) {
         decoder.decode_to_obs(shots[i], obs.data(), weight, nullptr);
         pm::decode_detection_events(reference, shots[i], obs.data(), weight, false);
+        progress.tick(++retired);
     }
 
     std::vector<ShotRow> rows;
@@ -293,7 +470,12 @@ std::vector<ShotRow> run_point(
             row.contaminated = 1;
 
         rows.push_back(row);
+        // Both probe intervals are closed and both timers are stopped here, and the next shot's
+        // decode opens its own probe inside `decode_to_obs`. A redraw that blocks on the terminal
+        // therefore falls in the gap between two measurements rather than inside either.
+        progress.tick(++retired);
     }
+    progress.finish();
     return rows;
 }
 
@@ -346,6 +528,14 @@ int main(int argc, char** argv) {
         std::cerr << "error: could not create " << options.out_dir << ": " << dir_error.message() << "\n";
         return 1;
     }
+    ProgressBar progress;
+    progress.interactive = stderr_is_terminal();
+    progress.enabled = options.progress == ProgressMode::ALWAYS ||
+                       (options.progress == ProgressMode::AUTO && progress.interactive);
+    size_t jobs = options.distances.size() * options.error_rates.size() * options.horizons.size() *
+                  options.modes.size();
+    size_t job = 0;
+
     std::printf("writing one log file per (d, p, T, mode) to %s\n\n", options.out_dir.c_str());
     std::printf(
         "%4s %8s %5s %8s %8s %11s %11s %8s %8s %9s %8s\n",
@@ -364,14 +554,32 @@ int main(int argc, char** argv) {
     size_t files_written = 0;
     for (size_t distance : options.distances) {
         for (double noise : options.error_rates) {
+            {
+                char sampling[128];
+                std::snprintf(
+                    sampling, sizeof(sampling), "sampling %zu shots at d=%zu p=%g ...", options.shots, distance, noise);
+                progress.note(sampling);
+            }
             Experiment experiment = generate(distance, distance, noise, options.shots, options.seed);
             pm::Mwpm probe = pm::detector_error_model_to_mwpm(experiment.dem, NUM_DISTINCT_WEIGHTS, false);
             double unit = edge_weight_units(probe.flooder.graph);
 
             for (double horizon : options.horizons) {
                 for (BallGraphBuildMode mode : options.modes) {
-                    std::vector<ShotRow> rows =
-                        run_point(experiment.dem, config_for(horizon, unit, mode), experiment.shots, options.warmup);
+                    char label[128];
+                    std::snprintf(
+                        label,
+                        sizeof(label),
+                        "[%zu/%zu] d=%zu p=%g T=%g %s",
+                        ++job,
+                        jobs,
+                        distance,
+                        noise,
+                        horizon,
+                        mode_name(mode));
+                    progress.label = label;
+                    std::vector<ShotRow> rows = run_point(
+                        experiment.dem, config_for(horizon, unit, mode), experiment.shots, options.warmup, progress);
 
                     std::string path = options.out_dir + "/" + point_name(distance, noise, horizon, mode, options.tag);
                     std::ofstream out(path);
@@ -380,7 +588,7 @@ int main(int argc, char** argv) {
                                   << " (does " << options.out_dir << " exist?)\n";
                         return 1;
                     }
-                    write_header(out, options, distance, noise, horizon, mode, unit);
+                    write_header(out, options, distance, noise, horizon, mode, unit, progress);
                     for (size_t i = 0; i < rows.size(); i++) {
                         const ShotRow& row = rows[i];
                         out << i << "," << row.defects << "," << row.escalated << "," << row.certified << ","
