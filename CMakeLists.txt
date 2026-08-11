@@ -217,7 +217,9 @@ target_link_libraries(two_phase_m7_artifact libstim)
 
 # Latency profiler: per-shot latency of stock exact decode on G against the M7 front end on the
 # sparsified graph H, escalation included, logged shot by shot to one file per (d, p, T, mode) for
-# `plot_latency_histograms.py`. No aggregation — this is the distribution, not the mean.
+# `plot_latency_histograms.py`, which draws the two distributions, and for
+# `simulate_syndrome_buffer.py`, which runs each of them through the syndrome buffer they would feed.
+# No aggregation — this is the distribution, not the mean.
 add_executable(two_phase_latency_profiler benchmarks/two_phase/latency_profiler.cc ${SOURCE_FILES_NO_MAIN})
 target_include_directories(two_phase_latency_profiler PRIVATE ${CMAKE_CURRENT_LIST_DIR})
 target_compile_options(two_phase_latency_profiler PRIVATE ${ARCH_OPT})
