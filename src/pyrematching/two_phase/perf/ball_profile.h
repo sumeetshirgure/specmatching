@@ -143,6 +143,15 @@ struct BallProfile {
     int solve_dependent_depth{0};
     int solve_events{0};
 
+    /// §C.1's component structure of this shot's `H`. Filled by
+    /// `BallDecoder::analyze_last_shot_components`, which runs **after** `total_ns` has been read
+    /// and is timed by nothing: the component work is assumed free (hardware-offloadable), so it is
+    /// never charged to `blossom_on_h_ns`, `harvest_ns`, `total_ns` or any other reported latency.
+    ///
+    /// Left at `measured == 0` unless `BallConfig::collect_component_stats` is on, so a campaign
+    /// that did not collect it reports that rather than a row of zeros.
+    ComponentStats components;
+
     void clear() {
         *this = BallProfile();
     }

@@ -76,6 +76,119 @@ struct PreemptionProbe {
     }
 };
 
+/// §C.2's distributions, over one shot's components, `H` edges and defects.
+///
+/// Kept apart from the per-shot profile because their unit is the component, the edge or the node
+/// rather than the shot: the profile stays a flat row of scalars the pybind layer can column-ise,
+/// and these are folded straight into the campaign accumulator instead. One instance is reused
+/// across shots, so a profiled shot allocates nothing for them either.
+///
+/// **Unit.** The three weight histograms are binned in *sixteenths of the horizon* — bin `k` counts
+/// values in `[k * T / 16, (k + 1) * T / 16)`, and the last bin overflows — so all three share one
+/// axis and a plot can label it without knowing the normalising constant. `H`'s defect-defect edges
+/// are `<= 2T` by construction, which is exactly the last bin of `edge_weight_hist`.
+///
+/// Filled outside every timed region, and never counted toward any reported latency.
+struct ComponentHistograms {
+    static constexpr size_t BINS_PER_T = 16;
+    /// Component sizes `0..31`, last bin overflowing. Bin 0 is always empty: a component has at
+    /// least one member.
+    static constexpr size_t SIZE_HIST_BINS = 33;
+    /// `H`-node degrees, in the defect-defect adjacency alone.
+    static constexpr size_t DEGREE_HIST_BINS = 33;
+    /// `w_int` over `H`'s defect-defect edges: `0 .. 2T`, which is the whole range.
+    static constexpr size_t WEIGHT_HIST_BINS = 33;
+    /// `bcost_int` over defects that have a boundary entry within `R`. Values past `2T` — legal,
+    /// since `R >= 2 * T_max` — land in the overflow bin.
+    static constexpr size_t BCOST_HIST_BINS = 33;
+    /// Weighted `H`-subgraph diameters: `0 .. 4T`, then overflow.
+    static constexpr size_t DIAMETER_HIST_BINS = 65;
+
+    std::vector<uint64_t> size_hist = std::vector<uint64_t>(SIZE_HIST_BINS, 0);
+    std::vector<uint64_t> degree_hist = std::vector<uint64_t>(DEGREE_HIST_BINS, 0);
+    std::vector<uint64_t> edge_weight_hist = std::vector<uint64_t>(WEIGHT_HIST_BINS, 0);
+    std::vector<uint64_t> bcost_hist = std::vector<uint64_t>(BCOST_HIST_BINS, 0);
+    std::vector<uint64_t> diameter_hist = std::vector<uint64_t>(DIAMETER_HIST_BINS, 0);
+
+    /// Zeroes every bin without touching the buffers, so the next shot reuses the same storage.
+    void clear() {
+        std::fill(size_hist.begin(), size_hist.end(), (uint64_t)0);
+        std::fill(degree_hist.begin(), degree_hist.end(), (uint64_t)0);
+        std::fill(edge_weight_hist.begin(), edge_weight_hist.end(), (uint64_t)0);
+        std::fill(bcost_hist.begin(), bcost_hist.end(), (uint64_t)0);
+        std::fill(diameter_hist.begin(), diameter_hist.end(), (uint64_t)0);
+    }
+
+    /// The bin a weight-like quantity falls in, in sixteenths of `horizon`. A non-positive horizon
+    /// cannot happen on a decoding path — it is rejected at construction — and reads as bin 0 rather
+    /// than dividing by it.
+    static inline size_t weight_bin(pm::cumulative_time_int value, pm::cumulative_time_int horizon, size_t bins) {
+        if (horizon <= 0 || value <= 0)
+            return 0;
+        pm::cumulative_time_int bin = value * (pm::cumulative_time_int)BINS_PER_T / horizon;
+        return (size_t)std::min<pm::cumulative_time_int>(bin, (pm::cumulative_time_int)bins - 1);
+    }
+
+    static inline size_t count_bin(uint64_t value, size_t bins) {
+        return (size_t)std::min<uint64_t>(value, (uint64_t)bins - 1);
+    }
+
+    void add(const ComponentHistograms& other) {
+        for (size_t i = 0; i < size_hist.size(); i++)
+            size_hist[i] += other.size_hist[i];
+        for (size_t i = 0; i < degree_hist.size(); i++)
+            degree_hist[i] += other.degree_hist[i];
+        for (size_t i = 0; i < edge_weight_hist.size(); i++)
+            edge_weight_hist[i] += other.edge_weight_hist[i];
+        for (size_t i = 0; i < bcost_hist.size(); i++)
+            bcost_hist[i] += other.bcost_hist[i];
+        for (size_t i = 0; i < diameter_hist.size(); i++)
+            diameter_hist[i] += other.diameter_hist[i];
+    }
+};
+
+/// §C.1's per-shot component structure, over **all** components of the shot's `H`.
+///
+/// Computed outside every timed window and read by nothing on the decode path. `BallProfile` holds
+/// the original and `TwoPhaseProfile` mirrors it, so the campaign accumulator and the row-aligned
+/// pybind columns both see one definition.
+///
+/// The last three fields are the classification of §A.3 — what the trivial resolver *would* commit,
+/// leave as residual, and hand to the solver — evaluated for its counts alone. Nothing is committed
+/// and no decode output depends on them.
+struct ComponentStats {
+    /// 1 iff this shot's components were analysed, so a campaign that left the flag off reports no
+    /// component structure rather than a corpus of zeros.
+    int measured{0};
+
+    int num_components{0};
+    int num_trivial_components{0};
+    int num_singleton_components{0};
+    int num_pair_components{0};
+    int num_nontrivial_components{0};
+    int defects_in_trivial_components{0};
+    int largest_component_size{0};
+    /// Weighted `H`-subgraph diameter, in integer time units. See `component_diameter` for what
+    /// "confined to the component" means and why it is not a `G` distance.
+    int max_component_diameter_wint{0};
+    /// Components too large for the diameter to be computed (§C.2's cap).
+    int diameter_uncomputed_components{0};
+    /// Components with at least one member whose `bcost_int <= T_int`.
+    int num_boundary_touching_components{0};
+
+    int defects_committed_trivially{0};
+    int defects_residual_trivially{0};
+    int defects_to_solver{0};
+
+    /// Every component resolved trivially, i.e. the solver's input would have been empty and both
+    /// the `Mwpm(H)` build and the harvest would have been skipped outright (§A.4). This is the
+    /// shot class the `blossom_on_h_ns` / `harvest_ns` reduction comes from, so it is counted
+    /// rather than derived from a mean.
+    inline bool solver_set_empty() const {
+        return measured != 0 && defects_to_solver == 0;
+    }
+};
+
 /// Per-shot profile. Filled only when a non-null pointer is passed down the decode path, so the
 /// hot path pays nothing when profiling is off.
 struct TwoPhaseProfile {
@@ -126,6 +239,10 @@ struct TwoPhaseProfile {
     int harvest_dependent_depth{0};
     int solve_dependent_depth{0};
     int solve_events{0};
+
+    /// §C.1, mirrored off `BallProfile` after the shot's timed window has closed. All zero, and
+    /// `components.measured == 0`, unless `collect_component_stats` is on and Phase 1 ran on `H`.
+    ComponentStats components;
 
     /// `Sum_S y_S <= exact optimum`. Zero on an escalating shot: the truncated dual is discarded
     /// along with the rest of Phase 1's partial result, so there is nothing to certify against.
@@ -247,8 +364,55 @@ struct TwoPhaseAggregateStats {
     uint64_t sum_exposed_root_blossoms{0};
     uint64_t shots_with_exposed_root_blossoms{0};
 
+    /// §C.3. Running sums of §C.1 over the shots that were analysed, and the §C.2 distributions.
+    ///
+    /// `shots_with_component_stats` is the divisor for every mean below, and is *not* `shots`: a
+    /// campaign may analyse a subset, and a campaign that left `collect_component_stats` off must
+    /// report no component structure rather than a mean over zeros.
+    uint64_t shots_with_component_stats{0};
+    /// Analysed shots that had at least one `H` node. The divisor of `solver_set_empty_rate`, and
+    /// not `shots_with_component_stats`: a shot with no defects has an empty solver set for a reason
+    /// that has nothing to do with the prune, and pooling the two would quote a win that is really
+    /// the corpus's zero-defect rate.
+    uint64_t shots_with_component_defects{0};
+    /// Shots whose components were all resolved trivially, so the solver and the harvest would have
+    /// been skipped entirely (§A.4). Zero-defect shots are in here too — the solve really is skipped
+    /// on them — which is why the rate above is conditioned rather than taken over every shot.
+    uint64_t shots_solver_set_empty{0};
+    /// Shots with at least one trivially-residual defect — a singleton whose boundary sits past the
+    /// horizon, which forces escalation on its own (§A.5).
+    uint64_t shots_with_trivial_residual{0};
+    uint64_t sum_num_components{0};
+    uint64_t sum_trivial_components{0};
+    uint64_t sum_singleton_components{0};
+    uint64_t sum_pair_components{0};
+    uint64_t sum_nontrivial_components{0};
+    uint64_t sum_boundary_touching_components{0};
+    uint64_t sum_diameter_uncomputed_components{0};
+    /// The denominator of the two fractions §D asks for. `H`'s node count summed over the analysed
+    /// shots — the post-preamble defects, which is what the components actually partition — and not
+    /// the raw detection-event count `sum_num_defects`.
+    uint64_t sum_component_defects{0};
+    uint64_t sum_defects_in_trivial_components{0};
+    uint64_t sum_defects_committed_trivially{0};
+    uint64_t sum_defects_residual_trivially{0};
+    uint64_t sum_defects_to_solver{0};
+    /// Per-shot maxima, summed and maximised: the mean says what a typical shot's worst component
+    /// looks like, the max says what the worst shot of the campaign held.
+    uint64_t sum_largest_component_size{0};
+    uint64_t max_component_size{0};
+    uint64_t sum_max_component_diameter_wint{0};
+    uint64_t max_component_diameter_wint{0};
+    ComponentHistograms component_hist;
+
     void reset() {
         *this = TwoPhaseAggregateStats();
+    }
+
+    /// §C.2's distributions for one shot, folded in. Called beside `accumulate` from the profiling
+    /// branch of `decode_batch`, and by any driver that decodes shot by shot instead.
+    void accumulate_component_histograms(const ComponentHistograms& histograms) {
+        component_hist.add(histograms);
     }
 
     void accumulate(const TwoPhaseProfile& profile) {
@@ -306,6 +470,40 @@ struct TwoPhaseAggregateStats {
         sum_exposed_root_blossoms += (uint64_t)profile.exposed_root_blossoms;
         if (profile.exposed_root_blossoms > 0)
             shots_with_exposed_root_blossoms++;
+
+        const ComponentStats& components = profile.components;
+        if (components.measured) {
+            shots_with_component_stats++;
+            if (components.defects_committed_trivially + components.defects_residual_trivially +
+                    components.defects_to_solver >
+                0)
+                shots_with_component_defects++;
+            if (components.solver_set_empty())
+                shots_solver_set_empty++;
+            if (components.defects_residual_trivially > 0)
+                shots_with_trivial_residual++;
+            sum_num_components += (uint64_t)components.num_components;
+            sum_trivial_components += (uint64_t)components.num_trivial_components;
+            sum_singleton_components += (uint64_t)components.num_singleton_components;
+            sum_pair_components += (uint64_t)components.num_pair_components;
+            sum_nontrivial_components += (uint64_t)components.num_nontrivial_components;
+            sum_boundary_touching_components += (uint64_t)components.num_boundary_touching_components;
+            sum_diameter_uncomputed_components += (uint64_t)components.diameter_uncomputed_components;
+            sum_defects_in_trivial_components += (uint64_t)components.defects_in_trivial_components;
+            sum_defects_committed_trivially += (uint64_t)components.defects_committed_trivially;
+            sum_defects_residual_trivially += (uint64_t)components.defects_residual_trivially;
+            sum_defects_to_solver += (uint64_t)components.defects_to_solver;
+            // The components partition `H`'s nodes, so their three classifications sum to the node
+            // count — which is the denominator §D's fractions are taken over.
+            sum_component_defects += (uint64_t)components.defects_committed_trivially +
+                                     (uint64_t)components.defects_residual_trivially +
+                                     (uint64_t)components.defects_to_solver;
+            sum_largest_component_size += (uint64_t)components.largest_component_size;
+            max_component_size = std::max(max_component_size, (uint64_t)components.largest_component_size);
+            sum_max_component_diameter_wint += (uint64_t)components.max_component_diameter_wint;
+            max_component_diameter_wint =
+                std::max(max_component_diameter_wint, (uint64_t)components.max_component_diameter_wint);
+        }
     }
 };
 
@@ -364,6 +562,49 @@ struct TwoPhaseSummary {
     double mean_residual_size{0};
     double mean_residual_density{0};
     double exposed_root_blossom_rate{0};
+
+    /// §C/§D's component structure, derived once here rather than in every benchmark script.
+    ///
+    /// `shots_with_component_stats` is the divisor of every mean and rate below, and is reported
+    /// beside them for the same reason `shots` is reported beside `q`: zero of them means the
+    /// campaign did not measure this, which is a different statement from "it measured zero".
+    uint64_t shots_with_component_stats{0};
+    /// The subset of those that had at least one defect — the divisor of `solver_set_empty_rate`.
+    uint64_t shots_with_component_defects{0};
+    double mean_components{0};
+    double mean_singleton_components{0};
+    double mean_pair_components{0};
+    double mean_nontrivial_components{0};
+    double mean_largest_component_size{0};
+    double max_component_size{0};
+    double mean_max_component_diameter_wint{0};
+    double max_component_diameter_wint{0};
+    double boundary_touching_component_fraction{0};
+    double diameter_uncomputed_component_fraction{0};
+    /// The two fractions §D asks for, over `H`'s nodes summed across the analysed shots: how much of
+    /// the defect set sits in a trivial (size `<= 2`) component, and how much of it the solver would
+    /// still have had to take. They do not sum to 1 — an ambiguous trivial component is in the first
+    /// and in the second, which is exactly the gap between "trivial" and "trivially resolvable".
+    double frac_defects_in_trivial_components{0};
+    double frac_defects_to_solver{0};
+    double frac_defects_committed_trivially{0};
+    double frac_defects_residual_trivially{0};
+    /// Fraction of analysed shots **with at least one defect** on which the solver's input would
+    /// have been empty, so the `Mwpm(H)` build, the solve and the harvest would not have run at all
+    /// (§A.4). Conditioned on having defects so that a corpus's zero-defect rate is not read as the
+    /// prune's win; `shots_with_component_defects` is the divisor.
+    double solver_set_empty_rate{0};
+    double trivial_residual_rate{0};
+
+    /// §C.2's distributions, copied out of the accumulator so `summarize` is the one place a
+    /// consumer has to look. See `ComponentHistograms` for the binning; `weight_hist_bins_per_T` is
+    /// carried alongside so a plot can label the axis without restating the convention.
+    uint64_t weight_hist_bins_per_T{ComponentHistograms::BINS_PER_T};
+    std::vector<uint64_t> component_size_hist;
+    std::vector<uint64_t> component_diameter_hist;
+    std::vector<uint64_t> h_degree_hist;
+    std::vector<uint64_t> h_edge_weight_hist;
+    std::vector<uint64_t> boundary_cost_hist;
 };
 
 inline double percentile_of(std::vector<long long> values, double fraction) {
@@ -420,6 +661,47 @@ inline TwoPhaseSummary summarize(const TwoPhaseAggregateStats& stats) {
     if (stats.sum_num_defects)
         summary.mean_residual_density = (double)stats.sum_residual_size / (double)stats.sum_num_defects;
     summary.exposed_root_blossom_rate = (double)stats.shots_with_exposed_root_blossoms / shots;
+
+    // §C/§D. Every mean here is over the *analysed* shots, and the histograms are copied out
+    // whether or not any shot was analysed, so a consumer always finds the same keys with the same
+    // shapes and reads "not measured" off `shots_with_component_stats` rather than off their absence.
+    summary.shots_with_component_stats = stats.shots_with_component_stats;
+    summary.shots_with_component_defects = stats.shots_with_component_defects;
+    if (stats.shots_with_component_defects) {
+        summary.solver_set_empty_rate =
+            (double)stats.shots_solver_set_empty / (double)stats.shots_with_component_defects;
+    }
+    summary.max_component_size = (double)stats.max_component_size;
+    summary.max_component_diameter_wint = (double)stats.max_component_diameter_wint;
+    if (stats.shots_with_component_stats) {
+        double analysed = (double)stats.shots_with_component_stats;
+        summary.mean_components = (double)stats.sum_num_components / analysed;
+        summary.mean_singleton_components = (double)stats.sum_singleton_components / analysed;
+        summary.mean_pair_components = (double)stats.sum_pair_components / analysed;
+        summary.mean_nontrivial_components = (double)stats.sum_nontrivial_components / analysed;
+        summary.trivial_residual_rate = (double)stats.shots_with_trivial_residual / analysed;
+        // Both are per-shot maxima, so their means are "the typical shot's worst", not a mean over
+        // components — the histograms beside them are what describes the population.
+        summary.mean_largest_component_size = (double)stats.sum_largest_component_size / analysed;
+        summary.mean_max_component_diameter_wint = (double)stats.sum_max_component_diameter_wint / analysed;
+    }
+    if (stats.sum_num_components) {
+        double components = (double)stats.sum_num_components;
+        summary.boundary_touching_component_fraction = (double)stats.sum_boundary_touching_components / components;
+        summary.diameter_uncomputed_component_fraction = (double)stats.sum_diameter_uncomputed_components / components;
+    }
+    if (stats.sum_component_defects) {
+        double defects = (double)stats.sum_component_defects;
+        summary.frac_defects_in_trivial_components = (double)stats.sum_defects_in_trivial_components / defects;
+        summary.frac_defects_to_solver = (double)stats.sum_defects_to_solver / defects;
+        summary.frac_defects_committed_trivially = (double)stats.sum_defects_committed_trivially / defects;
+        summary.frac_defects_residual_trivially = (double)stats.sum_defects_residual_trivially / defects;
+    }
+    summary.component_size_hist = stats.component_hist.size_hist;
+    summary.component_diameter_hist = stats.component_hist.diameter_hist;
+    summary.h_degree_hist = stats.component_hist.degree_hist;
+    summary.h_edge_weight_hist = stats.component_hist.edge_weight_hist;
+    summary.boundary_cost_hist = stats.component_hist.bcost_hist;
     return summary;
 }
 

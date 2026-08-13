@@ -55,13 +55,27 @@
 /// and says how many it excluded.
 ///
 /// Usage:
+/// Beside the latency series, every run also dumps the **component structure** of the sparsified
+/// graph `H`: its connected components, their sizes, weighted diameters and boundary structure, the
+/// `H` edge-weight and boundary-cost distributions, and how much of the defect set sits in a
+/// component small enough to be resolved without the solver at all. That is a structural
+/// measurement, not a timing one — it is computed after each shot's timed window has closed and is
+/// charged to nothing — and it goes to its own file per grid point, so the latency schema keeps its
+/// meaning and the two are read together.
+///
+/// `blossom_ns` and `hrvst_ns` are the latency figures of merit to read beside it: the solve on `H`
+/// and the harvest are what a smaller node set moves, so they are summed into `b+h` in the printed
+/// table as well as logged per shot.
+///
+/// Usage:
 ///   two_phase_latency_profiler [--distances 5,7,9,11,13] [--error-rates 0.001]
 ///                              [--horizons 1.5,2.0] [--shots 20000] [--modes scan,bitset]
 ///                              [--warmup 256] [--seed N] [--out-dir DIR] [--tag NAME]
-///                              [--progress auto|always|never]
+///                              [--progress auto|always|never] [--no-component-stats] [--no-prune]
 ///
 /// One log file per `(d, p, T, mode)`, named `latency_d{d}_p{p}_T{T}_{mode}.csv`, written to
-/// `--out-dir`. See `write_header` for the schema.
+/// `--out-dir`, and one component file beside it named `components_...csv`. See `write_header` and
+/// `write_component_file` for the two schemas.
 ///
 /// A progress bar is drawn per grid point when stderr is a terminal (`ProgressBar`, `--progress`).
 /// It says the run is alive; it does not keep the machine awake. On a laptop, hold the wake lock
@@ -106,6 +120,15 @@ struct Options {
     /// a file or a pipe it degrades to one plain line per 10% — which is what a `nohup`'d overnight
     /// run wants.
     ProgressMode progress = ProgressMode::AUTO;
+    /// The component structure of `H`, per shot. On by default: it is a first-class output of this
+    /// driver, not a diagnostic. `--no-component-stats` turns it off so the same binary can produce
+    /// a latency-only run to compare against.
+    bool component_stats = true;
+    /// §A's trivial-component prune. On by default on this branch; `--no-prune` is the other half
+    /// of the A/B, and the two runs must agree on `obs` and on which shots escalate. The figures of
+    /// merit for the comparison are `blossom_ns` and `hrvst_ns` — the solver and the harvest running
+    /// on a smaller node set — and their aggregates.
+    bool prune = true;
 };
 
 const char* mode_name(BallGraphBuildMode mode) {
@@ -296,6 +319,10 @@ Options parse_options(int argc, char** argv) {
             }
         } else if (flag == "--no-progress") {
             options.progress = ProgressMode::NEVER;
+        } else if (flag == "--no-component-stats") {
+            options.component_stats = false;
+        } else if (flag == "--no-prune") {
+            options.prune = false;
         } else {
             throw std::invalid_argument("unrecognised flag " + flag);
         }
@@ -303,7 +330,8 @@ Options parse_options(int argc, char** argv) {
     return options;
 }
 
-TwoPhaseConfig config_for(double horizon_multiple, double unit, BallGraphBuildMode mode) {
+TwoPhaseConfig config_for(
+    double horizon_multiple, double unit, BallGraphBuildMode mode, bool component_stats, bool prune) {
     TwoPhaseConfig config;
     config.T = horizon_multiple * unit;
     config.ball.T_max = horizon_multiple * unit;
@@ -315,6 +343,13 @@ TwoPhaseConfig config_for(double horizon_multiple, double unit, BallGraphBuildMo
     // §M6.4's timer discipline. The flag costs one `getrusage` per shot and is what lets a
     // descheduled shot be flagged instead of silently widening the tail.
     config.detect_preemption = true;
+    // §C. The decomposition runs after each shot's `total_ns` has been read and is timed by
+    // nothing, so it cannot enter any column of the latency file — which is why the standard run
+    // can leave it on rather than needing a second pass.
+    config.collect_component_stats = component_stats;
+    // §A. The prune itself is untimed and charged to nothing; what it moves is `blossom_on_h_ns`
+    // and `harvest_ns`, which are already columns of the latency file.
+    config.prune_trivial_components = prune;
     return config;
 }
 
@@ -341,18 +376,39 @@ struct ShotRow {
     int certified{0};
     int contaminated{0};
 
+    /// §C.1, on the shots where it was collected. Structural, not timed: these describe the graph
+    /// the stages above ran on, and none of them is in any latency column.
+    ///
+    /// `h_defects` is `H`'s node count — the post-preamble defects, which is what the component
+    /// counts partition and therefore the denominator any per-shot fraction of them is taken over.
+    /// It is *not* `defects`, which is the raw detection-event count.
+    int h_defects{0};
+    int components{0};
+    int singleton_components{0};
+    int pair_components{0};
+    int nontrivial_components{0};
+    int largest_component{0};
+    int defects_in_trivial{0};
+    int defects_to_solver{0};
+
     /// The sparsified series. Kept identical to `plot_latency_histograms.py`'s `series_of`.
     long long sparse_ns() const {
         return blossom_ns + dscan_ns + hrvst_ns + escal_stock_ns;
     }
+    /// §D's figure of merit for the pruning experiment: the two stages a smaller node set moves.
+    long long solve_and_harvest_ns() const {
+        return blossom_ns + hrvst_ns;
+    }
 };
 
-std::string point_name(size_t distance, double noise, double horizon, BallGraphBuildMode mode, const std::string& tag) {
+std::string point_name(
+    const char* prefix, size_t distance, double noise, double horizon, BallGraphBuildMode mode, const std::string& tag) {
     char buffer[256];
     std::snprintf(
         buffer,
         sizeof(buffer),
-        "latency_d%zu_p%g_T%g_%s%s%s.csv",
+        "%s_d%zu_p%g_T%g_%s%s%s.csv",
+        prefix,
         distance,
         noise,
         horizon,
@@ -376,7 +432,7 @@ void write_header(
     BallGraphBuildMode mode,
     double unit,
     const ProgressBar& progress) {
-    out << "# schema=two_phase_latency_v2\n";
+    out << "# schema=two_phase_latency_v3\n";
     out << "# d=" << distance << "\n";
     out << "# p=" << noise << "\n";
     out << "# T=" << horizon << "\n";
@@ -403,15 +459,105 @@ void write_header(
     out << "# excluded_ns=intersect+h_build+mwpm_build, the stages discounted as pipelined out\n";
     out << "# total_ns=the whole two-phase shot end to end; not charged, kept so the gap to the"
            " stage sum stays visible\n";
+    // §D's figure of merit, named in the file so a reader does not have to be told which columns to
+    // add: the prune moves the solver and the harvest, and nothing else in this schema.
+    out << "# figure_of_merit=blossom_ns+hrvst_ns\n";
+    // Which side of the A/B this file is. The two runs must agree shot for shot on `obs` and on
+    // `escalated`; what differs is the figure of merit above.
+    out << "# prune_trivial_components=" << (options.prune ? 1 : 0) << "\n";
+    // The component columns of schema v3. Structural and untimed — they describe `H`, they are not
+    // part of any series, and they are all 0 under `--no-component-stats`.
+    out << "# component_stats=" << (options.component_stats ? 1 : 0) << "\n";
+    out << "# h_defects=nodes of H, i.e. the post-preamble defects the components partition\n";
+    out << "# components=connected components of H over its defect-defect edges\n";
+    out << "# defects_in_trivial=defects in components of size <= 2\n";
+    out << "# defects_to_solver=defects a size <= 2 resolver would have had to leave to the solver\n";
     out << "shot,defects,escalated,certified,contaminated,stock_g_ns,blossom_ns,dscan_ns,hrvst_ns,"
-           "escal_stock_ns,excluded_ns,total_ns\n";
+           "escal_stock_ns,excluded_ns,total_ns,"
+           "h_defects,components,singleton_components,pair_components,nontrivial_components,"
+           "largest_component,defects_in_trivial,defects_to_solver\n";
 }
+
+/// §C.2/§C.3's distributions for one grid point, in long form so that one schema covers scalars and
+/// histograms alike: `kind` names the table, `key` the statistic or the bin, `value` the count.
+///
+/// Bins of the three weight histograms are in sixteenths of `T` — bin `k` is
+/// `[k * T / bins_per_T, (k + 1) * T / bins_per_T)`, last bin overflowing — which is recorded in the
+/// metadata rather than left to the reader to know. Sizes and degrees are binned by count, with the
+/// last bin overflowing the same way.
+void write_component_file(
+    std::ofstream& out,
+    const Options& options,
+    size_t distance,
+    double noise,
+    double horizon,
+    BallGraphBuildMode mode,
+    double unit,
+    horizon_int horizon_time_units,
+    const TwoPhaseSummary& summary) {
+    out << "# schema=two_phase_components_v1\n";
+    out << "# d=" << distance << "\n";
+    out << "# p=" << noise << "\n";
+    out << "# T=" << horizon << "\n";
+    out << "# T_weight_units=" << horizon * unit << "\n";
+    // The decoder's own `T_int`, read off the decoder rather than reconverted here — the §0 unit
+    // rule. It is what the histogram bin width is a sixteenth of.
+    out << "# T_time_units=" << horizon_time_units << "\n";
+    out << "# mode=" << mode_name(mode) << "\n";
+    out << "# shots=" << options.shots << "\n";
+    out << "# seed=" << options.seed << "\n";
+    out << "# bins_per_T=" << summary.weight_hist_bins_per_T << "\n";
+    out << "# untimed=1 (the decomposition runs outside every timed window and is in no latency"
+           " column)\n";
+    out << "kind,key,value\n";
+
+    auto scalar = [&](const char* key, double value) {
+        out << "scalar," << key << "," << value << "\n";
+    };
+    scalar("shots_with_component_stats", (double)summary.shots_with_component_stats);
+    scalar("shots_with_component_defects", (double)summary.shots_with_component_defects);
+    scalar("mean_components", summary.mean_components);
+    scalar("mean_singleton_components", summary.mean_singleton_components);
+    scalar("mean_pair_components", summary.mean_pair_components);
+    scalar("mean_nontrivial_components", summary.mean_nontrivial_components);
+    scalar("mean_largest_component_size", summary.mean_largest_component_size);
+    scalar("max_component_size", summary.max_component_size);
+    scalar("mean_max_component_diameter_wint", summary.mean_max_component_diameter_wint);
+    scalar("max_component_diameter_wint", summary.max_component_diameter_wint);
+    scalar("boundary_touching_component_fraction", summary.boundary_touching_component_fraction);
+    scalar("diameter_uncomputed_component_fraction", summary.diameter_uncomputed_component_fraction);
+    scalar("frac_defects_in_trivial_components", summary.frac_defects_in_trivial_components);
+    scalar("frac_defects_to_solver", summary.frac_defects_to_solver);
+    scalar("frac_defects_committed_trivially", summary.frac_defects_committed_trivially);
+    scalar("frac_defects_residual_trivially", summary.frac_defects_residual_trivially);
+    scalar("solver_set_empty_rate", summary.solver_set_empty_rate);
+    scalar("trivial_residual_rate", summary.trivial_residual_rate);
+
+    auto histogram = [&](const char* kind, const std::vector<uint64_t>& bins) {
+        for (size_t i = 0; i < bins.size(); i++)
+            out << kind << "," << i << "," << bins[i] << "\n";
+    };
+    histogram("size_hist", summary.component_size_hist);
+    histogram("diameter_hist", summary.component_diameter_hist);
+    histogram("degree_hist", summary.h_degree_hist);
+    histogram("edge_weight_hist", summary.h_edge_weight_hist);
+    histogram("bcost_hist", summary.boundary_cost_hist);
+}
+
+/// One grid point: the per-shot rows, and the campaign accumulator the component file is written
+/// from. `horizon_time_units` is the decoder's own `T_int`, carried so the component file can state
+/// the unit its histogram bins are a sixteenth of without converting `T` a second time (§0).
+struct PointResult {
+    std::vector<ShotRow> rows;
+    TwoPhaseAggregateStats stats;
+    horizon_int horizon_time_units{0};
+};
 
 /// Both decoders on every shot, `H` first. Returns one row per shot, in shot order.
 ///
 /// `progress` is ticked once per shot, warmup included, from between-shot positions only; see
 /// `ProgressBar` for why that placement is the one that cannot disturb a measurement.
-std::vector<ShotRow> run_point(
+PointResult run_point(
     const stim::DetectorErrorModel& dem,
     const TwoPhaseConfig& config,
     const std::vector<std::vector<uint64_t>>& shots,
@@ -433,7 +579,9 @@ std::vector<ShotRow> run_point(
         progress.tick(++retired);
     }
 
-    std::vector<ShotRow> rows;
+    PointResult result;
+    result.horizon_time_units = decoder.horizon;
+    std::vector<ShotRow>& rows = result.rows;
     rows.reserve(shots.size());
     TwoPhaseProfile profile;
     HiResTimer timer;
@@ -454,6 +602,22 @@ std::vector<ShotRow> run_point(
         row.escalated = profile.escalated ? 1 : 0;
         row.certified = profile.certified;
         row.contaminated = profile.contaminated ? 1 : 0;
+
+        // §C. Structural, and collected after this shot's `total_ns` was read, so nothing above is
+        // charged for it. `decode_to_obs` does not accumulate — only `decode_batch` does — so the
+        // campaign totals are gathered here, shot by shot, exactly as this driver gathers the rest.
+        const ComponentStats& components = profile.components;
+        row.h_defects = ball.h_nodes;
+        row.components = components.num_components;
+        row.singleton_components = components.num_singleton_components;
+        row.pair_components = components.num_pair_components;
+        row.nontrivial_components = components.num_nontrivial_components;
+        row.largest_component = components.largest_component_size;
+        row.defects_in_trivial = components.defects_in_trivial_components;
+        row.defects_to_solver = components.defects_to_solver;
+        result.stats.accumulate(profile);
+        if (components.measured)
+            result.stats.accumulate_component_histograms(decoder.component_histograms);
 
         // Stock on `G`, on the same shot, with its own preemption probe: either side being
         // descheduled makes the pair an outlier, so the flag covers both.
@@ -476,7 +640,7 @@ std::vector<ShotRow> run_point(
         progress.tick(++retired);
     }
     progress.finish();
-    return rows;
+    return result;
 }
 
 /// The mean over the uncontaminated rows, printed to stdout so a run says what it wrote without
@@ -536,9 +700,15 @@ int main(int argc, char** argv) {
                   options.modes.size();
     size_t job = 0;
 
-    std::printf("writing one log file per (d, p, T, mode) to %s\n\n", options.out_dir.c_str());
     std::printf(
-        "%4s %8s %5s %8s %8s %11s %11s %8s %8s %9s %8s\n",
+        "writing one latency log%s per (d, p, T, mode) to %s\n\n",
+        options.component_stats ? " and one component file" : "",
+        options.out_dir.c_str());
+    // `b+h` is §D's figure of merit — the solve on `H` plus the harvest, the two stages a smaller
+    // node set moves — and `triv`/`solver` are the share of the defect set that sits in a component
+    // of size <= 2 and the share the solver would still have to take.
+    std::printf(
+        "%4s %8s %5s %8s %8s %11s %11s %8s %11s %8s %9s %8s %6s %6s\n",
         "d",
         "p",
         "T",
@@ -547,9 +717,12 @@ int main(int argc, char** argv) {
         "stock_mean",
         "sparse_mean",
         "speedup",
+        "b+h_mean",
         "escal",
         "escal_frac",
-        "contam");
+        "contam",
+        "triv",
+        "solver");
 
     size_t files_written = 0;
     for (size_t distance : options.distances) {
@@ -578,10 +751,16 @@ int main(int argc, char** argv) {
                         horizon,
                         mode_name(mode));
                     progress.label = label;
-                    std::vector<ShotRow> rows = run_point(
-                        experiment.dem, config_for(horizon, unit, mode), experiment.shots, options.warmup, progress);
+                    PointResult point = run_point(
+                        experiment.dem,
+                        config_for(horizon, unit, mode, options.component_stats, options.prune),
+                        experiment.shots,
+                        options.warmup,
+                        progress);
+                    const std::vector<ShotRow>& rows = point.rows;
 
-                    std::string path = options.out_dir + "/" + point_name(distance, noise, horizon, mode, options.tag);
+                    std::string path =
+                        options.out_dir + "/" + point_name("latency", distance, noise, horizon, mode, options.tag);
                     std::ofstream out(path);
                     if (!out.is_open()) {
                         std::cerr << "error: could not open " << path << " for writing"
@@ -594,13 +773,47 @@ int main(int argc, char** argv) {
                         out << i << "," << row.defects << "," << row.escalated << "," << row.certified << ","
                             << row.contaminated << "," << row.stock_g_ns << "," << row.blossom_ns << ","
                             << row.dscan_ns << "," << row.hrvst_ns << "," << row.escal_stock_ns << ","
-                            << row.excluded_ns << "," << row.total_ns << "\n";
+                            << row.excluded_ns << "," << row.total_ns << "," << row.h_defects << ","
+                            << row.components << ","
+                            << row.singleton_components << "," << row.pair_components << ","
+                            << row.nontrivial_components << "," << row.largest_component << ","
+                            << row.defects_in_trivial << "," << row.defects_to_solver << "\n";
                     }
                     out.close();
                     files_written++;
 
+                    // The component structure goes in its own file: it is per component and per
+                    // edge rather than per shot, so it does not fit the latency schema, and keeping
+                    // the two apart is what stops a distribution over components being read as a
+                    // distribution over shots.
+                    TwoPhaseSummary component_summary = summarize(point.stats);
+                    if (options.component_stats) {
+                        std::string component_path =
+                            options.out_dir + "/" +
+                            point_name("components", distance, noise, horizon, mode, options.tag);
+                        std::ofstream component_out(component_path);
+                        if (!component_out.is_open()) {
+                            std::cerr << "error: could not open " << component_path << " for writing\n";
+                            return 1;
+                        }
+                        write_component_file(
+                            component_out,
+                            options,
+                            distance,
+                            noise,
+                            horizon,
+                            mode,
+                            unit,
+                            point.horizon_time_units,
+                            component_summary);
+                        component_out.close();
+                        files_written++;
+                    }
+
                     QuickStats stock = quick_stats(rows, [](const ShotRow& row) { return row.stock_g_ns; });
                     QuickStats sparse = quick_stats(rows, [](const ShotRow& row) { return row.sparse_ns(); });
+                    QuickStats solve_harvest =
+                        quick_stats(rows, [](const ShotRow& row) { return row.solve_and_harvest_ns(); });
                     size_t escalated = 0;
                     size_t contaminated = 0;
                     for (const ShotRow& row : rows) {
@@ -612,7 +825,7 @@ int main(int argc, char** argv) {
                     double speedup = sparse.mean > 0 ? stock.mean / sparse.mean : 0.0;
                     double escalated_fraction = rows.empty() ? 0.0 : (double)escalated / (double)rows.size();
                     std::printf(
-                        "%4zu %8g %5g %8s %8zu %9.3fus %9.3fus %8.3fx %8zu %8.3f%% %8zu\n",
+                        "%4zu %8g %5g %8s %8zu %9.3fus %9.3fus %8.3fx %9.3fus %8zu %8.3f%% %8zu %5.1f%% %5.1f%%\n",
                         distance,
                         noise,
                         horizon,
@@ -621,9 +834,12 @@ int main(int argc, char** argv) {
                         stock.mean / 1000.0,
                         sparse.mean / 1000.0,
                         speedup,
+                        solve_harvest.mean / 1000.0,
                         escalated,
                         100.0 * escalated_fraction,
-                        contaminated);
+                        contaminated,
+                        100.0 * component_summary.frac_defects_in_trivial_components,
+                        100.0 * component_summary.frac_defects_to_solver);
                     std::fflush(stdout);
                 }
             }
@@ -636,7 +852,11 @@ int main(int argc, char** argv) {
         " `escal`/`escal_frac`\nare over all %zu. `speedup` is stock_mean/sparse_mean, so the"
         " escalation tail is priced into it.\n`sparse_mean` is blossom+dscan+hrvst, plus the Phase-2"
         " re-decode on the shots that escalate; ball\nintersect, H build and Mwpm(H) build are not in"
-        " it and are logged as `excluded_ns` in every file.\n",
+        " it and are logged as `excluded_ns` in every file.\n"
+        "`b+h_mean` is blossom+hrvst alone — the two stages a smaller node set moves. `triv` and"
+        " `solver`\nare shares of H's defects: in a component of size <= 2, and left to the solver"
+        " anyway. Both are\nstructural, measured outside every timed window, and detailed per grid"
+        " point in components_*.csv.\n",
         files_written,
         options.shots,
         options.shots);

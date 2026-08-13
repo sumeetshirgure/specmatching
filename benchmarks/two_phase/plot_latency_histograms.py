@@ -46,6 +46,20 @@ No percentiles are reported. The one place a percentile survives is `--x-max-per
 chooses where the x axis stops — a view control, not a statistic, and the caption states as a count
 how many shots fell past it.
 
+Logs written under the v3 schema also carry the **component structure** of `H` — its connected
+components, their sizes, weighted diameters, degrees, `H` edge weights and boundary costs — measured
+outside every timed window and charged to no latency number. Two things are drawn from it:
+
+  * a component figure per grid point, from the profiler's companion `components_*.csv`: the five
+    distributions as small multiples, plus the headline "how much of the defect set never needs the
+    solver at all" numbers. `--no-components` skips it;
+  * a second table beside the latency one, from the per-shot rows, so both tables describe the same
+    uncontaminated shots.
+
+A v2 log still draws its latency figure; it simply has no component table row and no component
+figure. So does a v3 log written under `--no-component-stats`, which has the columns and zeros in
+them — "not measured" is read off the header, never off a column of zeros.
+
 The same numbers also go to a text table — `latency_speedups.txt`, written into the same directory as
 the figures — so the run is readable without opening an image, and diffable between runs. `--table`
 prints that table to the terminal too.
@@ -59,6 +73,7 @@ import itertools
 import math
 import os
 import sys
+import textwrap
 
 import matplotlib
 import numpy as np
@@ -95,6 +110,12 @@ SPARSE_LABEL = "stock decode on sparsified H"
 # enough that a block of text is a few megabytes rather than the whole file.
 CHUNK_ROWS = 100_000
 
+# Latency schemas this script reads. v1 logged one pre-summed `sparse_ns` column and no stage split,
+# so it cannot be re-read under the definition in `series_of`; v2 is the stage split; v3 adds the
+# component columns, which are optional here — a v2 log still draws, without the component panels.
+LATENCY_SCHEMAS = ("two_phase_latency_v2", "two_phase_latency_v3")
+COMPONENT_SCHEMA = "two_phase_components_v1"
+
 # The only columns any series needs. Everything else in the row — `shot`, `defects`, `certified`,
 # `total_ns` — is never read, so it is never parsed either.
 NEEDED = (
@@ -107,7 +128,24 @@ NEEDED = (
     "escal_stock_ns",
     "excluded_ns",
 )
-AT = {name: position for position, name in enumerate(NEEDED)}
+
+# v3's component columns: the structure of the sparsified graph the stages above ran on, measured
+# outside every timed window. Read as one block or not at all — a log that has some of them and not
+# others is malformed, not half-supported.
+#
+# `h_defects` is the denominator of every fraction taken from these: the nodes of `H`, which the
+# component counts partition. Not `defects`, which is the raw detection-event count before the
+# negative-weight preamble.
+COMPONENT_NEEDED = (
+    "h_defects",
+    "components",
+    "singleton_components",
+    "pair_components",
+    "nontrivial_components",
+    "largest_component",
+    "defects_in_trivial",
+    "defects_to_solver",
+)
 
 
 class Log:
@@ -118,10 +156,14 @@ class Log:
     at the end needs.
     """
 
-    def __init__(self, path, meta, columns):
+    def __init__(self, path, meta, columns, has_components=False):
         self.path = path
         self.meta = meta
         self.columns = columns
+        # Whether the per-shot component columns are there *and* the run actually collected them.
+        # A v3 log written under `--no-component-stats` has the columns and zeros in them, which
+        # would otherwise be reported as "every component is trivial" rather than "not measured".
+        self.has_components = has_components
 
     @property
     def title(self):
@@ -168,12 +210,17 @@ def load(path):
             raise ValueError(f"{path}: no shot rows")
     # v1 logged one pre-summed `sparse_ns` column and no stage split, so it cannot be re-read under
     # the definition in `series_of`. Named rather than reported as a pile of absent columns.
-    if meta.get("schema") not in (None, "two_phase_latency_v2"):
-        raise ValueError(f"schema {meta['schema']}; this script reads two_phase_latency_v2")
+    if meta.get("schema") not in (None,) + LATENCY_SCHEMAS:
+        raise ValueError(f"schema {meta['schema']}; this script reads {' or '.join(LATENCY_SCHEMAS)}")
     missing = [name for name in NEEDED if name not in columns]
     if missing:
         raise ValueError(f"{path}: header is missing {', '.join(missing)}")
-    return Log(path, meta, columns)
+    present = [name for name in COMPONENT_NEEDED if name in columns]
+    if present and len(present) != len(COMPONENT_NEEDED):
+        absent = [name for name in COMPONENT_NEEDED if name not in columns]
+        raise ValueError(f"{path}: has some component columns but not {', '.join(absent)}")
+    has_components = len(present) == len(COMPONENT_NEEDED) and meta.get("component_stats") != "0"
+    return Log(path, meta, columns, has_components)
 
 
 def collect(paths):
@@ -211,12 +258,22 @@ def series_of(log, include_contaminated, include_excluded):
     while it is still integer nanoseconds, so a contaminated shot is never converted at all. What
     survives the read is two `float64` arrays — 8 MB each per million kept shots, against roughly a
     hundred times that for the same rows as Python objects.
+
+    v3's component columns are reduced to running totals *inside* the same loop and never kept per
+    shot: the component structure is reported as means and rates, and the shape of its distributions
+    comes from the companion `components_*.csv`, which is already aggregated. So the per-shot memory
+    cost of reading them is nothing at all.
     """
-    usecols = tuple(log.columns.index(name) for name in NEEDED)
+    names = NEEDED + (COMPONENT_NEEDED if log.has_components else ())
+    at = {name: position for position, name in enumerate(names)}
+    usecols = tuple(log.columns.index(name) for name in names)
     stock_chunks = []
     sparse_chunks = []
     escalated = 0
     dropped = 0
+    components = dict.fromkeys(COMPONENT_NEEDED, 0) if log.has_components else None
+    if components is not None:
+        components.update(shots=0, shots_with_defects=0, solver_empty=0, max_component=0)
     with open(log.path) as handle:
         read_header(handle)
         while True:
@@ -230,29 +287,279 @@ def series_of(log, include_contaminated, include_excluded):
             if include_contaminated:
                 kept = block
             else:
-                clean = block[:, AT["contaminated"]] == 0
+                clean = block[:, at["contaminated"]] == 0
                 dropped += int(block.shape[0] - np.count_nonzero(clean))
                 kept = block[clean]
             del block
             if not kept.shape[0]:
                 continue
-            escalated += int(kept[:, AT["escalated"]].sum())
+            escalated += int(kept[:, at["escalated"]].sum())
             value = (
-                kept[:, AT["blossom_ns"]]
-                + kept[:, AT["dscan_ns"]]
-                + kept[:, AT["hrvst_ns"]]
-                + kept[:, AT["escal_stock_ns"]]
+                kept[:, at["blossom_ns"]]
+                + kept[:, at["dscan_ns"]]
+                + kept[:, at["hrvst_ns"]]
+                + kept[:, at["escal_stock_ns"]]
             )
             if include_excluded:
-                value += kept[:, AT["excluded_ns"]]
-            stock_chunks.append(kept[:, AT["stock_g_ns"]] / 1000.0)
+                value += kept[:, at["excluded_ns"]]
+            stock_chunks.append(kept[:, at["stock_g_ns"]] / 1000.0)
             sparse_chunks.append(value / 1000.0)
+            if components is not None:
+                accumulate_components(components, kept, at)
     empty = np.empty(0, dtype=np.float64)
     stock = np.concatenate(stock_chunks) if stock_chunks else empty
     stock_chunks.clear()
     sparse = np.concatenate(sparse_chunks) if sparse_chunks else empty
     sparse_chunks.clear()
-    return stock, sparse, escalated, dropped
+    return stock, sparse, escalated, dropped, components
+
+
+def accumulate_components(totals, kept, at):
+    """One block's component columns, folded into the running totals. O(1) memory in the campaign.
+
+    `shots_with_defects` and `solver_empty` are counted apart from `shots` because the rate worth
+    quoting — how often the solver and the harvest would not have run at all — has to be conditioned
+    on the shot having had a defect. A shot with an empty syndrome skips the solve for a reason that
+    has nothing to do with the prune, and pooling the two would report the corpus's zero-defect rate
+    as if it were the prune's win.
+    """
+    for name in COMPONENT_NEEDED:
+        totals[name] += int(kept[:, at[name]].sum())
+    has_defects = kept[:, at["h_defects"]] > 0
+    totals["shots"] += int(kept.shape[0])
+    totals["shots_with_defects"] += int(np.count_nonzero(has_defects))
+    totals["solver_empty"] += int(np.count_nonzero(has_defects & (kept[:, at["defects_to_solver"]] == 0)))
+    totals["max_component"] = max(totals["max_component"], int(kept[:, at["largest_component"]].max()))
+
+
+def component_file_for(log):
+    """The `components_*.csv` the profiler writes beside a `latency_*.csv`, or None.
+
+    The two files share everything after the prefix, so the pairing is a rename rather than a match
+    on parsed metadata — a log renamed by hand loses its companion, which is the intended failure:
+    guessing which of several component files belongs to it would be worse.
+    """
+    name = os.path.basename(log.path)
+    if not name.startswith("latency_"):
+        return None
+    path = os.path.join(os.path.dirname(log.path), "components_" + name[len("latency_") :])
+    return path if os.path.exists(path) else None
+
+
+def read_component_file(path):
+    """The aggregated component structure of one grid point: its scalars and its histograms.
+
+    Long form on disk — `kind,key,value` — so one schema covers a table of scalars and five
+    histograms of different lengths. Bins arrive in order but are placed by index rather than
+    appended, so a file that is sorted differently, or that omits an empty trailing bin, still reads
+    correctly.
+    """
+    scalars = {}
+    raw = {}
+    with open(path) as handle:
+        meta, columns = read_header(handle)
+        if meta.get("schema") != COMPONENT_SCHEMA:
+            raise ValueError(f"{path}: schema {meta.get('schema')}; this script reads {COMPONENT_SCHEMA}")
+        if columns != ["kind", "key", "value"]:
+            raise ValueError(f"{path}: expected a kind,key,value header")
+        for line in handle:
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            kind, _, rest = line.partition(",")
+            key, _, value = rest.partition(",")
+            if kind == "scalar":
+                scalars[key] = float(value)
+            else:
+                raw.setdefault(kind, {})[int(key)] = float(value)
+    histograms = {}
+    for kind, bins in raw.items():
+        counts = np.zeros(max(bins) + 1, dtype=np.float64)
+        for index, count in bins.items():
+            counts[index] = count
+        histograms[kind] = counts
+    return {"path": path, "meta": meta, "scalars": scalars, "hists": histograms}
+
+
+# The five distributions the component file carries, in reading order, with the unit of their bins.
+# `T` means the bin index is in units of the horizon divided by `bins_per_T`; `count` means the bin
+# index *is* the value. The last bin of every one of them overflows, which the axis labels say.
+COMPONENT_PANELS = (
+    ("size_hist", "components", "component size (defects)", "count"),
+    ("degree_hist", "H nodes", "degree in H", "count"),
+    ("edge_weight_hist", "H edges", "edge weight $d_G(u,v)$  (units of T)", "T"),
+    ("bcost_hist", "defects", "boundary cost  (units of T)", "T"),
+    ("diameter_hist", "components", "weighted component diameter  (units of T)", "T"),
+)
+
+
+def draw_component_panel(ax, counts, unit, bins_per_T, label, colour, theme):
+    """One histogram, drawn like the latency figure's: filled at low alpha under a 2px edge.
+
+    The count axis is logarithmic because these distributions are the point: the bulk is one or two
+    bins tall and everything the pruning experiment is about — the large components, the long edges —
+    lives three or four decades down. On a linear axis that tail is a flat line at zero.
+    """
+    edges = np.arange(counts.size + 1, dtype=np.float64)
+    if unit == "T":
+        edges /= float(bins_per_T)
+    ax.stairs(counts, edges, color=colour, alpha=0.45, fill=True, zorder=2)
+    ax.stairs(counts, edges, color=colour, linewidth=2.0, zorder=3)
+    ax.set_yscale("log")
+    ax.set_xlim(edges[0], edges[-1])
+    ax.set_xlabel(label, color=theme["text_secondary"], fontsize=9)
+    ax.grid(axis="y", color=theme["grid"], linewidth=0.8, zorder=0)
+    ax.set_axisbelow(True)
+    for side in ("top", "right"):
+        ax.spines[side].set_visible(False)
+    for side in ("left", "bottom"):
+        ax.spines[side].set_color(theme["grid"])
+    ax.tick_params(colors=theme["text_secondary"], labelsize=8)
+
+
+def draw_components(log, component, args, theme):
+    """The component structure of `H` at one grid point: five distributions and the headline numbers.
+
+    Small multiples of one hue, not a five-series chart: these are five different populations —
+    components, nodes, edges — and colouring them apart would imply a comparison between quantities
+    that share no axis. The one hue is the same one the latency figure gives the sparsified series,
+    because every panel here describes that same graph.
+
+    The sixth cell is deliberately not a chart. "How much of the defect set never needs the solver"
+    is a handful of numbers, and a bar chart of six unrelated percentages is harder to read than the
+    percentages.
+    """
+    hists = component["hists"]
+    scalars = component["scalars"]
+    bins_per_T = float(component["meta"].get("bins_per_T", 16))
+    colour = theme["series"][1]
+
+    fig, axes = plt.subplots(2, 3, figsize=(13.5, 7.0))
+    fig.patch.set_facecolor(theme["surface"])
+    flat = axes.ravel()
+    for ax in flat:
+        ax.set_facecolor(theme["surface"])
+
+    for ax, (kind, of_what, label, unit) in zip(flat, COMPONENT_PANELS):
+        counts = hists.get(kind)
+        if counts is None or not counts.sum():
+            ax.text(
+                0.5,
+                0.5,
+                f"no {kind}",
+                transform=ax.transAxes,
+                ha="center",
+                va="center",
+                color=theme["text_secondary"],
+                fontsize=9,
+            )
+            ax.set_axis_off()
+            continue
+        draw_component_panel(ax, counts, unit, bins_per_T, label, colour, theme)
+        ax.set_ylabel(of_what, color=theme["text_secondary"], fontsize=9)
+        # One direct label per panel, and only where a threshold means something: the size axis is
+        # where "trivial" is defined, and `H` holds no edge longer than `2T` by construction, so a
+        # bar at the right edge of that panel is the overflow bin and not a longer edge.
+        if kind == "size_hist":
+            ax.axvline(3.0, color=theme["text_secondary"], linewidth=1.0, linestyle=(0, (4, 3)), zorder=4)
+            ax.annotate(
+                "size $\\leq$ 2: no solver",
+                xy=(3.0, 0.94),
+                xycoords=("data", "axes fraction"),
+                ha="left",
+                va="top",
+                fontsize=8,
+                color=theme["text_primary"],
+                xytext=(4, 0),
+                textcoords="offset points",
+                zorder=5,
+            )
+        elif kind == "edge_weight_hist":
+            ax.axvline(2.0, color=theme["text_secondary"], linewidth=1.0, linestyle=(0, (4, 3)), zorder=4)
+            ax.annotate(
+                "2T: H's own cutoff",
+                xy=(2.0, 0.94),
+                xycoords=("data", "axes fraction"),
+                ha="right",
+                va="top",
+                fontsize=8,
+                color=theme["text_primary"],
+                xytext=(-4, 0),
+                textcoords="offset points",
+                zorder=5,
+            )
+
+    summary_ax = flat[len(COMPONENT_PANELS)]
+    summary_ax.set_axis_off()
+    # Every percentage here states the population it is over. The three defect shares are over the
+    # same denominator — `H`'s nodes — and do not sum to 1: a component can be small enough to be
+    # trivial and still ambiguous enough to go to the solver, and that gap is the interesting number.
+    analysed = scalars.get("shots_with_component_stats", 0.0)
+    with_defects = scalars.get("shots_with_component_defects", 0.0)
+    lines = [
+        "what the prune would remove",
+        "",
+        "share of H's defects",
+        f"  in a component of size $\\leq$ 2  {100 * scalars.get('frac_defects_in_trivial_components', 0):>6.1f}%",
+        f"  resolvable outright            {100 * scalars.get('frac_defects_committed_trivially', 0):>6.1f}%",
+        f"  left to the solver anyway      {100 * scalars.get('frac_defects_to_solver', 0):>6.1f}%",
+        "",
+        "share of shots with a defect",
+        f"  no solve, no harvest at all    {100 * scalars.get('solver_set_empty_rate', 0):>6.1f}%",
+        "",
+        f"components per shot              {scalars.get('mean_components', 0):>6.2f}",
+        f"largest, mean over shots         {scalars.get('mean_largest_component_size', 0):>6.2f}",
+        f"largest, over the campaign       {scalars.get('max_component_size', 0):>6.0f}",
+        f"touching the boundary            {100 * scalars.get('boundary_touching_component_fraction', 0):>6.1f}%",
+        "",
+        f"{analysed:,.0f} shots analysed, {with_defects:,.0f} with a defect",
+    ]
+    # Sized so the block cannot reach the caption: sixteen lines at this size and spacing are shorter
+    # than the cell, which a figure with a longer caption or a taller font would not be.
+    summary_ax.text(
+        0.0,
+        1.0,
+        "\n".join(lines),
+        transform=summary_ax.transAxes,
+        ha="left",
+        va="top",
+        fontsize=8,
+        family="monospace",
+        color=theme["text_primary"],
+        linespacing=1.4,
+    )
+
+    fig.suptitle(
+        f"component structure of H  —  {log.title}",
+        color=theme["text_primary"],
+        fontsize=13,
+        x=0.012,
+        ha="left",
+    )
+    uncomputed = scalars.get("diameter_uncomputed_component_fraction", 0.0)
+    clauses = [
+        "Counts on a log axis; the last bin of every histogram is an overflow bin",
+        f"weight bins are T/{bins_per_T:.0f}",
+        "diameters are shortest paths confined to the component, so they are H-subgraph distances"
+        " rather than distances in G",
+    ]
+    if uncomputed:
+        clauses.append(f"{100 * uncomputed:.2f}% of components were too large to measure one")
+    # Wrapped rather than left to run: at this width the clause list is longer than the figure, and
+    # a caption that leaves the page is a caption that was not read.
+    caption = textwrap.fill("  ·  ".join(clauses), width=170, break_long_words=False)
+    caption += "\nStructural, measured outside every timed window: none of this is charged to any latency number."
+    fig.text(0.012, 0.005, caption, color=theme["text_secondary"], fontsize=8.5, va="bottom")
+    fig.tight_layout(rect=(0, 0.075, 1, 0.955))
+
+    stem = os.path.splitext(os.path.basename(component["path"]))[0]
+    written = []
+    for extension in args.formats:
+        out_path = os.path.join(args.out_dir or os.path.dirname(log.path) or ".", f"{stem}.{extension}")
+        fig.savefig(out_path, dpi=args.dpi, facecolor=theme["surface"])
+        written.append(out_path)
+    plt.close(fig)
+    return written
 
 
 def percentile(values, fraction):
@@ -297,7 +604,9 @@ def bin_edges(stock, sparse, x_max, bins, log_x):
 
 
 def draw(log, args, theme):
-    stock, sparse, escalated, dropped = series_of(log, args.include_contaminated, args.include_excluded)
+    stock, sparse, escalated, dropped, components = series_of(
+        log, args.include_contaminated, args.include_excluded
+    )
     if not stock.size:
         print(f"  {log.stem}: every shot was contaminated; nothing to plot")
         return None
@@ -409,6 +718,7 @@ def draw(log, args, theme):
         "escalated": escalated,
         "dropped": dropped,
         "clipped": clipped,
+        "components": components,
         "written": written,
     }
 
@@ -454,6 +764,62 @@ def table_lines(results, args):
     )
     if args.include_contaminated:
         lines.append("  Contaminated shots were KEPT in both series (--include-contaminated).")
+    lines.extend(component_table_lines(results))
+    return lines
+
+
+def component_table_lines(results):
+    """The component structure as text, over the same uncontaminated shots as the table above.
+
+    Every column comes from the per-shot rows rather than from the companion file, so this table and
+    the latency table describe exactly the same set of shots: the companion file is aggregated over
+    *all* shots, contaminated ones included, and quoting the two side by side would be quoting two
+    populations under one heading. The companion file's own numbers are on the component figure,
+    where they are the whole subject and the difference is stated.
+    """
+    rows = [result for result in results if result.get("components")]
+    if not rows:
+        return []
+    lines = [
+        "",
+        "Component structure of H — same uncontaminated shots as above. `triv` is the share of H's"
+        " defects in a",
+        "component of size <= 2; `solver` is the share a size <= 2 resolver would still have had to"
+        " hand over;",
+        "`no solve` is the share of shots with at least one defect where it would have had to hand"
+        " over nothing,",
+        "so the Mwpm(H) build, the solve and the harvest would not have run at all. Structural, and"
+        " untimed.",
+        "",
+        f"{'d':>4} {'p':>8} {'T':>5} {'mode':>7} {'shots':>8} "
+        f"{'comps':>7} {'single':>7} {'pairs':>7} {'nontriv':>8} "
+        f"{'largest':>8} {'max':>5} {'triv':>7} {'solver':>7} {'no solve':>9}",
+    ]
+    for result in rows:
+        meta = result["log"].meta
+        totals = result["components"]
+        shots = totals["shots"] or 1
+        defects = totals["h_defects"] or 1
+        with_defects = totals["shots_with_defects"] or 1
+        lines.append(
+            f"{meta.get('d', '?'):>4} {meta.get('p', '?'):>8} {meta.get('T', '?'):>5} "
+            f"{meta.get('mode', '?'):>7} {totals['shots']:>8,} "
+            f"{totals['components'] / shots:>7.2f} "
+            f"{totals['singleton_components'] / shots:>7.2f} "
+            f"{totals['pair_components'] / shots:>7.2f} "
+            f"{totals['nontrivial_components'] / shots:>8.2f} "
+            f"{totals['largest_component'] / shots:>8.2f} "
+            f"{totals['max_component']:>5,} "
+            f"{100 * totals['defects_in_trivial'] / defects:>6.1f}% "
+            f"{100 * totals['defects_to_solver'] / defects:>6.1f}% "
+            f"{100 * totals['solver_empty'] / with_defects:>8.1f}%"
+        )
+    missing = len(results) - len(rows)
+    if missing:
+        lines.append(
+            f"  {missing} log(s) carried no component columns and are absent from this table"
+            " (schema v2, or --no-component-stats)."
+        )
     return lines
 
 
@@ -527,6 +893,13 @@ def main():
         action="store_true",
         help="keep shots the scheduler interfered with; they are dropped from both series by default",
     )
+    parser.add_argument(
+        "--no-components",
+        dest="components",
+        action="store_false",
+        help="skip the component-structure figure drawn from each log's companion components_*.csv;"
+        " the component table stays, since it comes from the per-shot rows",
+    )
     parser.add_argument("--theme", choices=sorted(THEMES), default="light")
     parser.add_argument("--table", action="store_true", help="print the summary table to stdout as well")
     parser.add_argument(
@@ -552,7 +925,8 @@ def main():
         # pre-parsed a malformed row is first seen while the figure is being built. One bad file
         # still costs the run one file.
         try:
-            result = draw(load(path), args, theme)
+            log = load(path)
+            result = draw(log, args, theme)
         except (OSError, ValueError, KeyError) as error:
             print(f"  skipping {path}: {error}")
             continue
@@ -561,6 +935,20 @@ def main():
         results.append(result)
         for out_path in result["written"]:
             print(f"  wrote {out_path}")
+
+        # The component figure is drawn from the companion file, so a missing or malformed one costs
+        # the run that figure and nothing else: the latency figure beside it is already written.
+        if args.components:
+            component_path = component_file_for(log)
+            if component_path is None:
+                if log.has_components:
+                    print(f"  note: no components_*.csv beside {log.stem}; component figure skipped")
+                continue
+            try:
+                for out_path in draw_components(log, read_component_file(component_path), args, theme):
+                    print(f"  wrote {out_path}")
+            except (OSError, ValueError, KeyError) as error:
+                print(f"  skipping {component_path}: {error}")
 
     if not results:
         print("  nothing plotted.")

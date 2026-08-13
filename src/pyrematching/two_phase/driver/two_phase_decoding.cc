@@ -130,6 +130,10 @@ TwoPhaseDecoder TwoPhaseDecoder::from_detector_error_model(
         ball_config.compile_threads = config.compile_threads;
         ball_config.collect_harvest_diagnostics = config.collect_harvest_diagnostics;
         ball_config.collect_structural_counters = config.collect_structural_counters;
+        ball_config.collect_component_stats = config.collect_component_stats;
+        ball_config.prune_trivial_components = config.prune_trivial_components;
+        ball_config.trivial_component_max_size = config.trivial_component_max_size;
+        ball_config.skip_negative_weight_preamble_when_positive = config.skip_negative_weight_preamble_when_positive;
         decoder.ball =
             std::make_unique<BallDecoder>(BallDecoder::from_mwpm(std::move(g_mwpm), ball_config, ball_artifact_path));
         decoder.horizon = decoder.ball->horizon;
@@ -223,6 +227,17 @@ void TwoPhaseDecoder::copy_phase1_stats(const Phase1Outcome& outcome, TwoPhasePr
     }
 }
 
+void TwoPhaseDecoder::record_component_stats(TwoPhaseProfile* prof) {
+    if (prof == nullptr || ball == nullptr || !config.collect_component_stats)
+        return;
+    // Deliberately after `total_ns` has been read, and deliberately untimed: the pruning experiment
+    // this feeds assumes the component work is free, so charging it to a latency number here would
+    // be measuring a stage that is not meant to run on this critical path. It also has to come
+    // before `record_truncated_reference`, which rebuilds `H` in the same arena.
+    ball->analyze_last_shot_components(ball_profile, component_histograms);
+    prof->components = ball_profile.components;
+}
+
 void TwoPhaseDecoder::record_truncated_reference(const std::vector<uint64_t>& dets, TwoPhaseProfile* prof) {
     if (!config.measure_truncated_reference || ball == nullptr || prof == nullptr)
         return;
@@ -302,6 +317,7 @@ void TwoPhaseDecoder::decode_to_obs(
         assert(
             prof->escalated == prof->truncated &&
             "invariant 12: escalation fires iff Phase 1 has no usable answer, and nothing else");
+        record_component_stats(prof);
         record_truncated_reference(dets, prof);
     }
 }
@@ -400,6 +416,7 @@ void TwoPhaseDecoder::decode_to_edges(
         assert(
             prof->escalated == prof->truncated &&
             "invariant 12: escalation fires iff Phase 1 has no usable answer, and nothing else");
+        record_component_stats(prof);
         record_truncated_reference(dets, prof);
     }
 }
@@ -435,6 +452,10 @@ void TwoPhaseDecoder::decode_batch(
                 local.exact_reference_ns = exact_timer.elapsed_ns();
             }
             stats.accumulate(local);
+            // §C.3. The scalars ride in on the profile; the distributions are per component and per
+            // edge, so they are folded in from the decoder's own per-shot buffer instead.
+            if (config.collect_component_stats && local.components.measured)
+                stats.accumulate_component_histograms(component_histograms);
             if (profiles_out != nullptr)
                 profiles_out->push_back(local);
         }

@@ -77,6 +77,59 @@ struct BallConfig {
     /// The counters are structural, so the separate pass costs nothing in fidelity: they are a
     /// function of the shot and the tables, not of when they were measured.
     bool collect_structural_counters{false};
+    /// §C — the component and structural statistics of the shot's `H`: the connected components,
+    /// their sizes, weighted diameters and boundary structure, the `H` edge-weight and boundary-cost
+    /// distributions, and §A.3's classification of each component into "the trivial resolver would
+    /// commit it", "it would leave a residual" and "it goes to the solver".
+    ///
+    /// **Profiling only, and untimed.** The analysis runs after the shot's timed window has closed
+    /// and is charged to no latency number at all: the component work is assumed free
+    /// (hardware-offloadable), so timing it would be measuring a stage that is not meant to be on
+    /// this critical path. It reads the `H` the arena is still holding and changes nothing about
+    /// the decode — with the flag on or off, every shot produces byte-identical output and the same
+    /// set of shots escalates.
+    ///
+    /// Off by default, for the same reason `collect_structural_counters` is: the exit artifact
+    /// collects it in its own pass rather than beside the timings it would otherwise perturb
+    /// through the cache.
+    bool collect_component_stats{false};
+
+    /// §A — decompose `H` into connected components, resolve the trivial ones (size 1 and 2)
+    /// directly off the ball tables, and hand the solver only the remainder.
+    ///
+    /// Components are disconnected by construction — no `H` edge crosses one, and the boundary is
+    /// not a node, so it joins nothing — which means the timeline on `H` factorises over them.
+    /// Removing a component the resolver has already settled therefore cannot change the solve on
+    /// what is left, and §A.3's strict inequalities keep the resolved set to the components whose
+    /// outcome is unambiguous and strictly inside the horizon. Everything else, ties and exact-`T`
+    /// events included, still goes to the solver.
+    ///
+    /// The output is unchanged on every shot and so is the set of shots that escalate; what moves
+    /// is `blossom_on_h_ns` and `harvest_ns`, which run on a smaller node set — and, when every
+    /// component resolves trivially, do not run at all (§A.4).
+    ///
+    /// **Production path only.** The two verification entry points (`decode_phase1`,
+    /// `decode_phase1_to_match_edges`) ignore this and always solve the whole of `H`: they are what
+    /// §M2.6 level 1 and §M3.3 X8 compare against, and pruning what the oracle sees would defeat
+    /// them. Turning the flag off restores the current production path exactly, which is what the
+    /// A/B is run against.
+    bool prune_trivial_components{true};
+    /// The largest component the resolver will attempt. **A resolver exists for sizes 1 and 2
+    /// only**, and larger components go to the solver whatever this says (§A.3); the knob is here
+    /// so that a future exact brute-forcer for small components has somewhere to be enabled from,
+    /// and so that the resolver can be narrowed to singletons for an A/B.
+    int trivial_component_max_size{2};
+
+    /// §B — skip the §M2.1 negative-weight preamble on `G` when the DEM has no negative-weight
+    /// edge, which is the overwhelmingly common case (`log((1-p)/p) > 0` for `p < 0.5`).
+    ///
+    /// The skip only ever fires when the decoder's own scan of `G` also says all-positive, in which
+    /// case the preamble is provably a no-op: there are no negative-weight detection events to
+    /// symmetric-difference in and the weight/observable offsets are zero. With a negative-weight
+    /// edge anywhere in the DEM the preamble runs exactly as it does today. The flag exists to be
+    /// turned off for the A/B, not because the skip is conditional on anything else.
+    bool skip_negative_weight_preamble_when_positive{true};
+
     /// Harvest with M1.3's enumeration instead of §M2.9.1's. The output is identical either way
     /// (that is H1); this exists so that the A/B of §M2.9.6 can be run as two passes of one process
     /// rather than as two runs of two binaries, which is the only way the difference — a few
@@ -95,6 +148,19 @@ struct CommittedPair {
     uint64_t ball_entry;
 
     static constexpr uint64_t NO_BALL_ENTRY = UINT64_MAX;
+};
+
+/// What §A.3's resolver did with the shot, in counts. Not a latency measurement and not derived
+/// from one: these are the branch tallies the combine step of §A.5 needs, plus the two harvest
+/// counters the trivial commits belong in.
+struct TrivialCommitCounts {
+    /// Components that resolved to a residual — a singleton whose boundary sits past the horizon,
+    /// or that has no boundary within `R` at all. Non-zero forces escalation (§A.5).
+    int residual{0};
+    /// Trivially committed pairs and boundary matches, mirrored into `HarvestResult`'s own counters
+    /// so that the profile's commit tallies still add up to the shot's defect count.
+    int pairs{0};
+    int boundary{0};
 };
 
 /// What §M3.4's production Phase 1 yielded.
@@ -127,6 +193,11 @@ struct BallDecoder {
 
     /// `T` in the flooder's time units, converted once from `config.T` (§0 unit rule).
     horizon_int horizon{0};
+
+    /// §B. Does `G` carry a negative-weight edge at all? Scanned once at construction off the
+    /// matching graph's own negative-weight record. When this is false the §M2.1 preamble has
+    /// nothing to do, which is what `skip_negative_weight_preamble_when_positive` skips.
+    bool dem_has_negative_weights{false};
 
     static BallDecoder from_detector_error_model(
         const stim::DetectorErrorModel& dem,
@@ -192,6 +263,18 @@ struct BallDecoder {
     /// across campaigns.
     bool truncated_scheme_escalates(const std::vector<uint64_t>& dets);
 
+    /// §C. Decomposes the `H` the arena is still holding — the one the shot just decoded on — into
+    /// connected components, and fills `prof.components` and `histograms` from it.
+    ///
+    /// **Call it after the shot's timed window has closed, never inside one** (hard constraint 1).
+    /// It starts no timer of its own and must not be wrapped in one: this experiment's latency
+    /// account is the solver and the harvest, and the component work is assumed free.
+    ///
+    /// `histograms` is cleared and refilled with *this shot's* distributions; the campaign
+    /// accumulator adds them up. Valid until the next `build_ball_graph`, which is why the driver
+    /// calls this before anything that rebuilds `H` — `truncated_scheme_escalates`, in particular.
+    void analyze_last_shot_components(BallProfile& prof, ComponentHistograms& histograms);
+
     void save_ball_artifact(const std::string& path) const;
 
     /// Scratch, so a steady-state shot allocates nothing.
@@ -199,16 +282,39 @@ struct BallDecoder {
     std::vector<uint64_t> h_dets_scratch;
     mutable std::vector<uint64_t> sort_scratch;
     std::vector<pm::CompressedEdge> match_edge_scratch;
+    /// §A.3's committed pairs, in `G`'s detector ids — the trivial resolver's contribution to the
+    /// match-edge flavours. Cleared every shot, and cleared again on an escalating one, where §A.5
+    /// discards Phase 1 in full.
+    std::vector<CommittedPair> trivial_pairs;
+    /// The graph the last solve actually ran on: the whole of `H`, or §A.4's sub-`H`. Everything
+    /// that maps a solver index back to a detector id reads it, so that the two cases go through
+    /// one path.
+    const BallGraph* solved_graph{nullptr};
     /// §M2.9.6 measurement 4, over `H`. Only touched when `collect_harvest_diagnostics` is set.
     TimelineDepthModel depth_model;
 
     void finish_construction(const char* ball_artifact_path);
     /// `harvest_on_h(mwpm, h_dets, status)` decides what to do with the solved timeline: the
     /// verification entry points always harvest in full, the production ones branch on the status.
+    ///
+    /// `allow_prune` is what keeps §A off the verification path: only the production entry points
+    /// pass true, and even they defer to `BallConfig::prune_trivial_components`.
     template <typename HarvestOnH>
-    Phase1Outcome decode_impl(const std::vector<uint64_t>& dets, BallProfile* prof, const HarvestOnH& harvest_on_h);
-    /// Turns harvest's `CompressedEdge`s over `H` into `CommittedPair`s over `G`, ball entry and
-    /// all. Shared by the verification and production match-edge entry points.
+    Phase1Outcome decode_impl(
+        const std::vector<uint64_t>& dets, BallProfile* prof, bool allow_prune, const HarvestOnH& harvest_on_h);
+    /// §A.3's trivial resolver, run over every component of `h`, and §A.4's induced sub-graph.
+    ///
+    /// Returns the graph the solver should be handed: the sub-`H` over the SOLVER set, or `h`
+    /// itself when nothing was resolved away (in which case no copy is made). Accumulates the
+    /// trivially committed observables and weight into `trivial`, the committed pairs into
+    /// `trivial_pairs`, and counts the components that survive past the horizon.
+    ///
+    /// **Untimed by construction** — no timer is started here and none may be added.
+    const BallGraph& resolve_trivial_components(
+        const BallGraph& h, pm::MatchingResult& trivial, TrivialCommitCounts& counts);
+    /// Turns harvest's `CompressedEdge`s over the solved graph into `CommittedPair`s over `G`, ball
+    /// entry and all, and merges in §A's trivially committed pairs. Shared by the verification and
+    /// production match-edge entry points.
     void map_match_edges_to_committed_pairs(std::vector<CommittedPair>& committed_pairs) const;
     /// Asserts §M2.6 level 1 against M1 on `G`. `actual_pairs` may be null when the caller took the
     /// obs flavour, in which case the committed *pair set* is not part of the comparison.

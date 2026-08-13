@@ -73,6 +73,131 @@ struct BallGraph {
     }
 };
 
+/// The connected components of `H`, over its defect-defect edges only, and the undirected adjacency
+/// the structural statistics walk.
+///
+/// **Profiling state.** Nothing on the decode path reads any of this, no timer is ever started
+/// inside the routine that fills it, and it is never filled from inside a timed window: the
+/// component work is assumed free (hardware-offloadable), so charging a latency number for it would
+/// be measuring a stage this experiment does not intend to run on a CPU.
+///
+/// The root of a component is the **smallest** `H`-node index in it, so components enumerate in
+/// ascending root order and every list below is a function of `H` alone (§0 determinism).
+struct BallComponents {
+    /// Root of `i`'s component, for each `H`-node `i`. Doubles as the union-find parent array while
+    /// the unions are running.
+    std::vector<uint32_t> component_of;
+    /// Index of `i`'s component within `roots` / `sizes` / `member_offsets`, for each `H`-node `i`.
+    /// Only meaningful at a root, which is where the fill reads it.
+    std::vector<uint32_t> component_index;
+    /// Roots, ascending. One entry per component.
+    std::vector<uint32_t> roots;
+    std::vector<uint32_t> sizes;
+    /// Members of component `c`, ascending: `[member_offsets[c], member_offsets[c + 1])` of
+    /// `members`.
+    std::vector<uint32_t> member_offsets;
+    std::vector<uint32_t> members;
+    /// Position of `H`-node `i` within its own component's block of `members`, so a per-component
+    /// scratch array can be indexed `0..size-1` without a map.
+    std::vector<uint32_t> local_index;
+
+    /// Undirected CSR adjacency over `H`'s defect-defect edges, both directions. Boundary edges are
+    /// not in it: the boundary is not a node, so it joins nothing (§A.2).
+    std::vector<uint32_t> adj_offsets;
+    std::vector<uint32_t> adj_target;
+    std::vector<pm::weight_int> adj_weight;
+
+    /// Per-component Dijkstra scratch for the weighted diameter, indexed by `local_index`.
+    std::vector<pm::cumulative_time_int> dijkstra_dist;
+    std::vector<uint8_t> dijkstra_done;
+    /// Write cursors for the two counting-sort fills below (members, then adjacency). Reused rather
+    /// than declared locally, so neither fill allocates in steady state.
+    std::vector<uint32_t> fill_cursor;
+
+    /// Analyses that had to grow a buffer, the component-side twin of `BallGraphArena::grow_events`.
+    /// After a warmup shot this must stop increasing (invariant 7).
+    uint64_t grow_events{0};
+
+    inline size_t num_components() const {
+        return roots.size();
+    }
+    inline uint32_t degree_of(uint32_t node) const {
+        return adj_offsets[node + 1] - adj_offsets[node];
+    }
+
+    void clear();
+};
+
+/// Components larger than this are left without a weighted diameter and counted instead (§C.2). The
+/// diameter is `O(s^2)` Dijkstras over the component, and at `p = 1e-3` a component this large is
+/// already far outside the distribution the statistic is for.
+inline constexpr uint32_t MAX_DIAMETER_COMPONENT_SIZE = 32;
+
+/// §A's trivial-component prune: the union-find over `H`, the per-component verdict, and the
+/// induced sub-`H` that the solver is actually handed.
+///
+/// This is **decode state**, not the profiling decomposition above. `BallComponents` builds the
+/// full adjacency, the member blocks and the Dijkstra scratch that the §C statistics walk; this
+/// builds only what §A.3 reads — a root per node, a size per root, and the one edge of every
+/// two-member component — because it runs on the shot's own path. The two are deliberately not
+/// shared: §C is computed for every shot whether or not the prune is enabled, and after the timed
+/// window has closed, while this runs inside it.
+///
+/// No timer is started anywhere in the routines that fill this and none may be added: the prune is
+/// assumed free (hardware-offloadable), and the latency account of this experiment is the solver
+/// and the harvest running on a smaller node set.
+struct BallPrune {
+    /// Union-find parent while the unions run; the root of each `H`-node afterwards. Every link
+    /// points at a **smaller** index, so a set's root is its minimum member and components
+    /// enumerate in ascending root order without a sort (§0 determinism).
+    std::vector<uint32_t> component_of;
+    /// Size of the component rooted at an `H`-node. Only meaningful at a root, which is the only
+    /// place it is read.
+    std::vector<uint32_t> component_size;
+    /// Index into `BallGraph::edges` of the single edge joining a two-member component, stored at
+    /// that component's root; `NO_PAIR_EDGE` everywhere else. `H` holds each undirected pair once,
+    /// so a two-member component has exactly one.
+    std::vector<uint32_t> pair_edge;
+    /// §A.3's verdict for the component rooted at an `H`-node, as a `TrivialVerdict`. Only
+    /// meaningful at a root; the second pass spreads it to the members.
+    std::vector<uint8_t> verdict;
+    /// 1 for the `H`-nodes the solver still has to take (§A.4's SOLVER set).
+    std::vector<uint8_t> node_to_solver;
+    /// Index of an `H`-node in `solver_graph`, or `NOT_IN_SOLVER` when it was resolved away.
+    std::vector<uint32_t> h_to_solver;
+    /// The sub-graph of `H` induced on the SOLVER set, renumbered in ascending `H`-node order so
+    /// that `h_to_det` stays strictly ascending and the residual maps back exactly as it does from
+    /// the full `H` (§A.4).
+    BallGraph solver_graph;
+
+    /// Prunes that had to grow a buffer, the prune-side twin of `BallGraphArena::grow_events`.
+    /// After a warmup shot this must stop increasing (invariant 7).
+    uint64_t grow_events{0};
+
+    static constexpr uint32_t NO_PAIR_EDGE = UINT32_MAX;
+    static constexpr uint32_t NOT_IN_SOLVER = UINT32_MAX;
+
+    void clear();
+};
+
+/// §A.2. Union-find over `H`'s defect-defect edges, and only those: the boundary is not a node of
+/// `H`, so two defects that both reach it are not thereby connected, and joining them would merge
+/// components the solver keeps apart.
+///
+/// Leaves `component_of` pointing every node straight at its root, `component_size` filled at the
+/// roots, and `pair_edge` naming the one edge of each two-member component. `verdict` is sized and
+/// zeroed for the caller to fill.
+void compute_prune_components(const BallGraph& graph, BallPrune& prune);
+
+/// §A.4. Fills `prune.solver_graph` with the sub-graph of `H` induced on the nodes flagged in
+/// `prune.node_to_solver`, and `prune.h_to_solver` with the renumbering.
+///
+/// Both endpoints of an `H` edge are in one component and so share a verdict; the edge is kept iff
+/// its component is. Boundary edges of kept nodes are carried over unchanged, which is what makes
+/// the solver see exactly the problem it would have seen on the full `H` restricted to these
+/// components.
+void build_solver_subgraph(const BallGraph& graph, BallPrune& prune);
+
 /// Owns everything `H`'s construction needs across shots, so that steady-state building allocates
 /// nothing (debug invariant 11). `det_to_h` and the syndrome bitset are sized once to the detector
 /// graph and cleared through touched lists, never by re-zeroing.
@@ -82,6 +207,16 @@ struct BallGraphArena {
     std::vector<uint32_t> det_to_h;
     std::vector<uint64_t> syndrome_words;
     std::vector<uint32_t> touched_words;
+
+    /// §C's component decomposition of the shot's `H`. Filled only by `analyze_ball_components`,
+    /// which the decode path never calls; it lives here for the arena's lifetime and reset
+    /// discipline, so the analysis allocates nothing in steady state either (invariant 7).
+    BallComponents components;
+
+    /// §A's prune state and the sub-`H` it hands the solver. Unlike `components` this *is* on the
+    /// decode path, and it lives here for the same reason: the arena's lifetime and reset
+    /// discipline are what make a steady-state shot allocate nothing (invariant 11, extended).
+    BallPrune prune;
 
     /// Counts builds that had to grow a buffer. After a warmup shot on a representative corpus this
     /// must stop increasing; that is what "zero allocations in steady state" is asserted as.
@@ -159,6 +294,28 @@ void build_ball_graph(
     BallGraphBuildMode mode,
     BallGraphTiming* timing = nullptr,
     BallGraphCounts* counts = nullptr);
+
+/// Union-find over `H`'s defect-defect edges, then the members, the adjacency and the per-component
+/// blocks the §C statistics read (§A.2).
+///
+/// Takes no timer and is given none: the component work is untimed by construction, and calling it
+/// from inside a timed window would put it in a latency number it must never enter.
+void analyze_ball_components(const BallGraph& graph, BallComponents& components);
+
+/// The weighted diameter of component `index`: the largest shortest-path distance between two of its
+/// members, with paths confined to the component's own subgraph of `H` and weighted by `w_int`.
+///
+/// This is an `H`-subgraph diameter, **not** a `G` diameter: a pair whose `G` geodesic leaves the
+/// component is measured here by the route that stays inside it, and the two can differ. That is
+/// fine for a structural metric — the quantity of interest is how far apart the component holds its
+/// own members — but it is why the number must not be read as a distance in `G`.
+///
+/// Returns `-1` for a component larger than `MAX_DIAMETER_COMPONENT_SIZE`, which the caller counts
+/// rather than computing (§C.2). A singleton has diameter 0.
+///
+/// `components` is taken by mutable reference for its Dijkstra scratch alone; nothing it describes
+/// about `H` is modified.
+pm::cumulative_time_int component_diameter(BallComponents& components, size_t index);
 
 }  // namespace two_phase
 }  // namespace pm

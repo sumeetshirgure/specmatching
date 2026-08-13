@@ -88,6 +88,26 @@ struct TwoPhaseConfig {
     bool verify_against_g{false};
     bool collect_harvest_diagnostics{false};
     bool collect_structural_counters{false};
+    /// §C — the component structure of every shot's `H`, and §A.3's classification of it. Profiling
+    /// only, computed after the shot's timed window has closed, and charged to no latency number:
+    /// see `BallConfig::collect_component_stats`. Ignored without `phase1_on_ball_graph`, where
+    /// there is no `H` to decompose.
+    bool collect_component_stats{false};
+
+    /// §A — resolve `H`'s trivial (size 1 and 2) connected components directly off the ball tables
+    /// and run the solver on the remainder only. See `BallConfig::prune_trivial_components`; the
+    /// output and the set of escalating shots are unchanged, and turning it off restores the
+    /// current production path exactly, which is the oracle the A/B is run against.
+    ///
+    /// Ignored without `phase1_on_ball_graph` (there is no `H` to decompose) and on the
+    /// verification path, which always solves the whole of `H`.
+    bool prune_trivial_components{true};
+    /// The largest component the resolver will attempt; sizes above 2 always go to the solver
+    /// (§A.3). See `BallConfig::trivial_component_max_size`.
+    int trivial_component_max_size{2};
+    /// §B — skip the §M2.1 negative-weight preamble on an all-positive DEM, where it is provably a
+    /// no-op. See `BallConfig::skip_negative_weight_preamble_when_positive`.
+    bool skip_negative_weight_preamble_when_positive{true};
 
     /// Benchmark mode: additionally run stock exact decode on every shot and record it as
     /// `exact_reference_ns`, so `speedup_vs_stock` is a paired measurement rather than two
@@ -189,6 +209,10 @@ struct TwoPhaseDecoder {
     /// a weight. Discarded; the caller already has the observables by another route.
     std::vector<uint8_t> obs_sink;
     BallProfile ball_profile;
+    /// §C.2's distributions for the shot just decoded. Refilled per shot and folded into `stats` by
+    /// `decode_batch`; a driver that decodes shot by shot instead reads it here and calls
+    /// `TwoPhaseAggregateStats::accumulate_component_histograms` itself.
+    ComponentHistograms component_histograms;
 
     /// The matching weight of a set of matched detection-event pairs: the sum of the shortest-path
     /// weights between them plus the graph's negative-weight offset.
@@ -206,6 +230,10 @@ struct TwoPhaseDecoder {
     /// off the ball tables' observable id lists. `obs` and `weight` are overwritten.
     void obs_from_committed_pairs(uint8_t* obs, pm::total_weight_int& weight) const;
     void copy_phase1_stats(const Phase1Outcome& outcome, TwoPhaseProfile* prof) const;
+    /// §C. Decomposes the shot's `H` and mirrors the result onto `prof`. Runs **outside** the timed
+    /// window, after `total_ns` has been read, and before anything that rebuilds `H` — the analysis
+    /// reads the graph the arena is still holding.
+    void record_component_stats(TwoPhaseProfile* prof);
     /// §M7.7's `q_current_on_same_corpus`. Runs **outside** the shot's timed window, after
     /// `total_ns` has been read, because it is a second full Phase 1 on `H`.
     void record_truncated_reference(const std::vector<uint64_t>& dets, TwoPhaseProfile* prof);
