@@ -60,6 +60,14 @@ A v2 log still draws its latency figure; it simply has no component table row an
 figure. So does a v3 log written under `--no-component-stats`, which has the columns and zeros in
 them — "not measured" is read off the header, never off a column of zeros.
 
+A v4 log adds `k` — the profiler ran one independent experiment per `k`, and the solver saw only
+components of size `> k`. `--k` and `--horizons` select which of them to draw, and every v4 log in a
+run is additionally **overlaid** on one figure per `(d, p, mode)`: the solver+harvest distribution,
+one curve per `(k, T)`, which is what comparing `k` values means here. This script does not sweep
+`k` — the profiler does, and the human runs it. The size-`<= k` resolve is in none of these numbers
+and never was: it is a serial pre-pass on the critical path, outside the profiler's measurement
+scope by intent, which the caption states rather than leaves to be assumed.
+
 The same numbers also go to a text table — `latency_speedups.txt`, written into the same directory as
 the figures — so the run is readable without opening an image, and diffable between runs. `--table`
 prints that table to the terminal too.
@@ -92,6 +100,9 @@ THEMES = {
         "text_secondary": "#52514e",
         "grid": "#dcdcd8",
         "series": ("#2a78d6", "#eb6834"),
+        # The `k` overlay's categorical slots, taken in `(k, T)` order so a run keeps its colour
+        # between figures. Cycled if a figure carries more runs than there are slots.
+        "k_series": ("#2a78d6", "#eb6834", "#2f8f5b", "#8a5cd6", "#c0a02c", "#4a4a46"),
     },
     "dark": {
         "surface": "#1a1a19",
@@ -99,11 +110,13 @@ THEMES = {
         "text_secondary": "#c3c2b7",
         "grid": "#3a3a37",
         "series": ("#3987e5", "#d95926"),
+        "k_series": ("#3987e5", "#d95926", "#3f9e69", "#9a6ee0", "#cfae37", "#9a9a90"),
     },
 }
 
 STOCK_LABEL = "stock decode on G"
 SPARSE_LABEL = "stock decode on sparsified H"
+SOLVE_HARVEST_LABEL = "solver + harvest, on the components of size > k"
 
 # Rows are parsed in blocks of this many, so the transient cost of a read is set by the block and not
 # by the length of the campaign. Big enough that the per-block overhead is lost in the parse, small
@@ -113,7 +126,7 @@ CHUNK_ROWS = 100_000
 # Latency schemas this script reads. v1 logged one pre-summed `sparse_ns` column and no stage split,
 # so it cannot be re-read under the definition in `series_of`; v2 is the stage split; v3 adds the
 # component columns, which are optional here — a v2 log still draws, without the component panels.
-LATENCY_SCHEMAS = ("two_phase_latency_v2", "two_phase_latency_v3")
+LATENCY_SCHEMAS = ("two_phase_latency_v2", "two_phase_latency_v3", "two_phase_latency_v4")
 COMPONENT_SCHEMA = "two_phase_components_v1"
 
 # The only columns any series needs. Everything else in the row — `shot`, `defects`, `certified`,
@@ -167,10 +180,27 @@ class Log:
 
     @property
     def title(self):
+        k = self.meta.get("k")
+        k_part = f",  k = {k}" if k is not None else ""
         return (
             f"d = {self.meta.get('d', '?')},  p = {self.meta.get('p', '?')},  "
-            f"T = {self.meta.get('T', '?')},  isect = {self.meta.get('mode', '?')}"
+            f"T = {self.meta.get('T', '?')}{k_part},  isect = {self.meta.get('mode', '?')}"
         )
+
+    @property
+    def k(self):
+        """The run's `k`, or None on a pre-v4 log — which is not the same statement as `k = 0`."""
+        try:
+            return int(self.meta["k"])
+        except (KeyError, ValueError):
+            return None
+
+    @property
+    def horizon(self):
+        try:
+            return float(self.meta["T"])
+        except (KeyError, ValueError):
+            return None
 
     @property
     def stem(self):
@@ -221,6 +251,42 @@ def load(path):
         raise ValueError(f"{path}: has some component columns but not {', '.join(absent)}")
     has_components = len(present) == len(COMPONENT_NEEDED) and meta.get("component_stats") != "0"
     return Log(path, meta, columns, has_components)
+
+
+def parse_number_list(text, cast):
+    """`--k 0,2,4` / `--horizons 1.5,2.0` as a set, or None when the flag was not given.
+
+    None and the empty set are deliberately different: "no filter" and "a filter nothing passes"
+    are different requests, and an empty `--k ,` is a typo worth reporting rather than a silent
+    run that plots nothing.
+    """
+    if text is None:
+        return None
+    values = set()
+    for item in text.split(","):
+        item = item.strip()
+        if not item:
+            continue
+        try:
+            values.add(cast(item))
+        except ValueError:
+            raise ValueError(f"cannot read {item!r} as a {cast.__name__}") from None
+    if not values:
+        raise ValueError(f"no values in {text!r}")
+    return values
+
+
+def selected(log, wanted_k, wanted_T):
+    """Whether a log passes `--k` / `--horizons`.
+
+    A pre-v4 log has no `k` at all, and `--k` therefore excludes it: it was written before `k`
+    existed, so claiming it is any particular `k` would be inventing the label.
+    """
+    if wanted_k is not None and log.k not in wanted_k:
+        return False
+    if wanted_T is not None and log.horizon not in wanted_T:
+        return False
+    return True
 
 
 def collect(paths):
@@ -312,6 +378,149 @@ def series_of(log, include_contaminated, include_excluded):
     sparse = np.concatenate(sparse_chunks) if sparse_chunks else empty
     sparse_chunks.clear()
     return stock, sparse, escalated, dropped, components
+
+
+def solve_harvest_series(log, include_contaminated):
+    """`blossom_ns + hrvst_ns` per shot, in microseconds — the figure of merit `k` moves.
+
+    Read on its own rather than carried out of `series_of`, so that the overlay holds one campaign's
+    array at a time instead of one per log file for the whole run. The cost is a second streaming
+    pass over the logs in a group, which is a read of two integer columns and no allocation beyond
+    the block.
+
+    It is the solve on the size-`> k` graph and the harvest, and nothing else: not the dual scan,
+    not the Phase-2 re-decode on an escalating shot, and not the size-`<= k` resolve, which the
+    profiler never timed — it is a serial pre-pass outside its measurement scope.
+    """
+    names = ("contaminated", "blossom_ns", "hrvst_ns")
+    at = {name: position for position, name in enumerate(names)}
+    usecols = tuple(log.columns.index(name) for name in names)
+    chunks = []
+    dropped = 0
+    with open(log.path) as handle:
+        read_header(handle)
+        while True:
+            text = list(itertools.islice(handle, CHUNK_ROWS))
+            if not text:
+                break
+            block = np.loadtxt(text, delimiter=",", usecols=usecols, dtype=np.int64, ndmin=2)
+            del text
+            if not block.size:
+                continue
+            if include_contaminated:
+                kept = block
+            else:
+                clean = block[:, at["contaminated"]] == 0
+                dropped += int(block.shape[0] - np.count_nonzero(clean))
+                kept = block[clean]
+            del block
+            if kept.shape[0]:
+                chunks.append((kept[:, at["blossom_ns"]] + kept[:, at["hrvst_ns"]]) / 1000.0)
+    values = np.concatenate(chunks) if chunks else np.empty(0, dtype=np.float64)
+    chunks.clear()
+    return values, dropped
+
+
+def draw_k_overlay(logs, args, theme):
+    """One figure per `(d, p, mode)`: the solver+harvest distribution, one curve per `(k, T)`.
+
+    This is the comparison the `k` experiment is for, and it is an overlay rather than a sweep: the
+    profiler ran each `k` as an independent experiment and this draws the runs it was given, in
+    ascending `(k, T)` order so a curve keeps its colour and its legend position between figures.
+
+    Curves are outlines rather than fills. Two filled histograms read as a comparison; five read as
+    a stack, and the quantity being compared here is where each distribution sits, not how they
+    overlap.
+    """
+    runs = []
+    for log in logs:
+        values, dropped = solve_harvest_series(log, args.include_contaminated)
+        if values.size:
+            runs.append({"log": log, "values": values, "dropped": dropped})
+    if len(runs) < 2:
+        # One curve is the per-log figure again, drawn worse. The overlay exists to compare runs.
+        for run in runs:
+            del run["values"]
+        return []
+    runs.sort(key=lambda run: (run["log"].k if run["log"].k is not None else -1, run["log"].horizon or 0.0))
+
+    pooled_max = max(percentile(run["values"], args.x_max_percentile / 100.0) for run in runs)
+    x_max = max(pooled_max, 1.15 * max(mean_of(run["values"]) for run in runs))
+    lows = [
+        float(run["values"][run["values"] > 0].min()) if args.log_x else float(run["values"].min())
+        for run in runs
+        if run["values"].size and (not args.log_x or np.any(run["values"] > 0))
+    ]
+    low = max(min(lows), 1e-3) if lows else 1e-3
+    high = max(x_max, low * (1.0 + 1e-6))
+    edges = (
+        np.logspace(math.log10(low), math.log10(high), args.bins + 1)
+        if args.log_x
+        else np.linspace(low, high, args.bins + 1)
+    )
+
+    fig, ax = plt.subplots(figsize=(9.0, 5.0))
+    fig.patch.set_facecolor(theme["surface"])
+    ax.set_facecolor(theme["surface"])
+    palette = theme["k_series"]
+    clipped = 0
+    for index, run in enumerate(runs):
+        values = run["values"]
+        colour = palette[index % len(palette)]
+        clipped += int(np.count_nonzero(values > x_max))
+        counts, _ = np.histogram(values, bins=edges)
+        label = f"k = {run['log'].k},  T = {run['log'].meta.get('T', '?')}  ·  mean {mean_of(values):.2f} us"
+        ax.stairs(counts, edges, color=colour, linewidth=2.0, label=label, zorder=3)
+        ax.axvline(mean_of(values), color=colour, linewidth=1.2, linestyle=(0, (4, 3)), zorder=2)
+        del run["values"]
+
+    if args.log_x:
+        ax.set_xscale("log")
+    ax.set_xlim(edges[0], edges[-1])
+    ax.set_xlabel("solver + harvest, per shot (microseconds)", color=theme["text_secondary"], fontsize=10)
+    ax.set_ylabel("shots", color=theme["text_secondary"], fontsize=10)
+    if args.log_y:
+        ax.set_yscale("log")
+    ax.yaxis.set_major_formatter(FuncFormatter(lambda value, _: f"{value:,.0f}"))
+    ax.grid(axis="y", color=theme["grid"], linewidth=0.8, zorder=0)
+    ax.set_axisbelow(True)
+    for side in ("top", "right"):
+        ax.spines[side].set_visible(False)
+    for side in ("left", "bottom"):
+        ax.spines[side].set_color(theme["grid"])
+    ax.tick_params(colors=theme["text_secondary"], labelsize=9)
+
+    first = runs[0]["log"]
+    ax.set_title(
+        f"d = {first.meta.get('d', '?')},  p = {first.meta.get('p', '?')},  "
+        f"isect = {first.meta.get('mode', '?')}  ·  {SOLVE_HARVEST_LABEL}",
+        color=theme["text_primary"],
+        fontsize=13,
+        loc="left",
+        pad=14,
+    )
+    legend = ax.legend(frameon=False, loc="upper right", fontsize=9)
+    for text in legend.get_texts():
+        text.set_color(theme["text_primary"])
+
+    caption = (
+        f"{len(runs)} independent runs on the same shots, one per (k, T)  ·  "
+        f"{clipped:,} shots beyond the right edge\n"
+        "solver + harvest only: the resolve of the size <= k components runs before it, in series, on the"
+        " critical path, and is in none of these numbers —\nit is outside the profiler's measurement scope"
+        " by intent, not free and not concurrent."
+    )
+    fig.text(0.012, 0.005, caption, color=theme["text_secondary"], fontsize=8.5, va="bottom")
+    fig.tight_layout(rect=(0, 0.085, 1, 1))
+
+    stem = f"bh_by_k_d{first.meta.get('d', 'NA')}_p{first.meta.get('p', 'NA')}_{first.meta.get('mode', 'NA')}"
+    written = []
+    for extension in args.formats:
+        out_path = os.path.join(args.out_dir or os.path.dirname(first.path) or ".", f"{stem}.{extension}")
+        fig.savefig(out_path, dpi=args.dpi, facecolor=theme["surface"])
+        written.append(out_path)
+    plt.close(fig)
+    return written
 
 
 def accumulate_components(totals, kept, at):
@@ -461,10 +670,13 @@ def draw_components(log, component, args, theme):
         # where "trivial" is defined, and `H` holds no edge longer than `2T` by construction, so a
         # bar at the right edge of that panel is the overflow bin and not a longer edge.
         if kind == "size_hist":
-            ax.axvline(3.0, color=theme["text_secondary"], linewidth=1.0, linestyle=(0, (4, 3)), zorder=4)
+            # The line sits at this run's own `k`, so the panel says which components the solver was
+            # spared rather than restating a size-2 rule the run may not have used.
+            k = log.k if log.k is not None else 2
+            ax.axvline(k + 1.0, color=theme["text_secondary"], linewidth=1.0, linestyle=(0, (4, 3)), zorder=4)
             ax.annotate(
-                "size $\\leq$ 2: no solver",
-                xy=(3.0, 0.94),
+                f"size $\\leq$ {k}: no solver",
+                xy=(k + 1.0, 0.94),
                 xycoords=("data", "axes fraction"),
                 ha="left",
                 va="top",
@@ -497,16 +709,17 @@ def draw_components(log, component, args, theme):
     analysed = scalars.get("shots_with_component_stats", 0.0)
     with_defects = scalars.get("shots_with_component_defects", 0.0)
     lines = [
-        "what the prune would remove",
+        f"what the prune removes at k = {log.k}" if log.k is not None else "what the prune would remove",
         "",
         "share of H's defects",
         f"  in a component of size $\\leq$ 2  {100 * scalars.get('frac_defects_in_trivial_components', 0):>6.1f}%",
-        f"  resolvable outright            {100 * scalars.get('frac_defects_committed_trivially', 0):>6.1f}%",
+        f"  resolved off the solver        {100 * scalars.get('frac_defects_committed_trivially', 0):>6.1f}%",
         f"  left to the solver anyway      {100 * scalars.get('frac_defects_to_solver', 0):>6.1f}%",
         "",
         "share of shots with a defect",
         f"  no solve, no harvest at all    {100 * scalars.get('solver_set_empty_rate', 0):>6.1f}%",
         "",
+        f"defects resolved per shot        {scalars.get('mean_defects_resolved_small', 0):>6.2f}",
         f"components per shot              {scalars.get('mean_components', 0):>6.2f}",
         f"largest, mean over shots         {scalars.get('mean_largest_component_size', 0):>6.2f}",
         f"largest, over the campaign       {scalars.get('max_component_size', 0):>6.0f}",
@@ -514,8 +727,8 @@ def draw_components(log, component, args, theme):
         "",
         f"{analysed:,.0f} shots analysed, {with_defects:,.0f} with a defect",
     ]
-    # Sized so the block cannot reach the caption: sixteen lines at this size and spacing are shorter
-    # than the cell, which a figure with a longer caption or a taller font would not be.
+    # Sized so the block cannot reach the caption: seventeen lines at this size and spacing are
+    # shorter than the cell, which a figure with a longer caption or a taller font would not be.
     summary_ax.text(
         0.0,
         1.0,
@@ -701,6 +914,13 @@ def draw(log, args, theme):
         f"{clipped:,} beyond the right edge\n{excluded_note}  ·  "
         f"timer {log.meta.get('timer_backend', '?')}"
         f"{'' if log.meta.get('timer_thread_scoped') == '1' else ' (WALL CLOCK)'}"
+        + (
+            ""
+            if log.k is None
+            else f"\nk = {log.k}: the solver saw only components of size > k. The size-<= k resolve"
+            " runs before it, in series, and is in neither series here — outside the profiler's"
+            " measurement scope by intent."
+        )
     )
     fig.text(0.012, 0.005, caption, color=theme["text_secondary"], fontsize=8.5, va="bottom")
     fig.tight_layout(rect=(0, 0.075, 1, 1))
@@ -730,17 +950,19 @@ def table_lines(results, args):
     without the two drifting apart.
     """
     lines = [
-        f"{'d':>4} {'p':>8} {'T':>5} {'mode':>7} {'shots':>8} "
+        f"{'d':>4} {'p':>8} {'T':>5} {'k':>3} {'mode':>7} {'shots':>8} "
         f"{'stock mean':>11} {'sparse mean':>12} {'stock max':>10} {'sparse max':>11} "
         f"{'speedup':>9} {'escal':>7} {'contam':>7}"
     ]
     for result in results:
-        meta = result["log"].meta
+        log = result["log"]
+        meta = log.meta
         stock = result["stock"]
         sparse = result["sparse"]
         ratio = stock["mean"] / sparse["mean"] if sparse["mean"] else float("nan")
         lines.append(
             f"{meta.get('d', '?'):>4} {meta.get('p', '?'):>8} {meta.get('T', '?'):>5} "
+            f"{'-' if log.k is None else log.k:>3} "
             f"{meta.get('mode', '?'):>7} {stock['n']:>8,} "
             f"{stock['mean']:>11.3f} {sparse['mean']:>12.3f} "
             f"{stock['max']:>10.3f} {sparse['max']:>11.3f} {ratio:>9.2f} "
@@ -762,6 +984,13 @@ def table_lines(results, args):
         " shots. Ball\n  intersect, H build and Mwpm(H) build are not charged (--include-excluded"
         " adds them back)."
     )
+    if any(result["log"].k is not None for result in results):
+        lines.append(
+            "  `k`: the solver saw only components of size > k; sizes 1..k were resolved exactly off"
+            " it. That\n  resolve is a serial pre-pass on the critical path and is in none of these"
+            " numbers — the profiler\n  scoped its measurement to the solver and the harvest, and"
+            " left the resolve to be measured separately.\n  `-` is a log written before k existed."
+        )
     if args.include_contaminated:
         lines.append("  Contaminated shots were KEPT in both series (--include-contaminated).")
     lines.extend(component_table_lines(results))
@@ -784,25 +1013,28 @@ def component_table_lines(results):
         "",
         "Component structure of H — same uncontaminated shots as above. `triv` is the share of H's"
         " defects in a",
-        "component of size <= 2; `solver` is the share a size <= 2 resolver would still have had to"
-        " hand over;",
-        "`no solve` is the share of shots with at least one defect where it would have had to hand"
-        " over nothing,",
-        "so the Mwpm(H) build, the solve and the harvest would not have run at all. Structural, and"
-        " untimed.",
+        "component of size <= 2, which is a fixed size class and not this run's k; `solver` is the"
+        " share the",
+        "resolver at this run's k had to hand over; `no solve` is the share of shots with at least"
+        " one defect",
+        "where it handed over nothing, so the Mwpm(H) build, the solve and the harvest did not run at"
+        " all.",
+        "Structural, and measured outside every timed window.",
         "",
-        f"{'d':>4} {'p':>8} {'T':>5} {'mode':>7} {'shots':>8} "
+        f"{'d':>4} {'p':>8} {'T':>5} {'k':>3} {'mode':>7} {'shots':>8} "
         f"{'comps':>7} {'single':>7} {'pairs':>7} {'nontriv':>8} "
         f"{'largest':>8} {'max':>5} {'triv':>7} {'solver':>7} {'no solve':>9}",
     ]
     for result in rows:
-        meta = result["log"].meta
+        log = result["log"]
+        meta = log.meta
         totals = result["components"]
         shots = totals["shots"] or 1
         defects = totals["h_defects"] or 1
         with_defects = totals["shots_with_defects"] or 1
         lines.append(
             f"{meta.get('d', '?'):>4} {meta.get('p', '?'):>8} {meta.get('T', '?'):>5} "
+            f"{'-' if log.k is None else log.k:>3} "
             f"{meta.get('mode', '?'):>7} {totals['shots']:>8,} "
             f"{totals['components'] / shots:>7.2f} "
             f"{totals['singleton_components'] / shots:>7.2f} "
@@ -900,6 +1132,27 @@ def main():
         help="skip the component-structure figure drawn from each log's companion components_*.csv;"
         " the component table stays, since it comes from the per-shot rows",
     )
+    parser.add_argument(
+        "--k",
+        metavar="LIST",
+        help="comma-separated k values to draw, e.g. 0,2,4; logs at any other k are skipped."
+        " Selection only — this script does not sweep k, the profiler runs one experiment per k and"
+        " writes one log each (default: draw every log given)",
+    )
+    parser.add_argument(
+        "--horizons",
+        "--T",
+        dest="horizons",
+        metavar="LIST",
+        help="comma-separated T values to draw; logs at any other T are skipped (default: all)",
+    )
+    parser.add_argument(
+        "--no-k-overlay",
+        dest="k_overlay",
+        action="store_false",
+        help="skip the per-(d, p, mode) figure that overlays the solver+harvest distribution of every"
+        " (k, T) run given, which is how k values are compared",
+    )
     parser.add_argument("--theme", choices=sorted(THEMES), default="light")
     parser.add_argument("--table", action="store_true", help="print the summary table to stdout as well")
     parser.add_argument(
@@ -910,6 +1163,12 @@ def main():
     )
     args = parser.parse_args()
     args.formats = [item.strip() for item in args.formats.split(",") if item.strip()]
+    try:
+        wanted_k = parse_number_list(args.k, int)
+        wanted_T = parse_number_list(args.horizons, float)
+    except ValueError as error:
+        print(f"  {error}")
+        return 1
 
     files = collect(args.paths)
     if not files:
@@ -920,18 +1179,26 @@ def main():
 
     theme = THEMES[args.theme]
     results = []
+    overlay_groups = {}
     for path in files:
         # `draw` is inside the same guard as `load`, because with the rows streamed rather than
         # pre-parsed a malformed row is first seen while the figure is being built. One bad file
         # still costs the run one file.
         try:
             log = load(path)
+            # Selection happens after the header is read and before anything is drawn, so a log is
+            # skipped by what it says it is rather than by what its filename looks like.
+            if not selected(log, wanted_k, wanted_T):
+                continue
             result = draw(log, args, theme)
         except (OSError, ValueError, KeyError) as error:
             print(f"  skipping {path}: {error}")
             continue
         if result is None:
             continue
+        if log.k is not None:
+            key = (log.meta.get("d"), log.meta.get("p"), log.meta.get("mode"))
+            overlay_groups.setdefault(key, []).append(log)
         results.append(result)
         for out_path in result["written"]:
             print(f"  wrote {out_path}")
@@ -953,6 +1220,17 @@ def main():
     if not results:
         print("  nothing plotted.")
         return 1
+
+    # The `k` comparison, drawn last because it re-reads the logs of a group and holds one campaign's
+    # series at a time rather than every campaign's at once.
+    if args.k_overlay:
+        for key in sorted(overlay_groups, key=lambda item: tuple(str(part) for part in item)):
+            try:
+                for out_path in draw_k_overlay(overlay_groups[key], args, theme):
+                    print(f"  wrote {out_path}")
+            except (OSError, ValueError, KeyError) as error:
+                print(f"  skipping the k overlay for d={key[0]} p={key[1]} {key[2]}: {error}")
+
     for out_path in write_tables(results, args):
         print(f"  wrote {out_path}")
     if args.table:

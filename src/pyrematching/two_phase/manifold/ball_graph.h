@@ -15,6 +15,7 @@
 #ifndef PYREMATCHING_TWO_PHASE_MANIFOLD_BALL_GRAPH_H
 #define PYREMATCHING_TWO_PHASE_MANIFOLD_BALL_GRAPH_H
 
+#include <array>
 #include <cstdint>
 #include <vector>
 
@@ -133,20 +134,29 @@ struct BallComponents {
 /// already far outside the distribution the statistic is for.
 inline constexpr uint32_t MAX_DIAMETER_COMPONENT_SIZE = 32;
 
-/// §A's trivial-component prune: the union-find over `H`, the per-component verdict, and the
-/// induced sub-`H` that the solver is actually handed.
+/// §A's k-component prune: the union-find over `H`, the per-component verdict, and the induced
+/// sub-`H` that the solver is actually handed.
 ///
 /// This is **decode state**, not the profiling decomposition above. `BallComponents` builds the
 /// full adjacency, the member blocks and the Dijkstra scratch that the §C statistics walk; this
-/// builds only what §A.3 reads — a root per node, a size per root, and the one edge of every
-/// two-member component — because it runs on the shot's own path. The two are deliberately not
-/// shared: §C is computed for every shot whether or not the prune is enabled, and after the timed
-/// window has closed, while this runs inside it.
+/// builds only what the small-component resolver reads — a root per node, a size per root, and the
+/// members and internal edges of every component small enough to resolve — because it runs on the
+/// shot's own path. The two are deliberately not shared: §C is computed for every shot whether or
+/// not the prune is enabled, and after the timed window has closed, while this runs inside it.
 ///
-/// No timer is started anywhere in the routines that fill this and none may be added: the prune is
-/// assumed free (hardware-offloadable), and the latency account of this experiment is the solver
-/// and the harvest running on a smaller node set.
+/// No timer is started anywhere in the routines that fill this and none may be added. That is a
+/// **measurement scope** and not a claim about cost: the prune and the resolve are a serial
+/// pre-pass on the critical path, deliberately outside what this branch reports, which is the
+/// solver and the harvest running on the size-`> k` graph.
 struct BallPrune {
+    /// The largest component the small-component resolver is defined for. `k` is capped at this at
+    /// construction; the resolver enumerates pairings-with-boundary-fill and nothing above 4 has a
+    /// resolver.
+    static constexpr uint32_t MAX_SMALL_COMPONENT_SIZE = 4;
+    /// A component of `MAX_SMALL_COMPONENT_SIZE` members holds at most `C(4, 2)` internal `H`
+    /// edges, so the per-component edge block is fixed-width and needs no sizing pass.
+    static constexpr uint32_t MAX_SMALL_COMPONENT_EDGES = 6;
+
     /// Union-find parent while the unions run; the root of each `H`-node afterwards. Every link
     /// points at a **smaller** index, so a set's root is its minimum member and components
     /// enumerate in ascending root order without a sort (§0 determinism).
@@ -154,11 +164,17 @@ struct BallPrune {
     /// Size of the component rooted at an `H`-node. Only meaningful at a root, which is the only
     /// place it is read.
     std::vector<uint32_t> component_size;
-    /// Index into `BallGraph::edges` of the single edge joining a two-member component, stored at
-    /// that component's root; `NO_PAIR_EDGE` everywhere else. `H` holds each undirected pair once,
-    /// so a two-member component has exactly one.
-    std::vector<uint32_t> pair_edge;
-    /// §A.3's verdict for the component rooted at an `H`-node, as a `TrivialVerdict`. Only
+    /// The members of every component of size `<= MAX_SMALL_COMPONENT_SIZE`, ascending, stored at
+    /// that component's root; `small_member_count` is how many, and equals `component_size` there.
+    /// Untouched at a non-root and at the root of a larger component, which is why the count is
+    /// what decides whether the block means anything.
+    std::vector<std::array<uint32_t, MAX_SMALL_COMPONENT_SIZE>> small_members;
+    std::vector<uint8_t> small_member_count;
+    /// Indices into `BallGraph::edges` of the edges internal to such a component, ascending, stored
+    /// at its root. `H` holds each undirected pair once, so every internal edge appears once.
+    std::vector<std::array<uint32_t, MAX_SMALL_COMPONENT_EDGES>> small_edges;
+    std::vector<uint8_t> small_edge_count;
+    /// The resolver's verdict for the component rooted at an `H`-node, as a `SmallVerdict`. Only
     /// meaningful at a root; the second pass spreads it to the members.
     std::vector<uint8_t> verdict;
     /// 1 for the `H`-nodes the solver still has to take (§A.4's SOLVER set).
@@ -174,7 +190,6 @@ struct BallPrune {
     /// After a warmup shot this must stop increasing (invariant 7).
     uint64_t grow_events{0};
 
-    static constexpr uint32_t NO_PAIR_EDGE = UINT32_MAX;
     static constexpr uint32_t NOT_IN_SOLVER = UINT32_MAX;
 
     void clear();
@@ -185,8 +200,9 @@ struct BallPrune {
 /// components the solver keeps apart.
 ///
 /// Leaves `component_of` pointing every node straight at its root, `component_size` filled at the
-/// roots, and `pair_edge` naming the one edge of each two-member component. `verdict` is sized and
-/// zeroed for the caller to fill.
+/// roots, and the members and internal edges of every component of size
+/// `<= MAX_SMALL_COMPONENT_SIZE` gathered at its root. `verdict` is sized and zeroed for the caller
+/// to fill.
 void compute_prune_components(const BallGraph& graph, BallPrune& prune);
 
 /// §A.4. Fills `prune.solver_graph` with the sub-graph of `H` induced on the nodes flagged in

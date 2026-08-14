@@ -131,8 +131,7 @@ TwoPhaseDecoder TwoPhaseDecoder::from_detector_error_model(
         ball_config.collect_harvest_diagnostics = config.collect_harvest_diagnostics;
         ball_config.collect_structural_counters = config.collect_structural_counters;
         ball_config.collect_component_stats = config.collect_component_stats;
-        ball_config.prune_trivial_components = config.prune_trivial_components;
-        ball_config.trivial_component_max_size = config.trivial_component_max_size;
+        ball_config.prune_component_max_size = config.prune_component_max_size;
         ball_config.skip_negative_weight_preamble_when_positive = config.skip_negative_weight_preamble_when_positive;
         decoder.ball =
             std::make_unique<BallDecoder>(BallDecoder::from_mwpm(std::move(g_mwpm), ball_config, ball_artifact_path));
@@ -224,6 +223,10 @@ void TwoPhaseDecoder::copy_phase1_stats(const Phase1Outcome& outcome, TwoPhasePr
         prof->certified = ball_profile.certified;
         prof->h_no_perfect_matching = ball_profile.h_no_perfect_matching;
         prof->max_dual_at_completion = ball_profile.max_dual_at_completion;
+        // §A's run label. Not a latency: the resolve is a serial pre-pass excluded from the stages
+        // above by measurement scope.
+        prof->prune_component_max_size = ball_profile.prune_component_max_size;
+        prof->defects_resolved_small = ball_profile.defects_resolved_small;
     }
 }
 

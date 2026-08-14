@@ -94,31 +94,30 @@ struct BallConfig {
     /// through the cache.
     bool collect_component_stats{false};
 
-    /// §A — decompose `H` into connected components, resolve the trivial ones (size 1 and 2)
-    /// directly off the ball tables, and hand the solver only the remainder.
+    /// §A — `k`: the largest connected component of `H` the small-component resolver takes. The
+    /// solver sees only components of size `> k`; components of size `<= k` are resolved exactly,
+    /// off the solver, before it runs.
     ///
     /// Components are disconnected by construction — no `H` edge crosses one, and the boundary is
     /// not a node, so it joins nothing — which means the timeline on `H` factorises over them.
     /// Removing a component the resolver has already settled therefore cannot change the solve on
-    /// what is left, and §A.3's strict inequalities keep the resolved set to the components whose
-    /// outcome is unambiguous and strictly inside the horizon. Everything else, ties and exact-`T`
-    /// events included, still goes to the solver.
+    /// what is left. The resolver is exact for weight and observable at every `k <= 4`: it
+    /// enumerates defect-pairings-with-boundary-fill under `H`'s own `<=` cutoffs and takes the
+    /// minimum, breaking ties deterministically. Nothing routes to the solver except by being size
+    /// `> k`; a component with no feasible matching becomes a residual and the shot escalates.
     ///
-    /// The output is unchanged on every shot and so is the set of shots that escalate; what moves
-    /// is `blossom_on_h_ns` and `harvest_ns`, which run on a smaller node set — and, when every
-    /// component resolves trivially, do not run at all (§A.4).
+    /// `k = 0` resolves nothing and restores the un-pruned production path exactly, which is the
+    /// oracle the A/B is run against. `k = 2` is the previous branch's production behaviour.
+    /// **Capped at 4** — no resolver is defined above that — and rejected at construction above it.
+    ///
+    /// What moves with `k` is `blossom_on_h_ns` and `harvest_ns`, which run on a smaller node set —
+    /// and, when every component resolves, do not run at all (§A.4).
     ///
     /// **Production path only.** The two verification entry points (`decode_phase1`,
     /// `decode_phase1_to_match_edges`) ignore this and always solve the whole of `H`: they are what
     /// §M2.6 level 1 and §M3.3 X8 compare against, and pruning what the oracle sees would defeat
-    /// them. Turning the flag off restores the current production path exactly, which is what the
-    /// A/B is run against.
-    bool prune_trivial_components{true};
-    /// The largest component the resolver will attempt. **A resolver exists for sizes 1 and 2
-    /// only**, and larger components go to the solver whatever this says (§A.3); the knob is here
-    /// so that a future exact brute-forcer for small components has somewhere to be enabled from,
-    /// and so that the resolver can be narrowed to singletons for an A/B.
-    int trivial_component_max_size{2};
+    /// them.
+    int prune_component_max_size{2};
 
     /// §B — skip the §M2.1 negative-weight preamble on `G` when the DEM has no negative-weight
     /// edge, which is the overwhelmingly common case (`log((1-p)/p) > 0` for `p < 0.5`).
@@ -150,17 +149,21 @@ struct CommittedPair {
     static constexpr uint64_t NO_BALL_ENTRY = UINT64_MAX;
 };
 
-/// What §A.3's resolver did with the shot, in counts. Not a latency measurement and not derived
-/// from one: these are the branch tallies the combine step of §A.5 needs, plus the two harvest
-/// counters the trivial commits belong in.
-struct TrivialCommitCounts {
-    /// Components that resolved to a residual — a singleton whose boundary sits past the horizon,
-    /// or that has no boundary within `R` at all. Non-zero forces escalation (§A.5).
+/// What the small-component resolver did with the shot, in counts. Not a latency measurement and
+/// not derived from one: these are the branch tallies the combine step of §A.5 needs, plus the two
+/// harvest counters the off-solver commits belong in.
+struct SmallCommitCounts {
+    /// Components of size `<= k` with no feasible pairing-with-boundary-fill at all — an odd
+    /// component with no legal boundary, or a "star" whose far members cannot pair. Non-zero forces
+    /// escalation (§A.5).
     int residual{0};
-    /// Trivially committed pairs and boundary matches, mirrored into `HarvestResult`'s own counters
-    /// so that the profile's commit tallies still add up to the shot's defect count.
+    /// Committed pairs and boundary matches, mirrored into `HarvestResult`'s own counters so that
+    /// the profile's commit tallies still add up to the shot's defect count.
     int pairs{0};
     int boundary{0};
+    /// Defects the resolver settled off the solver this shot: the members of every committed
+    /// component, over **all** sizes `1..k` and not merely the sizes above the previous branch's 2.
+    int defects_resolved{0};
 };
 
 /// What §M3.4's production Phase 1 yielded.
@@ -282,10 +285,10 @@ struct BallDecoder {
     std::vector<uint64_t> h_dets_scratch;
     mutable std::vector<uint64_t> sort_scratch;
     std::vector<pm::CompressedEdge> match_edge_scratch;
-    /// §A.3's committed pairs, in `G`'s detector ids — the trivial resolver's contribution to the
-    /// match-edge flavours. Cleared every shot, and cleared again on an escalating one, where §A.5
-    /// discards Phase 1 in full.
-    std::vector<CommittedPair> trivial_pairs;
+    /// §A's committed pairs, in `G`'s detector ids — the small-component resolver's contribution to
+    /// the match-edge flavours. Cleared every shot, and cleared again on an escalating one, where
+    /// §A.5 discards Phase 1 in full.
+    std::vector<CommittedPair> resolved_pairs;
     /// The graph the last solve actually ran on: the whole of `H`, or §A.4's sub-`H`. Everything
     /// that maps a solver index back to a detector id reads it, so that the two cases go through
     /// one path.
@@ -298,20 +301,22 @@ struct BallDecoder {
     /// verification entry points always harvest in full, the production ones branch on the status.
     ///
     /// `allow_prune` is what keeps §A off the verification path: only the production entry points
-    /// pass true, and even they defer to `BallConfig::prune_trivial_components`.
+    /// pass true, and even they defer to `BallConfig::prune_component_max_size`.
     template <typename HarvestOnH>
     Phase1Outcome decode_impl(
         const std::vector<uint64_t>& dets, BallProfile* prof, bool allow_prune, const HarvestOnH& harvest_on_h);
-    /// §A.3's trivial resolver, run over every component of `h`, and §A.4's induced sub-graph.
+    /// §A's small-component resolver, run over every component of `h` of size `<= k`, and §A.4's
+    /// induced sub-graph over what is left.
     ///
     /// Returns the graph the solver should be handed: the sub-`H` over the SOLVER set, or `h`
     /// itself when nothing was resolved away (in which case no copy is made). Accumulates the
-    /// trivially committed observables and weight into `trivial`, the committed pairs into
-    /// `trivial_pairs`, and counts the components that survive past the horizon.
+    /// committed observables and weight into `resolved`, the committed pairs into `resolved_pairs`,
+    /// and counts the components with no feasible matching.
     ///
-    /// **Untimed by construction** — no timer is started here and none may be added.
-    const BallGraph& resolve_trivial_components(
-        const BallGraph& h, pm::MatchingResult& trivial, TrivialCommitCounts& counts);
+    /// **Untimed by construction** — no timer is started here and none may be added. It is a serial
+    /// pre-pass on the critical path, outside this branch's reported latency by scope.
+    const BallGraph& resolve_small_components(
+        const BallGraph& h, pm::MatchingResult& resolved, SmallCommitCounts& counts);
     /// Turns harvest's `CompressedEdge`s over the solved graph into `CommittedPair`s over `G`, ball
     /// entry and all, and merges in §A's trivially committed pairs. Shared by the verification and
     /// production match-edge entry points.

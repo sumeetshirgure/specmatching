@@ -96,9 +96,11 @@ uint64_t component_capacity(const BallComponents& c) {
 /// The prune buffers' total capacity, used exactly as the two above are: compared before and after
 /// a prune to notice that it had to allocate.
 uint64_t prune_capacity(const BallPrune& p) {
-    return p.component_of.capacity() + p.component_size.capacity() + p.pair_edge.capacity() + p.verdict.capacity() +
-           p.node_to_solver.capacity() + p.h_to_solver.capacity() + p.solver_graph.h_to_det.capacity() +
-           p.solver_graph.edges.capacity() + p.solver_graph.boundary_edges.capacity();
+    return p.component_of.capacity() + p.component_size.capacity() + p.small_members.capacity() +
+           p.small_member_count.capacity() + p.small_edges.capacity() + p.small_edge_count.capacity() +
+           p.verdict.capacity() + p.node_to_solver.capacity() + p.h_to_solver.capacity() +
+           p.solver_graph.h_to_det.capacity() + p.solver_graph.edges.capacity() +
+           p.solver_graph.boundary_edges.capacity();
 }
 
 }  // namespace
@@ -120,7 +122,10 @@ void BallComponents::clear() {
 void BallPrune::clear() {
     component_of.clear();
     component_size.clear();
-    pair_edge.clear();
+    small_members.clear();
+    small_member_count.clear();
+    small_edges.clear();
+    small_edge_count.clear();
     verdict.clear();
     node_to_solver.clear();
     h_to_solver.clear();
@@ -323,8 +328,9 @@ void build_ball_graph(
 }
 
 void compute_prune_components(const BallGraph& graph, BallPrune& p) {
-    // No timer here, and none may be added (hard constraint 1): the prune is assumed free, and the
-    // only latency numbers this experiment moves are the solver's and the harvest's.
+    // No timer here, and none may be added (hard constraint 1). The union-find runs in series on
+    // the shot's critical path; it is outside this branch's reported latency by measurement scope,
+    // which is the solver and the harvest on the size-`> k` graph, and not because it is free.
     uint64_t capacity_before = prune_capacity(p);
     uint32_t n = (uint32_t)graph.num_nodes();
 
@@ -353,15 +359,31 @@ void compute_prune_components(const BallGraph& graph, BallPrune& p) {
     for (uint32_t i = 0; i < n; i++)
         p.component_size[p.component_of[i]]++;
 
-    // The one edge of every two-member component, found in the pass that is already walking the
-    // edges rather than by building an adjacency the prune has no other use for.
-    p.pair_edge.assign(n, BallPrune::NO_PAIR_EDGE);
+    // The members and the internal edges of every component the resolver can attempt, gathered at
+    // its root. Both blocks are fixed-width — a component of at most `MAX_SMALL_COMPONENT_SIZE`
+    // members holds at most `C(4, 2)` edges — so this is two passes and no sizing pass, and the
+    // adjacency the §C statistics build is not needed on the decode path at all.
+    //
+    // `i` and `e` ascend, so each block is filled in ascending `H`-node and ascending edge order
+    // for free, which is what makes the resolver's enumeration a function of `H` alone (§0).
+    p.small_members.assign(n, {});
+    p.small_member_count.assign(n, 0);
+    p.small_edges.assign(n, {});
+    p.small_edge_count.assign(n, 0);
+    for (uint32_t i = 0; i < n; i++) {
+        uint32_t root = p.component_of[i];
+        if (p.component_size[root] > BallPrune::MAX_SMALL_COMPONENT_SIZE)
+            continue;
+        p.small_members[root][p.small_member_count[root]++] = i;
+    }
     for (uint32_t e = 0; e < (uint32_t)graph.edges.size(); e++) {
         uint32_t root = p.component_of[graph.edges[e].i];
-        if (p.component_size[root] != 2)
+        if (p.component_size[root] > BallPrune::MAX_SMALL_COMPONENT_SIZE)
             continue;
-        assert(p.pair_edge[root] == BallPrune::NO_PAIR_EDGE && "a two-member component with two H edges");
-        p.pair_edge[root] = e;
+        assert(
+            p.small_edge_count[root] < BallPrune::MAX_SMALL_COMPONENT_EDGES &&
+            "a small component holds more edges than a complete graph on its members has");
+        p.small_edges[root][p.small_edge_count[root]++] = e;
     }
 
     p.verdict.assign(n, 0);

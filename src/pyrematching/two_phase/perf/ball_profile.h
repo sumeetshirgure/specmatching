@@ -143,6 +143,19 @@ struct BallProfile {
     int solve_dependent_depth{0};
     int solve_events{0};
 
+    /// §A's run label: the `k` this shot decoded at — the solver saw only components of size
+    /// `> k` — and how many of `H`'s defects the small-component resolver settled off the solver.
+    ///
+    /// Both are labels on the latency fields above and neither is one: the resolve is a serial
+    /// pre-pass on the critical path, excluded from `blossom_on_h_ns`, `harvest_ns` and `total_ns`
+    /// by measurement scope, to be measured and optimised separately.
+    ///
+    /// `defects_resolved_small` counts the members of every committed component over **all** sizes
+    /// `1..k`, so it is the resolver's whole load and not the increment over some other `k`. It is
+    /// what the resolver settled, reported even on a shot that then escalated and discarded it.
+    int prune_component_max_size{0};
+    int defects_resolved_small{0};
+
     /// §C.1's component structure of this shot's `H`. Filled by
     /// `BallDecoder::analyze_last_shot_components`, which runs **after** `total_ns` has been read
     /// and is timed by nothing: the component work is assumed free (hardware-offloadable), so it is

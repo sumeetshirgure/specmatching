@@ -244,6 +244,13 @@ struct TwoPhaseProfile {
     /// `components.measured == 0`, unless `collect_component_stats` is on and Phase 1 ran on `H`.
     ComponentStats components;
 
+    /// §A's run label, mirrored off `BallProfile`: the `k` this shot decoded at, and the defects the
+    /// small-component resolver settled off the solver. Labels on the latency fields above, never
+    /// latency themselves — the resolve is a serial pre-pass excluded from them by measurement
+    /// scope. See `BallProfile` for what `defects_resolved_small` counts.
+    int prune_component_max_size{0};
+    int defects_resolved_small{0};
+
     /// `Sum_S y_S <= exact optimum`. Zero on an escalating shot: the truncated dual is discarded
     /// along with the rest of Phase 1's partial result, so there is nothing to certify against.
     pm::total_weight_int dual_sum_at_truncation{0};
@@ -405,6 +412,15 @@ struct TwoPhaseAggregateStats {
     uint64_t max_component_diameter_wint{0};
     ComponentHistograms component_hist;
 
+    /// §A's run label. `k` is a property of the campaign rather than of a shot, so it is recorded
+    /// rather than summed — the last shot folded in wins, and pooling two campaigns decoded at
+    /// different `k` is a category error the reader has to avoid. `-1` until a shot is accumulated,
+    /// which is not the same statement as `0` (a run that resolved nothing off the solver).
+    int prune_component_max_size{-1};
+    /// Defects the resolver settled off the solver, summed over every accumulated shot. Not a
+    /// latency: the resolve is a serial pre-pass outside the reported stages by scope.
+    uint64_t sum_defects_resolved_small{0};
+
     void reset() {
         *this = TwoPhaseAggregateStats();
     }
@@ -470,6 +486,10 @@ struct TwoPhaseAggregateStats {
         sum_exposed_root_blossoms += (uint64_t)profile.exposed_root_blossoms;
         if (profile.exposed_root_blossoms > 0)
             shots_with_exposed_root_blossoms++;
+
+        // §A. `k` labels the campaign; the defect count is the resolver's load over it.
+        prune_component_max_size = profile.prune_component_max_size;
+        sum_defects_resolved_small += (uint64_t)profile.defects_resolved_small;
 
         const ComponentStats& components = profile.components;
         if (components.measured) {
@@ -596,6 +616,16 @@ struct TwoPhaseSummary {
     double solver_set_empty_rate{0};
     double trivial_residual_rate{0};
 
+    /// §A's run label. `k` is what the campaign decoded at — the solver saw only components of size
+    /// `> k` — and `mean_defects_resolved_small` is how many of `H`'s defects the small-component
+    /// resolver settled off the solver per shot, over every shot, sizes `1..k` included.
+    ///
+    /// Neither is a latency. The resolve is a serial pre-pass on the critical path, excluded from
+    /// the latency this summary reports by measurement scope, to be measured separately. `k = -1`
+    /// means no shot was accumulated, which is not the same statement as `k = 0`.
+    int prune_component_max_size{-1};
+    double mean_defects_resolved_small{0};
+
     /// §C.2's distributions, copied out of the accumulator so `summarize` is the one place a
     /// consumer has to look. See `ComponentHistograms` for the binning; `weight_hist_bins_per_T` is
     /// carried alongside so a plot can label the axis without restating the convention.
@@ -697,6 +727,10 @@ inline TwoPhaseSummary summarize(const TwoPhaseAggregateStats& stats) {
         summary.frac_defects_committed_trivially = (double)stats.sum_defects_committed_trivially / defects;
         summary.frac_defects_residual_trivially = (double)stats.sum_defects_residual_trivially / defects;
     }
+    // §A's run label. Over every shot, not only the analysed ones: the resolver ran on all of them,
+    // and `collect_component_stats` has nothing to do with whether it did.
+    summary.prune_component_max_size = stats.prune_component_max_size;
+    summary.mean_defects_resolved_small = (double)stats.sum_defects_resolved_small / shots;
     summary.component_size_hist = stats.component_hist.size_hist;
     summary.component_diameter_hist = stats.component_hist.diameter_hist;
     summary.h_degree_hist = stats.component_hist.degree_hist;

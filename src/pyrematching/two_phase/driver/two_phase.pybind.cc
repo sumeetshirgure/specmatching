@@ -98,6 +98,11 @@ py::dict summary_to_dict(const TwoPhaseSummary& summary) {
     out["frac_defects_residual_trivially"] = summary.frac_defects_residual_trivially;
     out["solver_set_empty_rate"] = summary.solver_set_empty_rate;
     out["trivial_residual_rate"] = summary.trivial_residual_rate;
+    // §A's run label: the `k` the campaign decoded at, and the resolver's per-shot load at it.
+    // Neither is a latency — the resolve is a serial pre-pass excluded from the reported stages by
+    // measurement scope — and `k = -1` means no shot was accumulated rather than `k = 0`.
+    out["prune_component_max_size"] = summary.prune_component_max_size;
+    out["mean_defects_resolved_small"] = summary.mean_defects_resolved_small;
     // The three weight histograms share one axis: bin `k` is `[k * T / bins_per_T, ...)`, last bin
     // overflowing. Carried so a plot can label it without restating the convention.
     out["weight_hist_bins_per_T"] = summary.weight_hist_bins_per_T;
@@ -158,6 +163,8 @@ py::dict stats_to_dict(const TwoPhaseAggregateStats& stats) {
     out["max_component_size"] = stats.max_component_size;
     out["sum_max_component_diameter_wint"] = stats.sum_max_component_diameter_wint;
     out["max_component_diameter_wint"] = stats.max_component_diameter_wint;
+    out["prune_component_max_size"] = stats.prune_component_max_size;
+    out["sum_defects_resolved_small"] = stats.sum_defects_resolved_small;
     out["weight_hist_bins_per_T"] = (uint64_t)ComponentHistograms::BINS_PER_T;
     out["component_size_hist"] = stats.component_hist.size_hist;
     out["component_diameter_hist"] = stats.component_hist.diameter_hist;
@@ -266,6 +273,13 @@ py::dict profiles_to_dict(const std::vector<TwoPhaseProfile>& profiles) {
     out["defects_residual_trivially"] = column_component(&ComponentStats::defects_residual_trivially);
     out["defects_to_solver"] = column_component(&ComponentStats::defects_to_solver);
 
+    // §A's run label, row-aligned like the rest. `prune_component_max_size` is the `k` the shot
+    // decoded at and `defects_resolved_small` what the resolver settled off the solver at it;
+    // neither is a latency column, because the resolve is a serial pre-pass excluded from the timed
+    // stages by measurement scope.
+    out["prune_component_max_size"] = column_int(&TwoPhaseProfile::prune_component_max_size);
+    out["defects_resolved_small"] = column_int(&TwoPhaseProfile::defects_resolved_small);
+
     py::array_t<double> dual_sum((py::ssize_t)n);
     py::array_t<double> weight_out((py::ssize_t)n);
     py::array_t<double> max_dual((py::ssize_t)n);
@@ -346,8 +360,7 @@ compiled ball tables and must satisfy `ball_R >= 2 * ball_T_max` (§M2.0). `T` m
     config.def_readwrite("collect_harvest_diagnostics", &TwoPhaseConfig::collect_harvest_diagnostics);
     config.def_readwrite("collect_structural_counters", &TwoPhaseConfig::collect_structural_counters);
     config.def_readwrite("collect_component_stats", &TwoPhaseConfig::collect_component_stats);
-    config.def_readwrite("prune_trivial_components", &TwoPhaseConfig::prune_trivial_components);
-    config.def_readwrite("trivial_component_max_size", &TwoPhaseConfig::trivial_component_max_size);
+    config.def_readwrite("prune_component_max_size", &TwoPhaseConfig::prune_component_max_size);
     config.def_readwrite(
         "skip_negative_weight_preamble_when_positive", &TwoPhaseConfig::skip_negative_weight_preamble_when_positive);
     config.def_readwrite("measure_exact_reference", &TwoPhaseConfig::measure_exact_reference);

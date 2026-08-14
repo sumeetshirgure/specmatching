@@ -94,17 +94,13 @@ struct TwoPhaseConfig {
     /// there is no `H` to decompose.
     bool collect_component_stats{false};
 
-    /// §A — resolve `H`'s trivial (size 1 and 2) connected components directly off the ball tables
-    /// and run the solver on the remainder only. See `BallConfig::prune_trivial_components`; the
-    /// output and the set of escalating shots are unchanged, and turning it off restores the
-    /// current production path exactly, which is the oracle the A/B is run against.
+    /// §A — `k`: resolve `H`'s connected components of size `<= k` exactly, directly off the ball
+    /// tables, and run the solver on the size-`> k` remainder only. Capped at 4 and rejected above
+    /// it; `k = 0` is the un-pruned path. See `BallConfig::prune_component_max_size`.
     ///
     /// Ignored without `phase1_on_ball_graph` (there is no `H` to decompose) and on the
     /// verification path, which always solves the whole of `H`.
-    bool prune_trivial_components{true};
-    /// The largest component the resolver will attempt; sizes above 2 always go to the solver
-    /// (§A.3). See `BallConfig::trivial_component_max_size`.
-    int trivial_component_max_size{2};
+    int prune_component_max_size{2};
     /// §B — skip the §M2.1 negative-weight preamble on an all-positive DEM, where it is provably a
     /// no-op. See `BallConfig::skip_negative_weight_preamble_when_positive`.
     bool skip_negative_weight_preamble_when_positive{true};

@@ -36,9 +36,9 @@ std::string describe(const std::vector<uint64_t>& values) {
     return out.str();
 }
 
-/// §A.3's `bcost_int(x)`, read from the ball tables and nowhere else. `exists == false` is the
-/// design's `+inf`: the defect has no boundary path within `R`, so `H` gave it no boundary edge and
-/// a lone region on it grows to the horizon and survives.
+/// `bcost_int(x)`, read from the ball tables and nowhere else. `exists == false` is the design's
+/// `+inf`: the defect has no boundary path within `R`, so `H` gave it no boundary edge and no
+/// boundary match of it is legal.
 struct BoundaryCost {
     bool exists{false};
     pm::cumulative_time_int w_int{0};
@@ -50,46 +50,135 @@ BoundaryCost boundary_cost(const BallTables& tables, uint64_t det) {
     return BoundaryCost{true, (pm::cumulative_time_int)tables.bcost_w_int[det]};
 }
 
-/// What §A.3's trivial resolver does with a component. The three `COMMIT_*` verdicts name *which*
-/// commit, because the resolver has to perform it and not merely count it; `RESIDUAL` forces
-/// escalation; `SOLVER` hands the component back.
-enum class TrivialVerdict { COMMIT_BOUNDARY, COMMIT_PAIR, COMMIT_DOUBLE_BOUNDARY, RESIDUAL, SOLVER };
+/// What the small-component resolver did with a component. `COMMIT` means it settled the component
+/// exactly and performed the matches; `RESIDUAL` means the component has no feasible matching at
+/// all and the shot escalates on it; `SOLVER` means it was larger than `k` and was handed on.
+///
+/// There is no fourth outcome. Ties are broken here, not deferred, and an exact-`T` match is legal
+/// rather than ambiguous — nothing routes to the solver except by being size `> k`.
+enum class SmallVerdict : uint8_t { SOLVER = 0, COMMIT = 1, RESIDUAL = 2 };
 
-bool is_commit(TrivialVerdict verdict) {
-    return verdict == TrivialVerdict::COMMIT_BOUNDARY || verdict == TrivialVerdict::COMMIT_PAIR ||
-           verdict == TrivialVerdict::COMMIT_DOUBLE_BOUNDARY;
+constexpr uint32_t MAX_SMALL = BallPrune::MAX_SMALL_COMPONENT_SIZE;
+
+/// The resolver's view of one component of size 1..4: which matches are legal, and what they weigh,
+/// in integer time units and in local indices `0..size-1` (ascending `H`-node order).
+///
+/// Legality comes from **`H`'s own inclusion cutoffs**, so the resolver and `H` agree by
+/// construction: a defect-defect pairing is legal iff `H` gave the pair an edge, i.e.
+/// `d_G(u,v) <= 2T`, and a boundary match is legal iff `bcost_int(x) <= T_int`. Both are weak
+/// inequalities, exactly as `H`'s are; there is no separate exact-`T` event to route around.
+struct SmallProblem {
+    uint32_t size{0};
+    bool boundary_legal[MAX_SMALL]{};
+    pm::cumulative_time_int boundary_w[MAX_SMALL]{};
+    bool pair_legal[MAX_SMALL][MAX_SMALL]{};
+    pm::cumulative_time_int pair_w[MAX_SMALL][MAX_SMALL]{};
+};
+
+/// One configuration of "defect-pairings-with-boundary-fill": a set of disjoint legal
+/// defect-defect pairs, with every unpaired member taking a legal boundary match.
+struct SmallMatching {
+    /// False on the empty result, i.e. the component admits no such configuration at all.
+    bool feasible{false};
+    pm::cumulative_time_int weight{0};
+    uint32_t num_pairs{0};
+    /// Local indices of the paired members, `pair_a[i] < pair_b[i]`, and the list ascending in
+    /// `pair_a` — which is the sorted `(min, max)` pair list the tie-break compares.
+    uint32_t pair_a[MAX_SMALL / 2]{};
+    uint32_t pair_b[MAX_SMALL / 2]{};
+    uint32_t num_boundary{0};
+    uint32_t boundary[MAX_SMALL]{};
+};
+
+/// The order the resolver minimises in: total `w_int` first, and among equal-weight configurations
+/// the lexicographically smallest sorted `(min, max)` defect pair list, with a shorter list — one
+/// that is a prefix of the other — ordered first.
+///
+/// Equal weight means equal committed weight, and an observable that differs by at most a
+/// homologically trivial cycle (zero flip), so either configuration is exact. The tie-break decides
+/// only *which* one, so that two runs are bit-identical (§0).
+bool small_matching_better(const SmallMatching& a, const SmallMatching& b) {
+    if (!b.feasible)
+        return a.feasible;
+    if (!a.feasible)
+        return false;
+    if (a.weight != b.weight)
+        return a.weight < b.weight;
+    for (uint32_t i = 0; i < a.num_pairs && i < b.num_pairs; i++) {
+        if (a.pair_a[i] != b.pair_a[i])
+            return a.pair_a[i] < b.pair_a[i];
+        if (a.pair_b[i] != b.pair_b[i])
+            return a.pair_b[i] < b.pair_b[i];
+    }
+    return a.num_pairs < b.num_pairs;
 }
 
-/// §A.3, singleton `{u}`. Strict inequalities throughout: on an exact-`T` event the component goes
-/// to the solver, which is what keeps the trivially-resolvable set an unambiguous subset.
-TrivialVerdict classify_singleton(const BoundaryCost& u, pm::cumulative_time_int t_int) {
-    if (!u.exists)
-        return TrivialVerdict::RESIDUAL;
-    if (u.w_int < t_int)
-        return TrivialVerdict::COMMIT_BOUNDARY;
-    if (u.w_int > t_int)
-        return TrivialVerdict::RESIDUAL;
-    return TrivialVerdict::SOLVER;
+/// Extends `current` from the lowest unmatched member and keeps the best complete configuration.
+///
+/// Taking the *lowest* unmatched member at every step enumerates each configuration exactly once,
+/// and emits its pairs in ascending `pair_a` order, which is the sorted pair list the tie-break
+/// wants without a sort. The candidate sets of the design's sizes 1–4 are what this generates:
+/// a singleton's boundary match; a pair's `u–v` or `u,v` both to boundary; a triple's three
+/// "one to boundary, the other two paired" plus all-three-to-boundary; a quadruple's three internal
+/// perfect matchings, its `C(4,2)` "one pair plus two boundaries", and all-four-to-boundary.
+void extend_small_matching(const SmallProblem& problem, uint32_t used, SmallMatching& current, SmallMatching& best) {
+    uint32_t i = 0;
+    while (i < problem.size && (used & (1u << i)) != 0)
+        i++;
+    if (i == problem.size) {
+        current.feasible = true;
+        if (small_matching_better(current, best))
+            best = current;
+        return;
+    }
+
+    // The boundary fill is tried before the pairings, so that among equal-weight configurations the
+    // shorter pair list is reached first. That is the tie-break's order made explicit in the
+    // enumeration; `small_matching_better` still decides, so the two cannot drift apart.
+    if (problem.boundary_legal[i]) {
+        current.boundary[current.num_boundary++] = i;
+        current.weight += problem.boundary_w[i];
+        extend_small_matching(problem, used | (1u << i), current, best);
+        current.weight -= problem.boundary_w[i];
+        current.num_boundary--;
+    }
+    for (uint32_t j = i + 1; j < problem.size; j++) {
+        if ((used & (1u << j)) != 0 || !problem.pair_legal[i][j])
+            continue;
+        current.pair_a[current.num_pairs] = i;
+        current.pair_b[current.num_pairs] = j;
+        current.num_pairs++;
+        current.weight += problem.pair_w[i][j];
+        extend_small_matching(problem, used | (1u << i) | (1u << j), current, best);
+        current.weight -= problem.pair_w[i][j];
+        current.num_pairs--;
+    }
 }
 
-/// §A.3, pair `{u, v}` across the single `H` edge of weight `d`.
+/// Sizes 1–4, exactly: the minimum-weight pairing-with-boundary-fill, or infeasible.
 ///
-/// Case A — both regions meet each other before either reaches its own boundary, strictly inside
-/// the horizon. Case B — the double boundary match is the strict optimum and both halves of it
-/// complete strictly inside the horizon. Everything else, ties and exact-`T` events included, is
-/// the solver's: the boundary-steal-then-rematch dynamics are not reproduced here.
-///
-/// A defect with no boundary within `R` has `bcost = +inf`, which satisfies case A's `2a > d`
-/// outright and rules out case B, so it needs no branch of its own.
-TrivialVerdict classify_pair(
-    const BoundaryCost& u, const BoundaryCost& v, pm::cumulative_time_int d, pm::cumulative_time_int t_int) {
-    bool a_beats_half = !u.exists || 2 * u.w_int > d;
-    bool b_beats_half = !v.exists || 2 * v.w_int > d;
-    if (a_beats_half && b_beats_half && d < 2 * t_int)
-        return TrivialVerdict::COMMIT_PAIR;
-    if (u.exists && v.exists && u.w_int + v.w_int < d && u.w_int < t_int && v.w_int < t_int)
-        return TrivialVerdict::COMMIT_DOUBLE_BOUNDARY;
-    return TrivialVerdict::SOLVER;
+/// Infeasible is not a failure and not an error. Even size does not guarantee a complete matching —
+/// a size-4 "star" whose centre is within `2T` of three mutually far members, none of them with a
+/// legal boundary, has no feasible pairing, and neither does an odd component with no legal
+/// boundary. The caller routes those to the residual and the shot escalates, exactly as the solver
+/// would have left it.
+SmallMatching resolve_small_component(const SmallProblem& problem) {
+    SmallMatching best;
+    SmallMatching current;
+    extend_small_matching(problem, 0, current, best);
+    return best;
+}
+
+/// Position of an `H`-node within its component's ascending member block, i.e. the local index the
+/// two structs above are written in. A linear scan over at most four entries.
+template <typename Members>
+uint32_t local_index_of(const Members& members, uint32_t size, uint32_t node) {
+    for (uint32_t a = 0; a < size; a++) {
+        if (members[a] == node)
+            return a;
+    }
+    assert(false && "an H edge names a node outside the component it is internal to");
+    return 0;
 }
 
 /// The observable mask of one ball entry's stored path, XORed out of the entry's observable id
@@ -167,6 +256,15 @@ void BallDecoder::finish_construction(const char* ball_artifact_path) {
         throw std::invalid_argument(
             "verify_against_g compares H's truncated harvest against M1 on G; the stock-on-H path (§M7) has no "
             "truncated harvest. Its oracle is stock exact decode on G — see §M7.6 level 1.");
+    // §A. `k` is capped at 4 because no resolver is defined above it: the enumeration of
+    // pairings-with-boundary-fill is written out for sizes 1–4 and for nothing larger. Rejected here
+    // rather than silently clamped, so a run cannot report a `k` it did not decode at.
+    if (config.prune_component_max_size < 0 ||
+        config.prune_component_max_size > (int)BallPrune::MAX_SMALL_COMPONENT_SIZE)
+        throw std::invalid_argument(
+            "prune_component_max_size (k) must be in [0, " + std::to_string(BallPrune::MAX_SMALL_COMPONENT_SIZE) +
+            "]; no small-component resolver is defined above that.");
+    assert(config.prune_component_max_size <= (int)BallPrune::MAX_SMALL_COMPONENT_SIZE && "k exceeds the resolver cap");
 
     const pm::MatchingGraph& graph = g_mwpm.flooder.graph;
     horizon = to_time_units(config.T, graph.normalising_constant);
@@ -196,9 +294,11 @@ void BallDecoder::finish_construction(const char* ball_artifact_path) {
     arena.reset_for_graph(graph.nodes.size());
 }
 
-const BallGraph& BallDecoder::resolve_trivial_components(
-    const BallGraph& h, pm::MatchingResult& trivial, TrivialCommitCounts& counts) {
+const BallGraph& BallDecoder::resolve_small_components(
+    const BallGraph& h, pm::MatchingResult& resolved, SmallCommitCounts& counts) {
     // Untimed by construction: no timer is started here and none may be added (hard constraint 1).
+    // This is a serial pre-pass on the critical path, excluded from what this branch reports by
+    // measurement scope; see `decode_impl`'s call site.
     BallPrune& prune = arena.prune;
     compute_prune_components(h, prune);
 
@@ -206,16 +306,19 @@ const BallGraph& BallDecoder::resolve_trivial_components(
     // `config.T` a second time here would be the §0 unit-rule trap.
     const pm::cumulative_time_int t_int = horizon;
     bool use_masks = g_mwpm.flooder.graph.num_observables <= sizeof(pm::obs_int) * 8;
-    // A resolver exists for sizes 1 and 2 only, whatever the knob says (§A.3).
-    uint32_t max_size =
-        config.trivial_component_max_size <= 0 ? 0 : std::min<uint32_t>((uint32_t)config.trivial_component_max_size, 2);
+    // `k`, capped at the largest size a resolver is defined for. The cap is enforced at
+    // construction; clamping again here is what keeps this loop's fixed-width blocks in range no
+    // matter how the config was reached.
+    uint32_t max_size = config.prune_component_max_size <= 0
+                            ? 0
+                            : std::min<uint32_t>((uint32_t)config.prune_component_max_size, MAX_SMALL);
     uint32_t n = (uint32_t)h.num_nodes();
 
     auto commit_boundary = [&](uint32_t node) {
         uint64_t det = h.h_to_det[node];
-        trivial.obs_mask ^= boundary_obs_mask(tables, det, use_masks);
-        trivial.weight += (pm::total_weight_int)tables.bcost_w_int[det];
-        trivial_pairs.push_back(CommittedPair{(int64_t)det, -1, CommittedPair::NO_BALL_ENTRY});
+        resolved.obs_mask ^= boundary_obs_mask(tables, det, use_masks);
+        resolved.weight += (pm::total_weight_int)tables.bcost_w_int[det];
+        resolved_pairs.push_back(CommittedPair{(int64_t)det, -1, CommittedPair::NO_BALL_ENTRY});
         counts.boundary++;
     };
 
@@ -226,37 +329,57 @@ const BallGraph& BallDecoder::resolve_trivial_components(
         if (prune.component_of[root] != root)
             continue;
         uint32_t size = prune.component_size[root];
-        TrivialVerdict verdict = TrivialVerdict::SOLVER;
-        if (size == 1 && size <= max_size) {
-            verdict = classify_singleton(boundary_cost(tables, h.h_to_det[root]), t_int);
-            if (verdict == TrivialVerdict::COMMIT_BOUNDARY)
-                commit_boundary(root);
-        } else if (size == 2 && size <= max_size) {
-            // `H` holds each undirected pair once and its endpoints are stored with `i < j`, so the
-            // component's one edge names its two members in ascending order.
-            assert(prune.pair_edge[root] != BallPrune::NO_PAIR_EDGE && "a two-member component with no H edge");
-            const BallGraphEdge& edge = h.edges[prune.pair_edge[root]];
-            assert(edge.i == root && "the root of a two-member component is its lower endpoint");
-            uint64_t det_u = h.h_to_det[edge.i];
-            uint64_t det_v = h.h_to_det[edge.j];
-            verdict = classify_pair(
-                boundary_cost(tables, det_u), boundary_cost(tables, det_v), (pm::cumulative_time_int)edge.w_int, t_int);
-            if (verdict == TrivialVerdict::COMMIT_PAIR) {
-                // Mask and weight come off the ball entry behind the edge, which is the same entry
-                // harvest would have extracted for this match — that is what keeps the committed
-                // observables and weight bit-exact (invariant 4).
-                trivial.obs_mask ^= path_obs_mask(tables, edge.entry, use_masks);
-                trivial.weight += (pm::total_weight_int)edge.w_int;
-                trivial_pairs.push_back(CommittedPair{(int64_t)det_u, (int64_t)det_v, edge.entry});
-                counts.pairs++;
-            } else if (verdict == TrivialVerdict::COMMIT_DOUBLE_BOUNDARY) {
-                commit_boundary(edge.i);
-                commit_boundary(edge.j);
-            }
+        if (size > max_size) {
+            prune.verdict[root] = (uint8_t)SmallVerdict::SOLVER;
+            continue;
         }
-        if (verdict == TrivialVerdict::RESIDUAL)
+
+        // The component's legality table, off `H` and the ball tables and nothing else. The
+        // presence of an `H` edge *is* the pairing's legality test (`d_G <= 2T`), and its `w_int`
+        // is the pairing's weight, so the resolver cannot disagree with `H` about either.
+        const auto& members = prune.small_members[root];
+        assert(prune.small_member_count[root] == size && "the small-component member block is short");
+        SmallProblem problem;
+        problem.size = size;
+        for (uint32_t a = 0; a < size; a++) {
+            BoundaryCost cost = boundary_cost(tables, h.h_to_det[members[a]]);
+            problem.boundary_legal[a] = cost.exists && cost.w_int <= t_int;
+            problem.boundary_w[a] = cost.w_int;
+        }
+        uint32_t edge_of[MAX_SMALL][MAX_SMALL] = {};
+        for (uint32_t e = 0; e < prune.small_edge_count[root]; e++) {
+            uint32_t index = prune.small_edges[root][e];
+            const BallGraphEdge& edge = h.edges[index];
+            uint32_t a = local_index_of(members, size, edge.i);
+            uint32_t b = local_index_of(members, size, edge.j);
+            problem.pair_legal[a][b] = problem.pair_legal[b][a] = true;
+            problem.pair_w[a][b] = problem.pair_w[b][a] = (pm::cumulative_time_int)edge.w_int;
+            edge_of[a][b] = edge_of[b][a] = index;
+        }
+
+        SmallMatching matching = resolve_small_component(problem);
+        if (!matching.feasible) {
+            // No configuration at all: the component survives past the horizon and the shot
+            // escalates on it, exactly as the solver would have left it.
             counts.residual++;
-        prune.verdict[root] = (uint8_t)verdict;
+            prune.verdict[root] = (uint8_t)SmallVerdict::RESIDUAL;
+            continue;
+        }
+        for (uint32_t p = 0; p < matching.num_pairs; p++) {
+            // Mask and weight come off the ball entry behind the edge, which is the same entry
+            // harvest would have extracted for this match — that is what keeps the committed
+            // observables and weight bit-exact.
+            const BallGraphEdge& edge = h.edges[edge_of[matching.pair_a[p]][matching.pair_b[p]]];
+            resolved.obs_mask ^= path_obs_mask(tables, edge.entry, use_masks);
+            resolved.weight += (pm::total_weight_int)edge.w_int;
+            resolved_pairs.push_back(
+                CommittedPair{(int64_t)h.h_to_det[edge.i], (int64_t)h.h_to_det[edge.j], edge.entry});
+            counts.pairs++;
+        }
+        for (uint32_t b = 0; b < matching.num_boundary; b++)
+            commit_boundary(members[matching.boundary[b]]);
+        counts.defects_resolved += (int)size;
+        prune.verdict[root] = (uint8_t)SmallVerdict::COMMIT;
     }
 
     // ---- Spread each component's verdict to its members, and count what is left for the solver.
@@ -264,7 +387,7 @@ const BallGraph& BallDecoder::resolve_trivial_components(
     for (uint32_t i = 0; i < n; i++) {
         // A RESIDUAL component is neither committed nor solved: the shot escalates on it and §A.5
         // discards Phase 1 in full, so there is nothing for the solver to learn from it.
-        bool to_solver = (TrivialVerdict)prune.verdict[prune.component_of[i]] == TrivialVerdict::SOLVER;
+        bool to_solver = (SmallVerdict)prune.verdict[prune.component_of[i]] == SmallVerdict::SOLVER;
         prune.node_to_solver[i] = to_solver ? 1 : 0;
         solver_nodes += to_solver ? 1 : 0;
     }
@@ -273,7 +396,7 @@ const BallGraph& BallDecoder::resolve_trivial_components(
     // identical sub-graph. This is the shot class the prune cannot help, and it should not pay for
     // being looked at.
     if (solver_nodes == n) {
-        assert(counts.pairs == 0 && counts.boundary == 0 && counts.residual == 0);
+        assert(counts.pairs == 0 && counts.boundary == 0 && counts.residual == 0 && counts.defects_resolved == 0);
         return h;
     }
     build_solver_subgraph(h, prune);
@@ -299,6 +422,11 @@ void BallDecoder::analyze_last_shot_components(BallProfile& prof, ComponentHisto
     // `config.T` a second time here would be the §0 unit-rule trap.
     const pm::cumulative_time_int t_int = horizon;
     uint32_t num_nodes = (uint32_t)h.num_nodes();
+    // The same `k` the decode path resolves at, clamped the same way, so the classification below
+    // describes the run it is collected beside rather than a fixed size-2 rule.
+    uint32_t max_size = config.prune_component_max_size <= 0
+                            ? 0
+                            : std::min<uint32_t>((uint32_t)config.prune_component_max_size, MAX_SMALL);
 
     stats.measured = 1;
     stats.num_components = (int)components.num_components();
@@ -345,34 +473,48 @@ void BallDecoder::analyze_last_shot_components(BallProfile& prof, ComponentHisto
         }
         stats.num_boundary_touching_components += touches_boundary ? 1 : 0;
 
-        // §A.3's classification. Nothing is committed here: the verdict is counted and discarded,
-        // so this is a measurement of what the prune would remove and not the prune itself.
-        TrivialVerdict verdict = TrivialVerdict::SOLVER;
+        // The size classes, which are structural and say nothing about `k`: "trivial" is size <= 2
+        // in this table whatever the resolver is configured to attempt, so the §C series stays
+        // comparable across runs.
         if (size == 1) {
             stats.num_singleton_components++;
-            verdict = classify_singleton(boundary_cost(tables, h.h_to_det[components.members[begin]]), t_int);
         } else if (size == 2) {
             stats.num_pair_components++;
-            uint32_t u = components.members[begin];
-            uint32_t v = components.members[begin + 1];
-            // A two-member component is joined by exactly one `H` edge — `H` holds each undirected
-            // pair once — so the first adjacency slot of either endpoint is that edge.
-            assert(components.degree_of(u) == 1 && components.adj_target[components.adj_offsets[u]] == v);
-            pm::cumulative_time_int d = (pm::cumulative_time_int)components.adj_weight[components.adj_offsets[u]];
-            verdict = classify_pair(
-                boundary_cost(tables, h.h_to_det[u]), boundary_cost(tables, h.h_to_det[v]), d, t_int);
         } else {
-            // §A.3: no resolver is implemented for size >= 3, whatever a size knob might say.
             stats.num_nontrivial_components++;
         }
-
         if (size <= 2) {
             stats.num_trivial_components++;
             stats.defects_in_trivial_components += (int)size;
         }
-        if (is_commit(verdict)) {
+
+        // The resolver's classification, at the `k` this decoder is configured with. Nothing is
+        // committed here: the verdict is counted and discarded, so this is a measurement of what
+        // the prune removes and not the prune itself.
+        SmallVerdict verdict = SmallVerdict::SOLVER;
+        if (size <= max_size) {
+            SmallProblem problem;
+            problem.size = size;
+            for (uint32_t a = 0; a < size; a++) {
+                uint32_t node = components.members[begin + a];
+                BoundaryCost cost = boundary_cost(tables, h.h_to_det[node]);
+                problem.boundary_legal[a] = cost.exists && cost.w_int <= t_int;
+                problem.boundary_w[a] = cost.w_int;
+                // The §C adjacency carries both directions of every `H` edge and the local index of
+                // a member is its position in this block, so one walk per member fills the pairing
+                // table — the same legality test the decode path makes off `BallPrune`.
+                for (uint32_t e = components.adj_offsets[node]; e < components.adj_offsets[node + 1]; e++) {
+                    uint32_t b = components.local_index[components.adj_target[e]];
+                    problem.pair_legal[a][b] = true;
+                    problem.pair_w[a][b] = (pm::cumulative_time_int)components.adj_weight[e];
+                }
+            }
+            verdict = resolve_small_component(problem).feasible ? SmallVerdict::COMMIT : SmallVerdict::RESIDUAL;
+        }
+
+        if (verdict == SmallVerdict::COMMIT) {
             stats.defects_committed_trivially += (int)size;
-        } else if (verdict == TrivialVerdict::RESIDUAL) {
+        } else if (verdict == SmallVerdict::RESIDUAL) {
             stats.defects_residual_trivially += (int)size;
         } else {
             stats.defects_to_solver += (int)size;
@@ -384,7 +526,7 @@ void BallDecoder::analyze_last_shot_components(BallProfile& prof, ComponentHisto
     assert(
         stats.defects_committed_trivially + stats.defects_residual_trivially + stats.defects_to_solver ==
             (int)num_nodes &&
-        "the trivial classification did not partition H's defects");
+        "the resolver's classification did not partition H's defects");
 }
 
 void BallDecoder::compute_seeded_detection_events(const std::vector<uint64_t>& dets, std::vector<uint64_t>& out) const {
@@ -464,25 +606,28 @@ Phase1Outcome BallDecoder::decode_impl(
         structural ? &counts : nullptr);
     const BallGraph& h = arena.graph;
 
-    // ---- §A. Resolve the trivial components off the ball tables and hand the solver what is left.
+    // ---- §A. Resolve the components of size <= k off the ball tables and hand the solver what is
+    // left.
     //
-    // Untimed, and deliberately outside every `step.start()` below: the prune is assumed free, and
-    // the numbers this experiment reads are `blossom_on_h_ns` and `harvest_ns` running on a smaller
-    // node set. `allow_prune` is false on the verification entry points, whose whole job is to
+    // serial pre-pass; excluded from this measurement by intent. It runs before the solve, in
+    // series, on the critical path, and it is a real cost — it is outside every `step.start()`
+    // below because this branch's reported latency is scoped to the solver and the harvest on the
+    // size-`> k` graph, to be measured and optimised separately, and not because it is free or
+    // concurrent. `allow_prune` is false on the verification entry points, whose whole job is to
     // solve the same `H` the oracle does.
-    trivial_pairs.clear();
-    pm::MatchingResult trivial(0, 0);
-    TrivialCommitCounts trivial_counts;
-    bool pruning = allow_prune && config.prune_trivial_components;
-    const BallGraph& solver_h = pruning ? resolve_trivial_components(h, trivial, trivial_counts) : h;
+    resolved_pairs.clear();
+    pm::MatchingResult resolved(0, 0);
+    SmallCommitCounts resolved_counts;
+    bool pruning = allow_prune && config.prune_component_max_size > 0;
+    const BallGraph& solver_h = pruning ? resolve_small_components(h, resolved, resolved_counts) : h;
     solved_graph = &solver_h;
 
-    // §A.4. With every component resolved trivially — the common case at `p = 1e-3` — there is no
+    // §A.4. With every component resolved off the solver — the common case at `p = 1e-3` — there is no
     // `Mwpm(H)` to build, no timeline to run and nothing to extract. That is where the reduction
     // comes from, so it is a skip of the whole stage rather than a solve over an empty node set.
     //
-    // The skip is conditioned on the prune, not merely on the node count, so that with the flag off
-    // the path is byte-identical to the current one down to the harvest counters: a defect-free shot
+    // The skip is conditioned on the prune, not merely on the node count, so that at `k = 0` the
+    // path is byte-identical to the un-pruned one down to the harvest counters: a defect-free shot
     // still builds its empty `Mwpm(H)` and still runs its empty solve and extraction, exactly as it
     // does today.
     bool solver_runs = !pruning || solver_h.num_nodes() != 0;
@@ -511,11 +656,11 @@ Phase1Outcome BallDecoder::decode_impl(
     if (!solver_runs) {
         // §A.4's skip. Nothing ran, so nothing is reported: `blossom_on_h_ns`, `dual_scan_ns` and
         // `harvest_ns` stay at the zero `prof->clear()` left them at, which is the honest reading —
-        // the stage did not happen. Under §M7 the shot is certified by the resolver's own strict
-        // inequalities rather than by a dual scan: every committed component's terminal dual is
-        // strictly below `T_int` (a pair matched at `d < 2T` settles at `d / 2` each, a boundary
-        // match at its own `bcost < T`), so it could never have been the `max_u Y(u)` that decides
-        // the certificate.
+        // the stage did not happen. Under §M7 there is no dual scan to certify the shot with, and
+        // none is needed: the resolver settled every component exactly, at `H`'s own cutoffs, so
+        // every committed match is inside the horizon the certificate tests — a pair at `d <= 2T`,
+        // a boundary match at `bcost <= T` — and no component was left for the certificate to be
+        // asked about.
         if (prof != nullptr && config.stock_on_h)
             prof->certified = 1;
     } else if (config.stock_on_h) {
@@ -595,29 +740,29 @@ Phase1Outcome BallDecoder::decode_impl(
 
     // ---- §A.5. Combine, and decide the branch.
     //
-    // `escalate <=> trivial residual OR (the solver ran and truncated)`. That is the current trigger
-    // restated, not a new one: the pipeline escalates a shot iff some component fails to resolve
-    // within `T`, and here that surfaces either as a resolver RESIDUAL (a singleton whose boundary
-    // is past the horizon, or that has none within `R`) or as the solver's own status on the
-    // components it was handed. Ambiguous components went to the solver, so it decides them exactly
-    // as it did before.
+    // `escalate <=> resolver residual OR (the solver ran and truncated)`. That is the current
+    // trigger restated, not a new one: the pipeline escalates a shot iff some component fails to
+    // resolve within `T`, and here that surfaces either as a resolver RESIDUAL (a component of size
+    // `<= k` with no feasible matching at all) or as the solver's own status on the components it
+    // was handed. Nothing was deferred to the solver except by being size `> k`, so it decides
+    // those exactly as it did before.
     if (pruning) {
-        if (trivial_counts.residual > 0)
+        if (resolved_counts.residual > 0)
             outcome.status = TimelineStatus::TRUNCATED;
         if (outcome.status == TimelineStatus::TRUNCATED) {
             // The escalating shot re-decodes the whole raw syndrome on `G` and discards **all** of
-            // Phase 1, trivial commits included — there is nothing to XOR and nothing to add
+            // Phase 1, the off-solver commits included — there is nothing to XOR and nothing to add
             // (§A.5, §M3.3 X3). Dropping them here is what keeps a caller from combining them by
             // accident.
-            trivial_pairs.clear();
+            resolved_pairs.clear();
         } else {
-            result.committed.obs_mask ^= trivial.obs_mask;
-            result.committed.weight += trivial.weight;
-            // The trivial commits are matches like any other, so they belong in the commit tallies
-            // the profile reports; a pair settled by the resolver is frozen at the horizon in the
-            // same sense a solver-frozen one is.
-            result.committed_pairs_frozen += trivial_counts.pairs;
-            result.committed_boundary += trivial_counts.boundary;
+            result.committed.obs_mask ^= resolved.obs_mask;
+            result.committed.weight += resolved.weight;
+            // The off-solver commits are matches like any other, so they belong in the commit
+            // tallies the profile reports; a pair settled by the resolver is frozen at the horizon
+            // in the same sense a solver-frozen one is.
+            result.committed_pairs_frozen += resolved_counts.pairs;
+            result.committed_boundary += resolved_counts.boundary;
         }
     }
 
@@ -628,6 +773,13 @@ Phase1Outcome BallDecoder::decode_impl(
         prof->h_nodes = (int)h.num_nodes();
         prof->h_edges = (int)h.edges.size();
         prof->h_boundary_edges = (int)h.boundary_edges.size();
+        // The run's `k`, and what the resolver actually settled off the solver this shot. Both are
+        // labels on the latency numbers beside them, not latency numbers themselves: the resolve is
+        // a serial pre-pass excluded from `blossom_on_h_ns` and `harvest_ns` by scope. `k` is
+        // reported as the decoder was configured, so a `k > 0` run whose shot resolved nothing is
+        // still distinguishable from a `k = 0` one.
+        prof->prune_component_max_size = pruning ? config.prune_component_max_size : 0;
+        prof->defects_resolved_small = resolved_counts.defects_resolved;
         // §M2 structural counters, left at zero unless they were collected, so that a profile
         // never reports a counter it did not measure. `hbld_edges_written` is the count taken at
         // the `push_back`s, not `h_edges + h_boundary_edges` read back off the vectors —
@@ -683,7 +835,7 @@ void BallDecoder::map_match_edges_to_committed_pairs(std::vector<CommittedPair>&
     const BallGraph& h = solved_graph != nullptr ? *solved_graph : arena.graph;
     const pm::DetectorNode* base = h_mwpm.mwpm.flooder.graph.nodes.data();
     committed_pairs.clear();
-    committed_pairs.reserve(match_edge_scratch.size() + trivial_pairs.size());
+    committed_pairs.reserve(match_edge_scratch.size() + resolved_pairs.size());
     for (const pm::CompressedEdge& edge : match_edge_scratch) {
         size_t i = (size_t)(edge.loc_from - base);
         int64_t from = (int64_t)h.h_to_det[i];
@@ -708,9 +860,9 @@ void BallDecoder::map_match_edges_to_committed_pairs(std::vector<CommittedPair>&
         assert(it != h.edges.end() && it->i == lo && it->j == hi && "a committed pair that is not an edge of H");
         committed_pairs.push_back(CommittedPair{from, to, it->entry});
     }
-    // §A's trivially resolved commits, already in `G`'s detector ids and already carrying the ball
-    // entry the mask and weight came from. Empty unless the prune ran and the shot completed.
-    committed_pairs.insert(committed_pairs.end(), trivial_pairs.begin(), trivial_pairs.end());
+    // §A's off-solver commits, already in `G`'s detector ids and already carrying the ball entry
+    // the mask and weight came from. Empty unless the prune ran and the shot completed.
+    committed_pairs.insert(committed_pairs.end(), resolved_pairs.begin(), resolved_pairs.end());
     sort_pairs(committed_pairs);
 }
 
