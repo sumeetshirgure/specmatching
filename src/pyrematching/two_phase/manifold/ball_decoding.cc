@@ -622,6 +622,16 @@ Phase1Outcome BallDecoder::decode_impl(
     const BallGraph& solver_h = pruning ? resolve_small_components(h, resolved, resolved_counts) : h;
     solved_graph = &solver_h;
 
+    // §A.5's verdict, known here rather than only at the combine below: a RESIDUAL component decides
+    // the branch on its own, whatever the solver goes on to do with the size-`> k` remainder.
+    //
+    // It has to be known *before* the harvest. The production entry points abandon an escalating
+    // shot in O(1) instead of extracting from it (§M3.4), and they decide that off the status they
+    // are handed at the harvest call site — so leaving the residual to flip `outcome.status` after
+    // that call had the shot extract a Phase 1 result that §A.5 then discarded, which is the wasted
+    // work §M3.3 X9 counts.
+    bool resolver_forces_escalation = pruning && resolved_counts.residual > 0;
+
     // §A.4. With every component resolved off the solver — the common case at `p = 1e-3` — there is no
     // `Mwpm(H)` to build, no timeline to run and nothing to extract. That is where the reduction
     // comes from, so it is a skip of the whole stage rather than a solve over an empty node set.
@@ -657,10 +667,12 @@ Phase1Outcome BallDecoder::decode_impl(
         // §A.4's skip. Nothing ran, so nothing is reported: `blossom_on_h_ns`, `dual_scan_ns` and
         // `harvest_ns` stay at the zero `prof->clear()` left them at, which is the honest reading —
         // the stage did not happen. Under §M7 there is no dual scan to certify the shot with, and
-        // none is needed: the resolver settled every component exactly, at `H`'s own cutoffs, so
-        // every committed match is inside the horizon the certificate tests — a pair at `d <= 2T`,
-        // a boundary match at `bcost <= T` — and no component was left for the certificate to be
-        // asked about.
+        // none is needed *for the components the resolver committed*: it settled those exactly, at
+        // `H`'s own cutoffs, so every committed match is inside the horizon the certificate tests —
+        // a pair at `d <= 2T`, a boundary match at `bcost <= T`.
+        //
+        // This is the provisional reading only. A RESIDUAL component also leaves the solver empty
+        // without being settled, and §A.5 below withdraws the certificate when there was one.
         if (prof != nullptr && config.stock_on_h)
             prof->certified = 1;
     } else if (config.stock_on_h) {
@@ -718,7 +730,12 @@ Phase1Outcome BallDecoder::decode_impl(
     if (solver_runs) {
         if (prof != nullptr)
             step.start();
-        outcome.harvest = harvest_on_h(h_mwpm.mwpm, h_dets_scratch, outcome.status);
+        // The status the *shot* has, not the one the solver's own components have: a residual
+        // elsewhere means this result is about to be discarded, so the production path abandons
+        // rather than extracts. `outcome.status` itself is left for §A.5, which is where the two
+        // are reconciled and where the `stock_on_h` certificate has already written its verdict.
+        outcome.harvest = harvest_on_h(
+            h_mwpm.mwpm, h_dets_scratch, resolver_forces_escalation ? TimelineStatus::TRUNCATED : outcome.status);
         if (prof != nullptr)
             prof->harvest_ns = step.elapsed_ns();
     }
@@ -747,8 +764,27 @@ Phase1Outcome BallDecoder::decode_impl(
     // was handed. Nothing was deferred to the solver except by being size `> k`, so it decides
     // those exactly as it did before.
     if (pruning) {
-        if (resolved_counts.residual > 0)
+        if (resolver_forces_escalation) {
             outcome.status = TimelineStatus::TRUNCATED;
+            // §M7. The certificate is a statement about the *whole* of `H`, and the resolver owns
+            // part of it, so its verdict has to reach the profile too. A RESIDUAL component is
+            // exactly "`H` has no perfect matching": the enumeration is exhaustive over
+            // pairings-with-boundary-fill at `H`'s own cutoffs, so no feasible configuration means
+            // the solver — handed that component — would have reported NO_PERFECT_MATCHING itself.
+            //
+            // Both branches above can reach here with `certified == 1`: the empty-solver branch set
+            // it provisionally, and the stock branch reads only the components it was handed, which
+            // certify on their own while another component is residual. Withdrawing it here is what
+            // keeps invariant 3's `escalated <=> !certified` true through the prune.
+            //
+            // `max_dual_at_completion` is deliberately left where it is. It is undefined rather
+            // than merely unmeasured when `H` cannot complete (§M7), and the escalating shot
+            // discards Phase 1 in full anyway.
+            if (prof != nullptr && config.stock_on_h) {
+                prof->certified = 0;
+                prof->h_no_perfect_matching = 1;
+            }
+        }
         if (outcome.status == TimelineStatus::TRUNCATED) {
             // The escalating shot re-decodes the whole raw syndrome on `G` and discards **all** of
             // Phase 1, the off-solver commits included — there is nothing to XOR and nothing to add
@@ -758,6 +794,19 @@ Phase1Outcome BallDecoder::decode_impl(
         } else {
             result.committed.obs_mask ^= resolved.obs_mask;
             result.committed.weight += resolved.weight;
+            // §M3.4/§M4.2. `dual_sum_at_truncation` is a sum over the regions of `H`, and the
+            // resolver removed regions from the solve, so the harvest's reduction now runs over a
+            // strict subset and under-reports the shot's dual by exactly what the resolver settled.
+            //
+            // What it settled is that dual: each committed match is frozen and tight, so the two
+            // halves of a pair matched across `d` contribute `d / 2` each and a boundary match at
+            // `bcost` contributes `bcost` — a component's regions sum to its committed weight,
+            // which is `resolved.weight` over all of them. That is the same tightness §M4.2
+            // measures as a ratio of exactly 1.0000 on a completed shot, and dropping the term
+            // would have degraded the certificate silently: `weight_out >= dual_sum` survives a
+            // dual that is too *small*, so only §M3.3 X8's bit-identity against the un-pruned full
+            // harvest catches it.
+            result.dual_sum_at_truncation += resolved.weight;
             // The off-solver commits are matches like any other, so they belong in the commit
             // tallies the profile reports; a pair settled by the resolver is frozen at the horizon
             // in the same sense a solver-frozen one is.

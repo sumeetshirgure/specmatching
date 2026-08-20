@@ -346,7 +346,15 @@ TEST(EscalationEscalate, X9ProductionPathDoesNoTreeWork) {
             ASSERT_EQ(counters.extractions, 0u);
         } else {
             completed++;
-            ASSERT_EQ(counters.extract_only_harvests, 1u);
+            // One extract-only harvest, unless §A's resolver settled the whole of `H` off the
+            // solver — then §A.4 skips the build, the solve and the extraction together, and zero
+            // harvests is the honest count rather than a missed one. Stated as an equality against
+            // which case the shot was in, so a harvest that goes missing for any *other* reason
+            // still fails here.
+            size_t h_nodes = decoder.ball->arena.graph.num_nodes();
+            bool fully_resolved = (size_t)profile.defects_resolved_small == h_nodes;
+            ASSERT_EQ(counters.extract_only_harvests, fully_resolved ? 0u : 1u)
+                << "defects_resolved_small = " << profile.defects_resolved_small << " of " << h_nodes << " H nodes";
         }
     }
     ASSERT_GT(escalated, 0u);
