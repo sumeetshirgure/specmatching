@@ -109,8 +109,12 @@ struct TwoPhaseConfig {
     /// `exact_reference_ns`, so `speedup_vs_stock` is a paired measurement rather than two
     /// campaigns divided.
     bool measure_exact_reference{false};
-    /// §M6.4 timer discipline: probe `getrusage(RUSAGE_THREAD)` once per shot and mark shots the
-    /// scheduler interfered with. One preemption defines p999 outright at 2000 shots.
+    /// §M6.4 timer discipline: probe the thread once per shot and mark shots the scheduler
+    /// interfered with. One preemption defines p999 outright at 2000 shots. The instrument is
+    /// `getrusage(RUSAGE_THREAD)`'s switch counters where they exist and the wall-minus-thread-CPU
+    /// gap where they do not (macOS); `PreemptionProbe::mechanism_name()` says which, and a campaign
+    /// should record it beside the rate, since "no shot was flagged" and "no shot could be flagged"
+    /// are different statements.
     bool detect_preemption{false};
 };
 

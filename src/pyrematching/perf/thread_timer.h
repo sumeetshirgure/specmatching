@@ -17,6 +17,7 @@
 
 #include <chrono>
 #include <cstdint>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 
@@ -34,6 +35,17 @@
 #include <sys/syscall.h>
 #include <unistd.h>
 #define PYREMATCHING_HAVE_THREAD_CYCLES 1
+#endif
+#elif defined(__APPLE__)
+#include <time.h>
+// `CLOCK_THREAD_CPUTIME_ID` arrived with the 10.12 SDK, as a macro over an enumerator, so testing the
+// macro is testing whether this SDK has the clock at all. Darwin serves it from the
+// `thread_selfusage` mach trap — this thread's user + kernel time, in nanoseconds, saved and restored
+// across context switches — which is the same semantics Linux's `CLOCK_THREAD_CPUTIME_ID` has and
+// exactly what the profile wants. Whether the *runtime* honours it is settled by
+// `thread_cputime_available()`, not here: an SDK that declares it is not a kernel that serves it.
+#if defined(CLOCK_THREAD_CPUTIME_ID)
+#define PYREMATCHING_HAVE_THREAD_CPUTIME 1
 #endif
 #endif
 
@@ -81,17 +93,37 @@
 /// Chosen once per thread, on first use, most-preferred first, and overridable for A/B work with
 /// the `PYREMATCHING_TIMER` environment variable (`thread` / `cputime` / `tsc` / `chrono`):
 ///
-/// | backend       | ns/read | advances only while the thread runs |
-/// |---------------|---------|-------------------------------------|
-/// | `thread`      |     8.3 | yes                                 |
-/// | `cputime`     |   190.8 | yes                                 |
-/// | `tsc`         |     9.5 | **no**                              |
-/// | `chrono`      |    22.8 | **no**                              |
+/// | backend       | ns/read | advances only while the thread runs | where                 |
+/// |---------------|---------|-------------------------------------|-----------------------|
+/// | `thread`      |     8.3 | yes                                 | Linux + x86 PMU       |
+/// | `cputime`     |   190.8 | yes                                 | Linux, macOS 10.12+   |
+/// | `tsc`         |     9.5 | **no**                              | x86, forced only      |
+/// | `chrono`      |    22.8 | **no**                              | anywhere              |
 ///
 /// The two thread-scoped backends are tried first, so a machine that refuses `perf_event_open`
 /// (`perf_event_paranoid = 3`, a container without the PMU, a non-x86 host) degrades to a slower
-/// thread-scoped clock rather than silently reverting to wall time. Only a non-Linux host reaches
-/// the wall-clock backends by default, and `timer_backend_name()` says so.
+/// thread-scoped clock rather than silently reverting to wall time.
+///
+/// ## macOS
+///
+/// There is no `perf_event_open` there and no unprivileged route to the PMU, so `thread` is not
+/// available and `cputime` is the backend a macOS run should land on:
+/// `clock_gettime(CLOCK_THREAD_CPUTIME_ID)` is served by the `thread_selfusage` mach trap, counts
+/// this thread's user + kernel nanoseconds, and stops while the thread is off a CPU — the same
+/// contract the Linux fallback has. It is *not* `mach_absolute_time`, which is a wall clock and
+/// would have exactly the defect this whole header exists to avoid. Two consequences worth knowing
+/// when reading a macOS campaign against a Linux one:
+///
+///   - the reading is a trap rather than a vDSO call, so it is the ~200 ns-class backend, not the
+///     8 ns one. Stage timers in the tens of nanoseconds are dominated by it; sums over a shot are
+///     not. `timer_backend_name()` is in every log header for precisely this comparison;
+///   - `cputime` charges kernel time to the interval and `thread` does not (it is forced to
+///     `exclude_kernel`), so a macOS `total_ns` includes syscall and fault time that the same run on
+///     Linux would leave out.
+///
+/// A macOS build only reaches the wall-clock backends if the runtime refuses the clock outright, and
+/// `backend_is_thread_scoped()` — reported in every log header, and warned about on stderr by
+/// `warn_if_wall_clock` — is what says so rather than leaving it to be assumed.
 namespace pm {
 namespace perf {
 
@@ -189,6 +221,36 @@ inline uint64_t thread_cputime_ns() {
     clock_gettime(CLOCK_THREAD_CPUTIME_ID, &ts);
     return (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
 }
+
+/// Does the *runtime* actually serve the clock the SDK declared?
+///
+/// Asked once, and asked at all because of macOS: the clock is a compile-time feature of the SDK and
+/// a run-time feature of the kernel, and a binary built on 10.12+ can be run somewhere the trap is
+/// refused. Two readings rather than one, because the failure that matters is not only `EINVAL` —
+/// a clock that returns success and never advances is a wall-clock fallback wearing a thread-scoped
+/// name, and a busy loop between the two readings is the cheapest way to catch it. The loop is
+/// bounded by iterations, not by time, so this cannot hang on a stopped clock.
+inline bool thread_cputime_available() {
+    struct timespec ts;
+    if (clock_gettime(CLOCK_THREAD_CPUTIME_ID, &ts) != 0)
+        return false;
+    uint64_t before = (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
+    volatile uint64_t sink = 0;
+    // Rounds of ~0.5 ms of work until the clock moves, up to ~30 ms of CPU in all. Bounded by
+    // iterations rather than by a deadline so a stopped clock ends the loop instead of owning it,
+    // and given that many rounds so that a coarse-but-working clock is not mistaken for a stopped
+    // one — a clock that cannot move in 30 ms of CPU time is no use for timing microseconds anyway.
+    for (int round = 0; round < 64; round++) {
+        for (int i = 0; i < 200000; i++)
+            sink = sink + (uint64_t)i;
+        if (clock_gettime(CLOCK_THREAD_CPUTIME_ID, &ts) != 0)
+            return false;
+        uint64_t after = (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
+        if (after > before)
+            return true;
+    }
+    return false;
+}
 #endif
 
 /// Ticks are cycles on `THREAD_CYCLES` and on `TSC`, and already nanoseconds on the other two.
@@ -228,6 +290,21 @@ inline uint64_t read_ticks(const ThreadClock& clock) {
 /// a shorter ramp measured `ns_per_tick` as much as 8% high on this machine — the counter is
 /// cycles, so calibrating at an unboosted frequency stretches every subsequent reading.
 ///
+/// The busy-wait must spend the window in **user mode**, which is why it is a batch of arithmetic
+/// between clock reads rather than a spin on the clock itself. `THREAD_CYCLES` counts user cycles
+/// only (`exclude_kernel` is forced), while every reference clock counts kernel time too, so any
+/// kernel time inside the window lands in the numerator and not in the denominator and inflates
+/// `ns_per_tick` directly. A tight `while (steady_clock_ns() - start < target) {}` is the worst case
+/// of exactly that: where the clocksource is not vDSO-able — `hpet`, `acpi_pm`, a VM without a
+/// paravirtual clock — every iteration is a syscall, the window is ~95% kernel time, and the
+/// calibration comes out **60x** high. That was measured here, on an `hpet` box where a
+/// `steady_clock` read costs 1.3 us: 15.3 ns/cycle against a true 0.253, i.e. every latency in every
+/// report inflated 60-fold while the ratios between them stayed entirely plausible. Batching the
+/// window into millisecond runs of arithmetic between clock reads brought the same host to 0.2575,
+/// 1.6% high — which is the frequency bias the paragraph below is about, and no longer a broken
+/// instrument. `calibration_looks_sane` is the backstop for whatever this reasoning has still
+/// missed.
+///
 /// The **smallest** of the kept windows wins, for the same reason: a window that caught a
 /// frequency excursion can only have counted fewer cycles per nanosecond, never more, so the
 /// minimum is the least-contaminated estimate. It cannot be gamed by descheduling the way a
@@ -239,13 +316,22 @@ inline uint64_t read_ticks(const ThreadClock& clock) {
 /// the same run — which is what the speedup tables are built from — divide it out entirely.
 inline double calibrate_ns_per_tick(const ThreadClock& clock, uint64_t (*reference_ns)()) {
     double best = 0;
+    // Volatile so the batch below is real work rather than something the optimiser folds away, and
+    // hoisted out of the loop so the whole calibration touches one cache line.
+    volatile uint64_t sink = 0;
     for (int window = 0; window < 4; window++) {
         uint64_t wall_start = steady_clock_ns();
         uint64_t ref_start = reference_ns();
         uint64_t tick_start = read_ticks(clock);
         uint64_t target = (window == 0 ? 25u : 10u) * 1000000ull;
-        while (steady_clock_ns() - wall_start < target) {
-        }
+        do {
+            // Sub-millisecond of user-mode arithmetic per clock read, so the window is user mode to
+            // within a fraction of a percent even where a `steady_clock` read costs the 1.3 us
+            // measured on the `hpet` host above. Overshooting the target by up to one batch is
+            // harmless: the window is measured, not assumed.
+            for (int i = 0; i < 1000000; i++)
+                sink = sink + (uint64_t)i;
+        } while (steady_clock_ns() - wall_start < target);
         uint64_t ticks = read_ticks(clock) - tick_start;
         uint64_t ns = reference_ns() - ref_start;
         if (window == 0 || ticks == 0)
@@ -255,6 +341,22 @@ inline double calibrate_ns_per_tick(const ThreadClock& clock, uint64_t (*referen
             best = ratio;
     }
     return best;
+}
+
+/// Is a calibrated cycle counter's ns-per-cycle a number a CPU could actually have?
+///
+/// The backstop on everything `calibrate_ns_per_tick` reasons about. A miscalibrated cycle counter
+/// does not fail, it *scales*: every stage, every mean and every tail moves by the same factor, the
+/// ratios between them stay exactly as plausible as before, and nothing in a report looks wrong. The
+/// 60x seen on an `hpet` host was found by comparing backends, not by reading a number that looked
+/// odd. So the range is checked rather than trusted, and a counter outside it is refused — falling
+/// back to a slower thread-scoped clock that is right beats keeping a fast one that is wrong.
+///
+/// The bounds are deliberately loose: `[0.02, 2.0]` ns/cycle is 0.5 GHz to 50 GHz, which no real core
+/// leaves and no plausible future one will either. This is a sanity check on the *instrument*, not a
+/// judgement about the machine.
+inline bool calibration_looks_sane(double ns_per_tick) {
+    return ns_per_tick >= 0.02 && ns_per_tick <= 2.0;
 }
 
 #if defined(PYREMATCHING_HAVE_THREAD_CYCLES)
@@ -318,7 +420,10 @@ inline void initialize(ThreadClock& clock) {
         if (clock.page != nullptr) {
             clock.backend = TimerBackend::THREAD_CYCLES;
             clock.ns_per_tick = calibrate_ns_per_tick(clock, thread_cputime_ns);
-            if (clock.ns_per_tick > 0) {
+            // A cycle counter is only as good as its calibration, and a bad one is silent — see
+            // `calibration_looks_sane`. Refused rather than kept, so the run lands on `cputime` and
+            // says `clock_thread_cputime_id` in its log header.
+            if (calibration_looks_sane(clock.ns_per_tick)) {
                 clock.initialized = true;
                 return;
             }
@@ -326,18 +431,28 @@ inline void initialize(ThreadClock& clock) {
     }
 #endif
 #if defined(PYREMATCHING_HAVE_THREAD_CPUTIME)
+    // The only thread-scoped backend macOS has, and the one a macOS run is expected to land on.
+    // Probed rather than assumed: on Linux the syscall is always there, on macOS the SDK declaring
+    // the clock is not the kernel serving it, and falling through to a wall clock while still
+    // *claiming* `clock_thread_cputime_id` would be the one failure mode that produces plausible
+    // numbers instead of obviously broken ones.
     if (want || strcmp(forced, "cputime") == 0) {
-        clock.backend = TimerBackend::THREAD_CPUTIME;
-        clock.ns_per_tick = 1.0;
-        clock.initialized = true;
-        return;
+        if (thread_cputime_available()) {
+            clock.backend = TimerBackend::THREAD_CPUTIME;
+            clock.ns_per_tick = 1.0;
+            clock.initialized = true;
+            return;
+        }
     }
 #endif
 #if defined(PYREMATCHING_HAVE_TSC)
     if (forced != nullptr && strcmp(forced, "tsc") == 0) {
         clock.backend = TimerBackend::TSC;
         clock.ns_per_tick = calibrate_ns_per_tick(clock, steady_clock_ns);
-        if (clock.ns_per_tick > 0) {
+        // The TSC is a fixed-rate counter rather than a core-cycle one, so this is a wider net than
+        // it looks — but a TSC calibrated against a wall clock is measuring like against like, and
+        // the check is here for the same reason as above: a scale error would be invisible.
+        if (calibration_looks_sane(clock.ns_per_tick)) {
             clock.initialized = true;
             return;
         }
@@ -366,6 +481,59 @@ inline TimerBackend current_backend() {
 
 inline const char* current_backend_name() {
     return backend_name(current_backend());
+}
+
+/// Wall time, for the one job that needs a wall clock: measuring how much of an interval this thread
+/// spent *not* running (`PreemptionProbe`). Never charge a stage with it.
+inline uint64_t wall_clock_ns() {
+    return internal::steady_clock_ns();
+}
+
+/// This thread's CPU time — user + kernel — or false where the platform has no thread-scoped clock.
+///
+/// Deliberately not routed through `ThreadTimer`: this is the *reference* clock, the one whose gap
+/// to wall time says the thread was descheduled, so it must be the thread-scoped clock itself and
+/// not whichever backend the timer settled on.
+inline bool thread_cpu_ns(uint64_t& out) {
+#if defined(PYREMATCHING_HAVE_THREAD_CPUTIME)
+    struct timespec ts;
+    if (clock_gettime(CLOCK_THREAD_CPUTIME_ID, &ts) != 0)
+        return false;
+    out = (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
+    return true;
+#else
+    (void)out;
+    return false;
+#endif
+}
+
+/// Says, loudly and on `stream`, that this run's numbers are wall-clock numbers. Returns whether it
+/// warned, so a caller can record the fact as well as print it.
+///
+/// Worth a banner rather than a parenthesis in a status line because of what a wall-clock fallback
+/// does to a campaign: it does not fail, it does not look wrong, it just quietly charges every stage
+/// for whatever else the machine was doing, and every mean and every speedup built on it inherits
+/// that. The failure is silent by nature, so the warning cannot be.
+inline bool warn_if_wall_clock(std::FILE* stream) {
+    if (backend_is_thread_scoped(current_backend()))
+        return false;
+    std::fprintf(
+        stream,
+        "\n"
+        "  ##########################################################################\n"
+        "  WARNING: latency is being measured with a WALL CLOCK, backend '%s'.\n"
+        "  ##########################################################################\n"
+        "  No thread-scoped clock was available, so every timing on this run includes\n"
+        "  whatever time the thread spent off the CPU: means, tails and speedups all\n"
+        "  carry the scheduler's interference inside them and are upper bounds only.\n"
+        "  Linux: needs perf_event_open (perf_event_paranoid <= 2) or clock_gettime\n"
+        "         (CLOCK_THREAD_CPUTIME_ID).\n"
+        "  macOS: needs clock_gettime(CLOCK_THREAD_CPUTIME_ID), i.e. macOS 10.12+.\n"
+        "  Check PYREMATCHING_TIMER, which forces the backend and may be set to chrono.\n"
+        "\n",
+        current_backend_name());
+    std::fflush(stream);
+    return true;
 }
 
 /// A stopwatch over thread run time. See the header comment for what "run time" excludes.

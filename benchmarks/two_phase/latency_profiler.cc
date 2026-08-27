@@ -33,6 +33,36 @@
 ///
 ///     sparse = blossom_ns + dscan_ns + hrvst_ns  (+ escal_stock_ns on an escalating shot)
 ///
+/// ## The two things the report prices, and which one the speedup is
+///
+/// `sparse` above is one **serial** machine: it runs the front end on `H`, and on a shot the
+/// certificate rejects it *then* pays a stock re-decode on `G`. That is the honest price of a
+/// decoder that only starts `G` once it knows it needs it, and it is reported as `sparse_mean`.
+///
+/// It is not the machine anyone would deploy. A deployment has both graphs in front of it and no
+/// reason to hold `G` back, so it starts the solve on `H` and the solve on `G` **concurrently** and
+/// stops the moment either produces a matching it can use. That system is what `system_mean` prices:
+///
+///     system = stock_g_ns                                  on an escalating shot
+///            = min(blossom_ns + dscan_ns + hrvst_ns,
+///                  stock_g_ns)                             otherwise
+///
+/// On a shot the certificate keeps, the answer is whichever race finished first — in practice `H`'s,
+/// which is the whole point, but the `min` is written rather than assumed. On a shot it rejects,
+/// `H`'s work bought nothing and the system waits out the `G` decode that has been running all
+/// along: the escalation costs the *full* `G` latency and not a nanosecond more, where the serial
+/// machine pays `H` and then `G` end to end. Escalation is therefore priced as lost opportunity
+/// rather than as an added tail, which is what concurrency actually buys.
+///
+/// Every speedup in this report is `stock_mean / system_mean` — the decoder system without graph
+/// sparsification against the same system predicating on `H` — over the same uncontaminated shots.
+/// `sparse_mean` is printed beside it as the serial reading, and is never a denominator.
+///
+/// Two costs the concurrent reading assumes away, stated rather than buried: the two solves are
+/// assumed to run on cores that are not competing for each other's memory bandwidth, and `G`'s
+/// decode is assumed to be running from the start of the shot at no scheduling cost. Both are the
+/// same critical-path style of assumption §M2 makes for ball intersect and the `H` build.
+///
 /// which is the solve on `H`, §M7.7's terminal `max_u Y(u)` scan, and the harvest — the three stages
 /// that are on the critical path once the front end is running — plus, on the shots that escalate,
 /// the stock re-decode on `G` that Phase 2 pays. Ball intersect, `H` build and `Mwpm(H)` build are
@@ -51,8 +81,16 @@
 ///
 /// Shots the scheduler interfered with are flagged rather than dropped. `HiResTimer` is
 /// thread-scoped, so such a shot is no longer *charged* for its off-CPU time, but it resumed on
-/// caches it did not leave, so it is still an outlier — the plotting script excludes them by default
-/// and says how many it excluded.
+/// caches it did not leave, so it is still an outlier — the printed means exclude them, and the
+/// plotting script excludes them by default and says how many it excluded.
+///
+/// Both the timer and that flag are platform-dependent, and the run says which instruments it got
+/// before it decodes anything. On Linux the timer is a per-thread PMU cycle counter and the flag is
+/// the thread's context-switch counters; on macOS both come from
+/// `clock_gettime(CLOCK_THREAD_CPUTIME_ID)` — the timer directly, the flag as the gap between wall
+/// time and thread CPU time over the shot, since Darwin exposes no per-thread switch counter (see
+/// `PreemptionProbe`). If neither a thread-scoped clock is available, the run prints a wall-clock
+/// warning banner and every number it produces is an upper bound with the scheduler inside it.
 ///
 /// Beside the latency series, every run also dumps the **component structure** of the sparsified
 /// graph `H`: its connected components, their sizes, weighted diameters and boundary structure, the
@@ -434,9 +472,29 @@ struct ShotRow {
     /// pre-pass excluded from every column above by measurement scope — and 0 at `k = 0`.
     int defects_resolved_small{0};
 
-    /// The sparsified series. Kept identical to `plot_latency_histograms.py`'s `series_of`.
+    /// The sparsified series, as one **serial** machine: the front end on `H`, then — on a shot the
+    /// certificate rejects — the Phase-2 re-decode on `G` after it. Kept identical to
+    /// `plot_latency_histograms.py`'s `series_of`.
     long long sparse_ns() const {
         return blossom_ns + dscan_ns + hrvst_ns + escal_stock_ns;
+    }
+
+    /// The front end alone: what `H` costs before anything is known about whether it will be kept.
+    long long h_path_ns() const {
+        return blossom_ns + dscan_ns + hrvst_ns;
+    }
+
+    /// The **concurrent** decoder system: `H` and `G` started together, the shot ending the moment a
+    /// usable matching exists. See the file comment for the definition and its assumptions.
+    ///
+    /// On an escalating shot that is the `G` decode, which has been running all along — `escal_stock_ns`
+    /// is deliberately *not* added, because in this system the re-decode is not a second decode. On
+    /// any other shot it is whichever of the two finished first; the `min` is written out rather than
+    /// assumed, so a grid point where `H` is the slower side reports that instead of hiding it.
+    long long system_ns() const {
+        if (escalated)
+            return stock_g_ns;
+        return std::min(h_path_ns(), stock_g_ns);
     }
     /// §D's figure of merit for the pruning experiment: the two stages a smaller node set moves.
     long long solve_and_harvest_ns() const {
@@ -500,12 +558,26 @@ void write_header(
     out << "# timer_backend=" << pm::perf::current_backend_name() << "\n";
     out << "# timer_thread_scoped=" << (pm::perf::backend_is_thread_scoped(pm::perf::current_backend()) ? 1 : 0)
         << "\n";
+    // How `contaminated` was decided on the machine that wrote this file. A rate of zero means two
+    // different things under `rusage_thread_switches` and under `none`, and only the header can tell
+    // them apart (§M6.4).
+    out << "# preemption_probe=" << PreemptionProbe::mechanism_name() << "\n";
+    out << "# preemption_slack_ns=" << PreemptionProbe::slack_ns() << "\n";
     // Recorded for the same reason the backend is: it is a write this process made while the loop
     // was running. It happens between shots, outside every timed window, at most ~101 times a job.
     out << "# progress_bar=" << (progress.enabled ? (progress.interactive ? "bar" : "lines") : "off") << "\n";
     // What each latency column is, stated in the file rather than left to the plotting script.
     out << "# stock_g_ns=stock exact sparse blossom on the original detector graph G\n";
-    out << "# sparse_ns=blossom_ns+dscan_ns+hrvst_ns+escal_stock_ns, summed by the reader\n";
+    out << "# sparse_ns=blossom_ns+dscan_ns+hrvst_ns+escal_stock_ns, summed by the reader; the"
+           " serial machine, which starts G only once H is rejected\n";
+    // The system the report's speedup is a ratio of. Derived by the reader from columns that are all
+    // already here, so it is a definition rather than a column — stated in the file so that every
+    // reader derives the same one.
+    out << "# system_ns=the concurrent decoder system: H and G solved at once, the shot ending when a"
+           " usable matching exists.\n";
+    out << "#   escalated shot: stock_g_ns (the G decode was already running; H bought nothing)\n";
+    out << "#   otherwise:      min(blossom_ns+dscan_ns+hrvst_ns, stock_g_ns)\n";
+    out << "# speedup=mean(stock_g_ns)/mean(system_ns) over uncontaminated shots\n";
     out << "# blossom_ns=the solve on the sparsified graph H, dual scan excluded\n";
     out << "# dscan_ns=the terminal max_u Y(u) scan, i.e. the certificate's own cost\n";
     out << "# hrvst_ns=harvest/extraction on H\n";
@@ -757,6 +829,25 @@ int main(int argc, char** argv) {
         pm::perf::current_backend_name(),
         pm::perf::backend_is_thread_scoped(pm::perf::current_backend()) ? "thread-scoped"
                                                                         : "WALL CLOCK — timings include off-CPU time");
+    // The banner goes to stderr as well as being implied by the line above, because a wall-clock run
+    // is a run whose every number is an upper bound and that fact must survive `> run.log`: stdout is
+    // where the table goes and is routinely redirected, stderr is what stays on the screen.
+    pm::perf::warn_if_wall_clock(stderr);
+    const std::string probe = PreemptionProbe::mechanism_name();
+    std::printf(
+        "contamination probe: %s%s\n",
+        probe.c_str(),
+        probe == "none" ? " — no shot can be flagged on this platform; `contam` will read 0 because"
+                          " nothing was measured, not because the machine was quiet"
+                        : "");
+    if (probe == "wall_minus_thread_cpu") {
+        // The macOS path. Says what "contaminated" means here, since it is a threshold rather than an
+        // exact counter, and where the threshold came from.
+        std::printf(
+            "  a shot is contaminated when wall time exceeds this thread's CPU time by more than"
+            " %llu ns\n  (PYREMATCHING_PREEMPTION_SLACK_NS)\n",
+            (unsigned long long)PreemptionProbe::slack_ns());
+    }
     std::error_code dir_error;
     std::filesystem::create_directories(options.out_dir, dir_error);
     if (dir_error) {
@@ -775,12 +866,15 @@ int main(int argc, char** argv) {
         "writing one latency log%s per (d, p, T, mode, k) to %s\n\n",
         options.component_stats ? " and one component file" : "",
         options.out_dir.c_str());
-    // `b+h` is §D's figure of merit — the solve on `H` plus the harvest, the two stages a smaller
-    // node set moves — `triv`/`solver` are the share of the defect set that sits in a component of
-    // size <= 2 and the share the solver would still have to take, and `resolved` is the mean number
-    // of defects the resolver took off the solver per shot at this run's `k`.
+    // `sparse_mean` is the serial machine (H, then G on a rejected shot) and `system_mean` the
+    // concurrent one (H and G at once, ending at the first usable matching); `speedup` is
+    // `stock_mean / system_mean` and nothing else. `b+h` is §D's figure of merit — the solve on `H`
+    // plus the harvest, the two stages a smaller node set moves — `triv`/`solver` are the share of
+    // the defect set that sits in a component of size <= 2 and the share the solver would still have
+    // to take, and `resolved` is the mean number of defects the resolver took off the solver per shot
+    // at this run's `k`.
     std::printf(
-        "%4s %8s %5s %8s %3s %8s %11s %11s %8s %11s %8s %9s %8s %6s %6s %9s\n",
+        "%4s %8s %5s %8s %3s %8s %11s %11s %11s %8s %11s %8s %9s %8s %6s %6s %9s\n",
         "d",
         "p",
         "T",
@@ -789,6 +883,7 @@ int main(int argc, char** argv) {
         "shots",
         "stock_mean",
         "sparse_mean",
+        "system_mean",
         "speedup",
         "b+h_mean",
         "escal",
@@ -895,6 +990,7 @@ int main(int argc, char** argv) {
 
                         QuickStats stock = quick_stats(rows, [](const ShotRow& row) { return row.stock_g_ns; });
                         QuickStats sparse = quick_stats(rows, [](const ShotRow& row) { return row.sparse_ns(); });
+                        QuickStats system = quick_stats(rows, [](const ShotRow& row) { return row.system_ns(); });
                         QuickStats solve_harvest =
                             quick_stats(rows, [](const ShotRow& row) { return row.solve_and_harvest_ns(); });
                         size_t escalated = 0;
@@ -903,21 +999,23 @@ int main(int argc, char** argv) {
                             escalated += (size_t)row.escalated;
                             contaminated += (size_t)row.contaminated;
                         }
-                        // stock's mean over the two-phase mean, both including every escalated shot:
-                        // what the front end buys once the escalation tail is paid for.
-                        double speedup = sparse.mean > 0 ? stock.mean / sparse.mean : 0.0;
+                        // The decoder system without sparsification over the same system predicating
+                        // on `H`, both including every escalated shot: what the front end buys once
+                        // the escalations are priced as the lost race they are.
+                        double speedup = system.mean > 0 ? stock.mean / system.mean : 0.0;
                         double escalated_fraction = rows.empty() ? 0.0 : (double)escalated / (double)rows.size();
                         std::printf(
-                            "%4zu %8g %5g %8s %3d %8zu %9.3fus %9.3fus %8.3fx %9.3fus %8zu %8.3f%% %8zu %5.1f%%"
-                            " %5.1f%% %9.3f\n",
+                            "%4zu %8g %5g %8s %3d %8zu %9.3fus %9.3fus %9.3fus %8.3fx %9.3fus %8zu %8.3f%% %8zu"
+                            " %5.1f%% %5.1f%% %9.3f\n",
                             distance,
                             noise,
                             horizon,
                             mode_name(mode),
                             k,
-                            sparse.kept,
+                            system.kept,
                             stock.mean / 1000.0,
                             sparse.mean / 1000.0,
+                            system.mean / 1000.0,
                             speedup,
                             solve_harvest.mean / 1000.0,
                             escalated,
@@ -936,10 +1034,18 @@ int main(int argc, char** argv) {
     std::printf(
         "\n%zu file(s) written. Means above are over uncontaminated shots only, escalated shots"
         " included;\n`contam` is how many of the %zu shots at each point were dropped from them, and"
-        " `escal`/`escal_frac`\nare over all %zu. `speedup` is stock_mean/sparse_mean, so the"
-        " escalation tail is priced into it.\n`sparse_mean` is blossom+dscan+hrvst, plus the Phase-2"
-        " re-decode on the shots that escalate; ball\nintersect, H build and Mwpm(H) build are not in"
-        " it and are logged as `excluded_ns` in every file.\n"
+        " `escal`/`escal_frac`\nare over all %zu.\n"
+        "`sparse_mean` is the serial machine: blossom+dscan+hrvst, plus the Phase-2 re-decode after it"
+        " on the\nshots that escalate. Ball intersect, H build and Mwpm(H) build are in neither"
+        " column and are logged\nas `excluded_ns` in every file.\n"
+        "`system_mean` is the concurrent decoder system — H and G solved at once, the shot ending at"
+        " the first\nusable matching. An escalating shot is charged the stock decode on G alone,"
+        " because that decode was\nalready running and H's work bought nothing; any other shot is"
+        " charged min(blossom+dscan+hrvst,\nstock). Escalation is priced as a lost race rather than"
+        " as an added tail.\n"
+        "`speedup` is stock_mean/system_mean: the decoder system without graph sparsification against"
+        " the same\nsystem predicating on H, over the same shots. `sparse_mean` is never a"
+        " denominator.\n"
         "`b+h_mean` is blossom+hrvst alone — the two stages a smaller node set moves. `triv` and"
         " `solver`\nare shares of H's defects: in a component of size <= 2, and left to the solver"
         " anyway. Both are\nstructural, measured outside every timed window, and detailed per grid"

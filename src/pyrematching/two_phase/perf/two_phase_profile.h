@@ -18,6 +18,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <cstdlib>
 #include <vector>
 
 #include "pyrematching/perf/thread_timer.h"
@@ -26,6 +27,21 @@
 
 #if defined(__linux__)
 #include <sys/resource.h>
+#endif
+
+/// Linux hands out a per-thread context-switch counter and nothing else does, so `RUSAGE_THREAD` is
+/// the preferred mechanism where it exists and `PYREMATCHING_PREEMPTION_CLOCK_GAP` is the fallback
+/// used everywhere else that has a thread-scoped clock — macOS in particular. See `PreemptionProbe`.
+///
+/// `-DPYREMATCHING_FORCE_CLOCK_GAP_PROBE` selects the fallback on a machine that has the counters,
+/// which is how the macOS path is exercised from a Linux CI box — the mechanism is chosen at compile
+/// time, so without it there is no way to run that code at all.
+#if defined(PYREMATCHING_FORCE_CLOCK_GAP_PROBE) && defined(PYREMATCHING_HAVE_THREAD_CPUTIME)
+#define PYREMATCHING_PREEMPTION_CLOCK_GAP 1
+#elif defined(__linux__) && defined(RUSAGE_THREAD)
+#define PYREMATCHING_PREEMPTION_SWITCH_COUNTERS 1
+#elif defined(PYREMATCHING_HAVE_THREAD_CPUTIME)
+#define PYREMATCHING_PREEMPTION_CLOCK_GAP 1
 #endif
 
 namespace pm {
@@ -47,16 +63,56 @@ using HiResTimer = pm::perf::ThreadTimer;
 /// also the cross-check on the clock: on a thread-scoped backend a contaminated shot should now
 /// look much like its neighbours, and if it does not, the backend is not doing what it claims.
 ///
-/// `RUSAGE_THREAD` is Linux-specific; elsewhere the probe reports "not contaminated" and
-/// `contaminated_shot_rate` reads 0, which the artifact says explicitly rather than implying the
-/// machine was quiet.
+/// ## How it is detected, and why that differs by platform
+///
+/// `getrusage(RUSAGE_THREAD)` counts this thread's voluntary and involuntary context switches, so on
+/// Linux the question is answered exactly: the counters moved, or they did not.
+///
+/// macOS has no `RUSAGE_THREAD` and exposes no per-thread switch counter at all — not through
+/// `getrusage`, not through `proc_pid_rusage`, not through `thread_info` — so the same question is
+/// answered by **the gap between two clocks** instead. Over any interval, wall time minus this
+/// thread's CPU time is the time the thread was not running; a run of that anywhere near the cost of
+/// a context switch means the thread lost the CPU. This is a different instrument from the Linux one
+/// and it is worth being clear about how it differs:
+///
+///   - it measures *how much* time was lost rather than *how many* switches happened, so a switch
+///     that returns the CPU inside the slack below is not seen. That is the intended trade: the
+///     reason a contaminated shot is dropped is the state it lost, and a switch too short to show up
+///     in the clock gap did not have time to lose much of it;
+///   - it charges the same way for anything else that takes the thread off the CPU — a page fault
+///     that goes to disk, a blocking syscall — which for this purpose is a feature, since those cost
+///     the shot the same caches;
+///   - both readings are taken inside `sample()`, in a fixed order, so the skew between them cancels
+///     between two samples to within the variation of two clock reads (tens of nanoseconds against a
+///     two-microsecond slack).
+///
+/// The slack is `PYREMATCHING_PREEMPTION_SLACK_NS`, default 2000. Well above the noise of four clock
+/// readings, well below the tens of microseconds a real deschedule costs.
+///
+/// Run against the switch counters on the same intervals on a Linux box (which is what
+/// `PYREMATCHING_FORCE_CLOCK_GAP_PROBE` is for), the gap flags a **superset**: over 200 intervals of
+/// ~30 us it flagged 35 where the counters flagged 29, and every one of those 29 was among them. The
+/// extras are intervals that lost 2 us or more without a thread context switch being charged for it,
+/// interrupt handling most of them — which is off-CPU time that costs the shot its caches just the
+/// same. Over intervals of a few microseconds, the length a shot actually is, the mean gap on an idle
+/// machine measured 0.8 us against the 2 us slack, so the skew between the two clocks does not flag
+/// anything on its own.
+///
+/// Where neither mechanism exists the probe reports "not contaminated" and `contaminated_shot_rate`
+/// reads 0, which the artifact says explicitly rather than implying the machine was quiet. Read
+/// `mechanism_name()` beside the rate, for the same reason the timer backend is read beside the
+/// timings: a rate of 0 from `none` is not a measurement.
 struct PreemptionProbe {
+    /// Switch counters, on the platforms that have them.
     long voluntary{0};
     long involuntary{0};
+    /// The two clocks whose divergence stands in for them where they do not.
+    uint64_t wall_ns{0};
+    uint64_t cpu_ns{0};
     bool supported{false};
 
     inline void sample() {
-#if defined(__linux__) && defined(RUSAGE_THREAD)
+#if defined(PYREMATCHING_PREEMPTION_SWITCH_COUNTERS)
         struct rusage usage;
         if (getrusage(RUSAGE_THREAD, &usage) == 0) {
             voluntary = usage.ru_nvcsw;
@@ -64,15 +120,67 @@ struct PreemptionProbe {
             supported = true;
             return;
         }
+#elif defined(PYREMATCHING_PREEMPTION_CLOCK_GAP)
+        // Order matters and is fixed: CPU first, wall second, in both samples. The interval's wall
+        // time then includes the cost of one CPU-clock read at each end and the interval's CPU time
+        // does not, which biases the gap by a constant that is the same on every shot and is an order
+        // of magnitude under the slack.
+        uint64_t cpu = 0;
+        if (pm::perf::thread_cpu_ns(cpu)) {
+            cpu_ns = cpu;
+            wall_ns = pm::perf::wall_clock_ns();
+            supported = true;
+            return;
+        }
 #endif
         supported = false;
     }
 
-    /// True when a context switch happened between `before` and this sample.
+    /// True when this thread lost the CPU between `before` and this sample.
     inline bool switched_since(const PreemptionProbe& before) const {
         if (!supported || !before.supported)
             return false;
+#if defined(PYREMATCHING_PREEMPTION_SWITCH_COUNTERS)
         return voluntary != before.voluntary || involuntary != before.involuntary;
+#elif defined(PYREMATCHING_PREEMPTION_CLOCK_GAP)
+        // Unsigned throughout, so a wall clock that failed to advance while the CPU clock did cannot
+        // wrap into a huge positive gap and flag every shot.
+        if (wall_ns <= before.wall_ns || cpu_ns < before.cpu_ns)
+            return false;
+        uint64_t wall = wall_ns - before.wall_ns;
+        uint64_t cpu = cpu_ns - before.cpu_ns;
+        return wall > cpu && wall - cpu > slack_ns();
+#else
+        return false;
+#endif
+    }
+
+    /// Which of the two instruments above filled this build's samples. Recorded beside the rate.
+    static inline const char* mechanism_name() {
+#if defined(PYREMATCHING_PREEMPTION_SWITCH_COUNTERS)
+        return "rusage_thread_switches";
+#elif defined(PYREMATCHING_PREEMPTION_CLOCK_GAP)
+        return "wall_minus_thread_cpu";
+#else
+        return "none";
+#endif
+    }
+
+    /// Nanoseconds of off-CPU time an interval is allowed before the shot is called contaminated.
+    /// Meaningless under the switch-counter mechanism, which does not measure a duration.
+    static inline uint64_t slack_ns() {
+        static const uint64_t slack = [] {
+            const char* value = std::getenv("PYREMATCHING_PREEMPTION_SLACK_NS");
+            if (value == nullptr || value[0] == '\0')
+                return (uint64_t)2000;
+            char* end = nullptr;
+            unsigned long long parsed = std::strtoull(value, &end, 10);
+            // A typo must not silently widen the slack until nothing is ever flagged.
+            if (end == value || *end != '\0')
+                return (uint64_t)2000;
+            return (uint64_t)parsed;
+        }();
+        return slack;
     }
 };
 

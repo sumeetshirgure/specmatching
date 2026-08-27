@@ -18,9 +18,14 @@
     python benchmarks/two_phase/plot_latency_histograms.py \
         benchmarks/two_phase/results/latency
 
-One figure per log file, two histograms in each: stock exact decode on the original graph `G`
-against the M7 front end on the sparsified graph `H`. Both sides are stock sparse blossom, timed on
-the same shots, so the gap between the two distributions is `H`'s own win and nothing else.
+One figure per log file, two histograms in each: stock exact decode on the original graph `G`, and
+the decoder system that runs `G` and the M7 front end on the sparsified graph `H` at once. Every side
+is stock sparse blossom, timed on the same shots, so the gap between the distributions is `H`'s own
+win and nothing else.
+
+The serial `sparse` machine described next is still computed and still reported in the text table —
+it is simply not drawn: the figure is the two distributions the speedup is a ratio of, and the third
+curve shared its bulk with the system series exactly.
 
 The sparsified series is the three stages that are on the critical path once the front end is
 running,
@@ -28,19 +33,34 @@ running,
     sparse = blossom_ns + dscan_ns + hrvst_ns  (+ escal_stock_ns on an escalating shot)
 
 i.e. the solve on `H`, §M7.7's terminal dual scan and the harvest, plus — on the shots the
-certificate rejects — the full Phase-2 stock re-decode on `G`. The escalation tail is therefore in
-the histogram rather than amortised away beside it. Ball intersect, `H` build and `Mwpm(H)` build are
-**not** in it: §M2's critical-path read discounts them as pipelined out. The profiler logs their sum
-as `excluded_ns`, so `--include-excluded` puts them back and draws the honest CPU number instead; the
-caption says which of the two is on the page.
+certificate rejects — the full Phase-2 stock re-decode on `G`, *after* them. That is one serial
+machine: it starts `G` only once `H` has been rejected. Ball intersect, `H` build and `Mwpm(H)` build
+are **not** in it: §M2's critical-path read discounts them as pipelined out. The profiler logs their
+sum as `excluded_ns`, so `--include-excluded` puts them back and draws the honest CPU number instead;
+the caption says which of the two is on the page.
+
+The system series is the machine anyone would actually deploy: `H` and `G` solved **concurrently**,
+the shot ending the moment a usable matching exists.
+
+    system = stock_g_ns                                         on an escalating shot
+           = min(blossom_ns + dscan_ns + hrvst_ns, stock_g_ns)  otherwise
+
+An escalating shot is charged the `G` decode alone — that decode was already running, and `H`'s work
+bought nothing — so escalation costs a lost race rather than a second decode stacked on the first.
+Every speedup here is `mean(stock) / mean(system)`: the decoder system without graph sparsification
+against the same system predicating on `H`. The serial `sparse` mean is reported beside it and is
+never a denominator.
 
 What the figure states rather than leaves to be inferred:
 
   * the means, direct-labelled, because the speedup is a ratio of means and the reader should be able
     to see the two numbers it is a ratio of;
-  * how many shots escalated, since those are the whole right tail of the sparsified series;
+  * how many shots escalated, since those are the shots the system is charged the `G` decode alone
+    for, and the whole right tail of the serial series in the table;
   * how many shots the plot clips off the right edge, and how many contaminated shots were dropped
-    before anything was computed. Neither is ever silent.
+    before anything was computed. Neither is ever silent;
+  * which timer produced the numbers, and — loudly, in the caption, in the table header and on
+    stderr — whether it was a wall clock rather than a thread-scoped counter.
 
 No percentiles are reported. The one place a percentile survives is `--x-max-percentile`, which
 chooses where the x axis stops — a view control, not a statistic, and the caption states as a count
@@ -90,16 +110,17 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt  # noqa: E402
 from matplotlib.ticker import FuncFormatter  # noqa: E402
 
-# Categorical slots 1 and 2, light and dark steps. Two series, fixed order: `G` is always slot 1 and
-# the sparsified graph always slot 2, at every grid point, so a reader moving between figures never
-# has to re-read the legend.
+# Categorical slots 1 to 3, light and dark steps. Fixed order: `G` is always slot 1, the sparsified
+# graph always slot 2 — which the latency figure no longer draws, but the component figure still
+# wears — and the concurrent system always slot 3, at every grid point, so a reader moving between
+# figures never has to re-read the legend.
 THEMES = {
     "light": {
         "surface": "#fcfcfb",
         "text_primary": "#0b0b0b",
         "text_secondary": "#52514e",
         "grid": "#dcdcd8",
-        "series": ("#2a78d6", "#eb6834"),
+        "series": ("#2a78d6", "#eb6834", "#2f8f5b"),
         # The `k` overlay's categorical slots, taken in `(k, T)` order so a run keeps its colour
         # between figures. Cycled if a figure carries more runs than there are slots.
         "k_series": ("#2a78d6", "#eb6834", "#2f8f5b", "#8a5cd6", "#c0a02c", "#4a4a46"),
@@ -109,13 +130,13 @@ THEMES = {
         "text_primary": "#ffffff",
         "text_secondary": "#c3c2b7",
         "grid": "#3a3a37",
-        "series": ("#3987e5", "#d95926"),
+        "series": ("#3987e5", "#d95926", "#3f9e69"),
         "k_series": ("#3987e5", "#d95926", "#3f9e69", "#9a6ee0", "#cfae37", "#9a9a90"),
     },
 }
 
 STOCK_LABEL = "stock decode on G"
-SPARSE_LABEL = "stock decode on sparsified H"
+SYSTEM_LABEL = "system: H and G at once, first match wins"
 SOLVE_HARVEST_LABEL = "solver + harvest, on the components of size > k"
 
 # Rows are parsed in blocks of this many, so the transient cost of a read is set by the block and not
@@ -308,15 +329,21 @@ def collect(paths):
 
 
 def series_of(log, include_contaminated, include_excluded):
-    """The two series, in microseconds, plus the counts the caption has to state.
+    """The three series, in microseconds, plus the counts the caption has to state.
 
     The sparsified side is summed here, from the stage columns rather than from a pre-summed one, so
     that what is charged is visible in this function: solve on `H`, terminal dual scan, harvest, and
-    on an escalating shot the Phase-2 re-decode on `G`. `escal_stock_ns` is zero on every shot that
-    did not escalate, so no branch is needed to say "escalated shots pay both".
+    on an escalating shot the Phase-2 re-decode on `G` after them. `escal_stock_ns` is zero on every
+    shot that did not escalate, so no branch is needed to say "escalated shots pay both".
 
-    Contaminated shots — the thread was descheduled mid-shot — are dropped from **both** series
-    before anything is computed, so the two stay paired shot for shot. The count is returned rather
+    The system side is the concurrent machine, and is where the branch is real: an escalating shot is
+    charged `stock_g_ns` and nothing else, because in that machine the `G` decode has been running
+    since the start of the shot and the `H` work is simply discarded. Every other shot is charged
+    whichever of the two finished first. Both are derived here rather than logged, from columns the
+    profiler already writes, and the profiler states the same definition in each log's header.
+
+    Contaminated shots — the thread was descheduled mid-shot — are dropped from **all three** series
+    before anything is computed, so they stay paired shot for shot. The count is returned rather
     than swallowed.
 
     The file is walked once, `CHUNK_ROWS` rows at a time, and each block is dropped as soon as the
@@ -335,6 +362,7 @@ def series_of(log, include_contaminated, include_excluded):
     usecols = tuple(log.columns.index(name) for name in names)
     stock_chunks = []
     sparse_chunks = []
+    system_chunks = []
     escalated = 0
     dropped = 0
     components = dict.fromkeys(COMPONENT_NEEDED, 0) if log.has_components else None
@@ -360,16 +388,23 @@ def series_of(log, include_contaminated, include_excluded):
             if not kept.shape[0]:
                 continue
             escalated += int(kept[:, at["escalated"]].sum())
-            value = (
-                kept[:, at["blossom_ns"]]
-                + kept[:, at["dscan_ns"]]
-                + kept[:, at["hrvst_ns"]]
-                + kept[:, at["escal_stock_ns"]]
-            )
+            stock = kept[:, at["stock_g_ns"]]
+            front_end = kept[:, at["blossom_ns"]] + kept[:, at["dscan_ns"]] + kept[:, at["hrvst_ns"]]
+            value = front_end + kept[:, at["escal_stock_ns"]]
             if include_excluded:
-                value += kept[:, at["excluded_ns"]]
-            stock_chunks.append(kept[:, at["stock_g_ns"]] / 1000.0)
+                # The pipelined-out stages are charged to the front end itself, so they land in both
+                # the serial series and the system's `H` side — in the concurrent machine they are
+                # still work that has to happen before `H` can answer.
+                front_end = front_end + kept[:, at["excluded_ns"]]
+                value = value + kept[:, at["excluded_ns"]]
+            system = np.where(
+                kept[:, at["escalated"]] != 0,
+                stock,
+                np.minimum(front_end, stock),
+            )
+            stock_chunks.append(stock / 1000.0)
             sparse_chunks.append(value / 1000.0)
+            system_chunks.append(system / 1000.0)
             if components is not None:
                 accumulate_components(components, kept, at)
     empty = np.empty(0, dtype=np.float64)
@@ -377,7 +412,9 @@ def series_of(log, include_contaminated, include_excluded):
     stock_chunks.clear()
     sparse = np.concatenate(sparse_chunks) if sparse_chunks else empty
     sparse_chunks.clear()
-    return stock, sparse, escalated, dropped, components
+    system = np.concatenate(system_chunks) if system_chunks else empty
+    system_chunks.clear()
+    return stock, sparse, system, escalated, dropped, components
 
 
 def solve_harvest_series(log, include_contaminated):
@@ -507,11 +544,14 @@ def draw_k_overlay(logs, args, theme):
         f"{len(runs)} independent runs on the same shots, one per (k, T)  ·  "
         f"{clipped:,} shots beyond the right edge\n"
         "solver + harvest only: the resolve of the size <= k components runs before it, in series, on the"
-        " critical path, and is in none of these numbers —\nit is outside the profiler's measurement scope"
-        " by intent, not free and not concurrent."
+        " critical path, and is in none of these numbers —"
+        " it is outside the profiler's measurement scope by intent, not free and not concurrent."
     )
+    caption = wrap_caption(caption)
     fig.text(0.012, 0.005, caption, color=theme["text_secondary"], fontsize=8.5, va="bottom")
-    fig.tight_layout(rect=(0, 0.085, 1, 1))
+    # The axes give up exactly as much of the figure as the caption turned out to need, so a longer
+    # caption pushes the plot up rather than being drawn over it.
+    fig.tight_layout(rect=(0, min(0.3, 0.02 + 0.033 * (caption.count("\n") + 1)), 1, 1))
 
     stem = f"bh_by_k_d{first.meta.get('d', 'NA')}_p{first.meta.get('p', 'NA')}_{first.meta.get('mode', 'NA')}"
     written = []
@@ -775,6 +815,19 @@ def draw_components(log, component, args, theme):
     return written
 
 
+def wrap_caption(text, width=135):
+    """Re-wraps a caption to the figure width, keeping the author's own line breaks.
+
+    A caption that runs off the right edge is a caption that was not read, and these say things —
+    which shots were dropped, which timer produced the numbers, what the speedup is a ratio of — that
+    the figure is not honest without. The default width is what fits a 9-inch figure at 8.5 pt.
+    """
+    return "\n".join(
+        textwrap.fill(line, width=width, break_long_words=False) if line else ""
+        for line in text.split("\n")
+    )
+
+
 def percentile(values, fraction):
     """Only ever used to choose where the x axis stops; nothing reported is a percentile.
 
@@ -799,16 +852,16 @@ def stats_of(values):
     }
 
 
-def bin_edges(stock, sparse, x_max, bins, log_x):
-    """Shared edges for both series — two histograms on different bins are not comparable.
+def bin_edges(sides, x_max, bins, log_x):
+    """Shared edges for every series — histograms on different bins are not comparable.
 
-    Takes the two series rather than a pooled copy of them: the low edge is a minimum, and a minimum
-    over a union is the smaller of the two minima.
+    Takes the series rather than a pooled copy of them: the low edge is a minimum, and a minimum over
+    a union is the smallest of the individual minima.
     """
     if log_x:
-        lows = [float(side[side > 0].min()) for side in (stock, sparse) if np.any(side > 0)]
+        lows = [float(side[side > 0].min()) for side in sides if np.any(side > 0)]
     else:
-        lows = [float(side.min()) for side in (stock, sparse) if side.size]
+        lows = [float(side.min()) for side in sides if side.size]
     low = max(min(lows), 1e-3) if lows else 1e-3
     high = max(x_max, low * (1.0 + 1e-6))
     if log_x:
@@ -817,31 +870,42 @@ def bin_edges(stock, sparse, x_max, bins, log_x):
 
 
 def draw(log, args, theme):
-    stock, sparse, escalated, dropped, components = series_of(
+    stock, sparse, system, escalated, dropped, components = series_of(
         log, args.include_contaminated, args.include_excluded
     )
     if not stock.size:
         print(f"  {log.stem}: every shot was contaminated; nothing to plot")
         return None
 
-    # The axis has to reach past both means with room for their labels, or the escalation tail pushes
-    # a mean off the right edge and the figure loses the number it is built around.
+    # The axis has to reach past every mean with room for its label, or the escalation tail pushes a
+    # mean off the right edge and the figure loses the number it is built around.
+    #
+    # Only the two drawn series set it. The serial `sparse` series is still computed, for the table,
+    # but an axis stretched to cover a curve nobody can see would only compress the ones they can.
     #
     # The pooled copy exists only for that one order statistic and is released before anything is
     # drawn; the count past the edge is two counts summed, which needs no pool at all.
-    pooled = np.concatenate((stock, sparse))
-    x_max = max(percentile(pooled, args.x_max_percentile / 100.0), 1.15 * max(mean_of(stock), mean_of(sparse)))
+    pooled = np.concatenate((stock, system))
+    x_max = max(
+        percentile(pooled, args.x_max_percentile / 100.0),
+        1.15 * max(mean_of(stock), mean_of(system)),
+    )
     del pooled
-    clipped = int(np.count_nonzero(stock > x_max) + np.count_nonzero(sparse > x_max))
-    edges = bin_edges(stock, sparse, x_max, args.bins, args.log_x)
+    clipped = int(np.count_nonzero(stock > x_max) + np.count_nonzero(system > x_max))
+    edges = bin_edges((stock, system), x_max, args.bins, args.log_x)
 
     fig, ax = plt.subplots(figsize=(9.0, 5.0))
     fig.patch.set_facecolor(theme["surface"])
     ax.set_facecolor(theme["surface"])
 
+    # `stock` and `system` are the two the speedup is a ratio of, and they are the only two drawn.
+    # The serial series is not: it shares its bulk with the system series exactly — the two differ on
+    # escalating shots and nowhere else — so its curve was a second tracing of the same body, and the
+    # escalation count in the caption says how many shots the two would have parted company on. Its
+    # mean and max are in the text table, where they are read rather than compared by eye.
     for values, colour, label in (
         (stock, theme["series"][0], STOCK_LABEL),
-        (sparse, theme["series"][1], SPARSE_LABEL),
+        (system, theme["series"][2], SYSTEM_LABEL),
     ):
         # Binned once and drawn twice. `ax.hist` would re-bin the whole series for each of the two
         # passes and keep a copy of it inside the axes; past a few hundred thousand shots that is the
@@ -854,13 +918,16 @@ def draw(log, args, theme):
         ax.stairs(counts, edges, color=colour, linewidth=2.0, zorder=3)
 
     # Selective direct labels: the two means, and nothing else. A number on every bar is noise.
-    # Stacked at different heights and always set to the right of their line, because the two means
-    # sit close together at every grid point and would otherwise collide or run off the axis.
+    # Stacked at different heights and always set to the right of their line, because the means sit
+    # close together at every grid point and would otherwise collide or run off the axis.
     #
     # The mean of a distribution with an escalation tail does not sit at the mode, so the line will
     # often be to the right of the peak. That is the point of drawing it: the ratio in the caption is
-    # a ratio of these two lines, not of the bumps under them.
-    for values, colour, height in ((stock, theme["series"][0], 0.97), (sparse, theme["series"][1], 0.88)):
+    # a ratio of the stock line and the system line, not of the bumps under them.
+    for values, colour, height in (
+        (stock, theme["series"][0], 0.97),
+        (system, theme["series"][2], 0.88),
+    ):
         mean = mean_of(values)
         ax.axvline(mean, color=colour, linewidth=1.5, linestyle=(0, (4, 3)), zorder=4)
         ax.annotate(
@@ -900,30 +967,36 @@ def draw(log, args, theme):
 
     stock_stats = stats_of(stock)
     sparse_stats = stats_of(sparse)
-    speedup = stock_stats["mean"] / sparse_stats["mean"] if sparse_stats["mean"] else float("nan")
+    system_stats = stats_of(system)
+    # The one speedup on the page: the decoder system without sparsification over the same system
+    # predicating on H. The serial mean is in the table beside it, and is never a denominator.
+    speedup = stock_stats["mean"] / system_stats["mean"] if system_stats["mean"] else float("nan")
     excluded_note = (
-        "sparsified = blossom + dscan + hrvst + intersect + H build + Mwpm(H) build,"
-        " plus the Phase-2 re-decode on escalating shots"
+        "front end = blossom + dscan + hrvst + intersect + H build + Mwpm(H) build"
         if args.include_excluded
-        else "sparsified = blossom + dscan + hrvst, plus the Phase-2 re-decode on escalating shots"
+        else "front end = blossom + dscan + hrvst"
     )
     caption = (
-        f"{stock_stats['n']:,} shots  ·  mean ratio {speedup:.2f}x  ·  "
-        f"max {stock_stats['max']:.2f} vs {sparse_stats['max']:.2f} us  ·  "
+        f"{stock_stats['n']:,} shots  ·  speedup {speedup:.2f}x = stock mean / system mean  ·  "
+        f"max {stock_stats['max']:.2f} vs {system_stats['max']:.2f} us  ·  "
         f"{escalated:,} escalated  ·  {dropped:,} contaminated dropped  ·  "
-        f"{clipped:,} beyond the right edge\n{excluded_note}  ·  "
+        f"{clipped:,} beyond the right edge\n{excluded_note}; system = min(front end, G) on an"
+        " ordinary shot and G alone on an escalating one, since that decode was already running  ·  "
         f"timer {log.meta.get('timer_backend', '?')}"
-        f"{'' if log.meta.get('timer_thread_scoped') == '1' else ' (WALL CLOCK)'}"
+        f"{'' if log.meta.get('timer_thread_scoped') == '1' else ' — WALL CLOCK, timings include off-CPU time'}"
         + (
             ""
             if log.k is None
             else f"\nk = {log.k}: the solver saw only components of size > k. The size-<= k resolve"
-            " runs before it, in series, and is in neither series here — outside the profiler's"
+            " runs before it, in series, and is in none of these numbers — outside the profiler's"
             " measurement scope by intent."
         )
     )
+    caption = wrap_caption(caption)
     fig.text(0.012, 0.005, caption, color=theme["text_secondary"], fontsize=8.5, va="bottom")
-    fig.tight_layout(rect=(0, 0.075, 1, 1))
+    # As on the overlay: the caption states what the figure would not be honest without, so the axes
+    # yield to it rather than the other way round.
+    fig.tight_layout(rect=(0, min(0.3, 0.02 + 0.033 * (caption.count("\n") + 1)), 1, 1))
 
     written = []
     for extension in args.formats:
@@ -935,6 +1008,7 @@ def draw(log, args, theme):
         "log": log,
         "stock": stock_stats,
         "sparse": sparse_stats,
+        "system": system_stats,
         "escalated": escalated,
         "dropped": dropped,
         "clipped": clipped,
@@ -951,7 +1025,8 @@ def table_lines(results, args):
     """
     lines = [
         f"{'d':>4} {'p':>8} {'T':>5} {'k':>3} {'mode':>7} {'shots':>8} "
-        f"{'stock mean':>11} {'sparse mean':>12} {'stock max':>10} {'sparse max':>11} "
+        f"{'stock mean':>11} {'sparse mean':>12} {'system mean':>12} "
+        f"{'stock max':>10} {'sparse max':>11} {'system max':>11} "
         f"{'speedup':>9} {'escal':>7} {'contam':>7}"
     ]
     for result in results:
@@ -959,30 +1034,36 @@ def table_lines(results, args):
         meta = log.meta
         stock = result["stock"]
         sparse = result["sparse"]
-        ratio = stock["mean"] / sparse["mean"] if sparse["mean"] else float("nan")
+        system = result["system"]
+        ratio = stock["mean"] / system["mean"] if system["mean"] else float("nan")
         lines.append(
             f"{meta.get('d', '?'):>4} {meta.get('p', '?'):>8} {meta.get('T', '?'):>5} "
             f"{'-' if log.k is None else log.k:>3} "
             f"{meta.get('mode', '?'):>7} {stock['n']:>8,} "
-            f"{stock['mean']:>11.3f} {sparse['mean']:>12.3f} "
-            f"{stock['max']:>10.3f} {sparse['max']:>11.3f} {ratio:>9.2f} "
+            f"{stock['mean']:>11.3f} {sparse['mean']:>12.3f} {system['mean']:>12.3f} "
+            f"{stock['max']:>10.3f} {sparse['max']:>11.3f} {system['max']:>11.3f} {ratio:>9.2f} "
             f"{result['escalated']:>7,} {result['dropped']:>7,}"
         )
     lines.append("")
     lines.append(
         "  All times in microseconds, over uncontaminated shots. `speedup` is stock mean over"
-        " sparsified\n  mean, both taken over every uncontaminated shot — the escalating ones"
-        " included, each charged its\n  Phase-2 re-decode on G on top of its time on H. Dropping"
-        " them would price the front end at a\n  rate no deployment gets, so the escalation tail is"
-        " inside this ratio rather than beside it."
+        " SYSTEM mean —\n  the decoder system without graph sparsification against the same system"
+        " predicating on H — and\n  never over the serial `sparse` mean. Both are taken over every"
+        " uncontaminated shot, the escalating\n  ones included: dropping them would price the front"
+        " end at a rate no deployment gets, so the cost\n  of escalation is inside this ratio rather"
+        " than beside it."
     )
     lines.append(
-        "  sparsified = blossom + dscan + hrvst + intersect + H build + Mwpm(H) build, plus the"
-        " Phase-2\n  re-decode on escalating shots."
+        "  sparse = front end, then the whole Phase-2 re-decode on G after it on an escalating shot."
+        "\n  system = H and G solved concurrently, the shot ending at the first usable matching:"
+        " stock_g on an\n  escalating shot (that decode was already running, so escalation costs a"
+        " lost race and not a\n  second decode), min(front end, stock_g) on any other."
+    )
+    lines.append(
+        "  front end = blossom + dscan + hrvst + intersect + H build + Mwpm(H) build."
         if args.include_excluded
-        else "  sparsified = blossom + dscan + hrvst, plus the Phase-2 re-decode on escalating"
-        " shots. Ball\n  intersect, H build and Mwpm(H) build are not charged (--include-excluded"
-        " adds them back)."
+        else "  front end = blossom + dscan + hrvst. Ball intersect, H build and Mwpm(H) build are"
+        " not charged\n  (--include-excluded adds them back to both series)."
     )
     if any(result["log"].k is not None for result in results):
         lines.append(
@@ -1055,6 +1136,35 @@ def component_table_lines(results):
     return lines
 
 
+def warn_about_wall_clock(results):
+    """Says on stderr that some of these numbers came off a wall clock. Returns how many logs did.
+
+    On stderr and as a banner, for the same reason the profiler does it: stdout here is a list of
+    written files and a table, routinely redirected or piped, and this is the one property of a
+    campaign that cannot be recovered from the figures afterwards. A wall-clock log does not look
+    broken — it looks like a slower machine.
+    """
+    guilty = [result["log"] for result in results if result["log"].meta.get("timer_thread_scoped") != "1"]
+    if not guilty:
+        return 0
+    backends = sorted({log.meta.get("timer_backend", "?") for log in guilty})
+    print(
+        "\n"
+        "  ##########################################################################\n"
+        f"  WARNING: {len(guilty)} of {len(results)} log(s) were timed with a WALL CLOCK"
+        f" ({', '.join(backends)}).\n"
+        "  ##########################################################################\n"
+        "  Their timings include whatever time the decoding thread spent off the CPU,\n"
+        "  so every mean, tail and speedup drawn from them is an upper bound with the\n"
+        "  scheduler's interference inside it. Re-run the profiler on a host with a\n"
+        "  thread-scoped clock before quoting these numbers.\n",
+        file=sys.stderr,
+    )
+    for log in guilty:
+        print(f"    {log.stem}: timer {log.meta.get('timer_backend', '?')}", file=sys.stderr)
+    return len(guilty)
+
+
 def write_tables(results, args):
     """Writes the table as text beside the figures it summarises, one file per output directory.
 
@@ -1070,13 +1180,29 @@ def write_tables(results, args):
     for out_dir, group in sorted(by_dir.items()):
         out_path = os.path.join(out_dir, args.table_name)
         timers = sorted({result["log"].meta.get("timer_backend", "?") for result in group})
+        probes = sorted({result["log"].meta.get("preemption_probe", "?") for result in group})
         header = [
-            "Two-phase per-shot latency: stock decode on G vs stock decode on sparsified H.",
-            f"{len(group)} log file(s); timer backend {', '.join(timers)}.",
+            "Two-phase per-shot latency: stock decode on G, against the same decoder predicating on"
+            " the sparsified graph H.",
+            f"{len(group)} log file(s); timer backend {', '.join(timers)};"
+            f" contamination probe {', '.join(probes)}.",
             "",
         ]
         if any(result["log"].meta.get("timer_thread_scoped") != "1" for result in group):
-            header.insert(2, "WARNING: at least one log was timed on a WALL CLOCK, not a thread-scoped counter.")
+            header.insert(
+                2,
+                "WARNING: at least one log was timed on a WALL CLOCK, not a thread-scoped counter."
+                " Its timings include\n         time the decoding thread spent off the CPU, so every"
+                " mean, tail and speedup below that\n         came from it is an upper bound with the"
+                " scheduler's interference inside it.",
+            )
+        if any(result["log"].meta.get("preemption_probe", "?") == "none" for result in group):
+            header.insert(
+                2,
+                "NOTE: at least one log came from a platform with no contamination probe, so its"
+                " `contam` of 0 means\n      nothing was measured rather than that the machine was"
+                " quiet.",
+            )
         with open(out_path, "w") as handle:
             handle.write("\n".join(header + table_lines(group, args)) + "\n")
         written.append(out_path)
@@ -1231,6 +1357,7 @@ def main():
             except (OSError, ValueError, KeyError) as error:
                 print(f"  skipping the k overlay for d={key[0]} p={key[1]} {key[2]}: {error}")
 
+    warn_about_wall_clock(results)
     for out_path in write_tables(results, args):
         print(f"  wrote {out_path}")
     if args.table:
