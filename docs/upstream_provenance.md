@@ -1,6 +1,6 @@
 # Upstream provenance
 
-`src/pyrematching/`, excluding `two_phase/`, is [PyMatching](https://github.com/oscarhiggott/PyMatching)
+`src/pyrematching/`, excluding `spec_matching/`, is [PyMatching](https://github.com/oscarhiggott/PyMatching)
 vendored in and renamed wholesale, per §M0 of the implementation plan. This file is the difference
 between a fork and a laundering: it says what was taken, from where, and how.
 

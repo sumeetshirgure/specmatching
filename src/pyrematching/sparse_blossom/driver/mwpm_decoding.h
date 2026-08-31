@@ -57,7 +57,7 @@ Mwpm detector_error_model_to_mwpm(
 /// detection events implied by negative weight edges.
 ///
 /// Factored out of `process_timeline_until_completion` so that the truncated timeline
-/// (`pm::two_phase::process_timeline_until_horizon`) reuses this preamble verbatim rather than
+/// (`pm::spec_matching::process_timeline_until_horizon`) reuses this preamble verbatim rather than
 /// copying it.
 void begin_timeline(pm::Mwpm& mwpm, const std::vector<uint64_t>& detection_events);
 
@@ -110,9 +110,9 @@ void decode_detection_events_to_match_edges(pm::Mwpm& mwpm, const std::vector<ui
 /// edge along the search graph's shortest path between the matched pair, adds the graph's own
 /// negative-weight edges, and drops any edge flipped an even number of times.
 ///
-/// Factored out of `decode_detection_events_to_edges` (pyrematching M5) so that the two-phase
+/// Factored out of `decode_detection_events_to_edges` (pyrematching M5) so that the spec-matching
 /// driver's oracle front end can reuse it verbatim on a *truncated* timeline, where the match
-/// edges come from `pm::two_phase::harvest_to_match_edges` rather than from a completed decode.
+/// edges come from `pm::spec_matching::harvest_to_match_edges` rather than from a completed decode.
 /// Copying it instead would have put the cancellation pass in two places, and the cancellation is
 /// the part with no independent check on it.
 void expand_match_edges_to_edges(pm::Mwpm& mwpm, std::vector<int64_t>& edges);

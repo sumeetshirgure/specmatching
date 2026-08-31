@@ -2,7 +2,7 @@
 
 PyReMatching is a Python/C++ library for accelerating the PyMatching decoder.
 
-## The two-phase decoder
+## The spec-matching decoder
 
 Truncated sparse blossom, executed on a precomputed ball graph over the shot's defects, with stock
 exact decode as the residual fallback. **The output is exact MWPM on every shot** — the fallback is
@@ -17,7 +17,7 @@ circuit = stim.Circuit.generated("surface_code:rotated_memory_x", distance=11, r
                                  after_clifford_depolarization=1e-3)
 dem = circuit.detector_error_model(decompose_errors=True)
 
-decoder = pyrematching.two_phase_decoder(dem, T=2.0)   # T is in DEM weight units
+decoder = pyrematching.spec_matching_decoder(dem, T=2.0)   # T is in DEM weight units
 observables, weight = decoder.decode_to_obs(detection_event_indices)
 
 observables, weights, profile = decoder.decode_batch(shots, profile=True)
@@ -28,17 +28,18 @@ print(pyrematching.summarize(decoder.get_aggregate_stats()))
 which is the memory cost. Lowering `T` raises the fraction of shots that fall back — measured at
 `5e-6` to `1.3e-4` at `T = 2` and one to two orders higher at `T = 1.5`.
 
-`pyrematching.two_phase_decoder(dem, T=2.0, stock_on_h=True)` selects an alternative front end:
+`pyrematching.spec_matching_decoder(dem, T=2.0, stock_on_h=True)` selects an alternative front end:
 **stock** (untruncated) sparse blossom on the ball graph, kept when its terminal duals certify the
 shot globally optimal and escalated otherwise. Same exact output, same escalation rate (measured
 identical over 10⁶ shots), about 3% slower, and a cleaner correctness argument — it is checked by
-direct equality against stock exact decode rather than against a truncated intermediate state. See
-`docs/two_phase_m7_exit.md`.
+direct equality against stock exact decode rather than against a truncated intermediate state.
 
-**It is not currently faster than the inherited decoder on a CPU**: measured at 0.28–0.42x stock
-exact decode throughput. See `docs/two_phase_m6_exit.md` for why, and for the critical-path and
-local-memory measurements the design is actually argued on. The exit reports for each milestone are
-in `docs/two_phase_m*_exit.md`.
+**Latency, not throughput.** Run as a system — the sparsified graph `H` and the original graph `G`
+solved concurrently, the shot ending at the first usable matching — per-shot latency is **1.1x to
+6.1x** faster than stock exact decode across `d = 17..31` and `p = 0.0005..0.003`. On a single core
+running shots back to back it is still *slower* than stock, because it does strictly more work per
+shot; what it buys is that most of that work is off the critical path. The full 48-point sweep, the
+tail percentiles and the method are in [`docs/latency_speedups.md`](docs/latency_speedups.md).
 
 
 ## Attribution

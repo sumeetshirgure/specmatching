@@ -15,13 +15,13 @@
 from pyrematching._cpp_pyrematching import (randomize, set_seed, rand_float)  # noqa
 from pyrematching._cpp_pyrematching import main as cli  # noqa
 from pyrematching._cpp_pyrematching import (  # noqa
-    TwoPhaseAggregateStats,
-    TwoPhaseConfig,
-    TwoPhaseDecoder,
+    SpecMatchingAggregateStats,
+    SpecMatchingConfig,
+    SpecMatchingDecoder,
     summarize,
 )
 from pyrematching.matching import Matching  # noqa
-from pyrematching._two_phase import two_phase_decoder  # noqa
+from pyrematching._spec_matching import spec_matching_decoder  # noqa
 from pyrematching._version import __version__
 
 randomize()  # Set random seed using std::random_device
