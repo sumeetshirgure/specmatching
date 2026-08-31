@@ -27,6 +27,25 @@
 
 namespace pm {
 
+/// Counts blossom formations, for §M2.9.6 measurement 3.
+///
+/// §M2.9.4's eager-cached-base option is worth a field and a mutation site only if formations are
+/// much rarer than base readouts, and that ratio is not observable after the fact: a blossom that
+/// forms and then shatters again leaves nothing behind to count. Hence a counter at the formation
+/// site. Unlike `pm::horizon_gate_stats` this one is live in release builds too, because the
+/// measurement it feeds is a release measurement; the cost is one increment per blossom, against a
+/// formation that already sweeps the blossom's whole area to reschedule events. Not thread safe.
+struct BlossomFormationStats {
+    uint64_t formations{0};
+
+    void clear() {
+        formations = 0;
+    }
+};
+
+/// Process-wide counter for blossom formations. Not thread safe.
+inline BlossomFormationStats blossom_formation_stats{};
+
 struct GraphFlooder {
     /// The graph of detector nodes that is being flooded.
     MatchingGraph graph;

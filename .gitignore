@@ -36,3 +36,4 @@ build.ninja
 .vscode
 tools
 design
+compile_commands.json

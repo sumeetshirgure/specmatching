@@ -130,7 +130,8 @@ void pm::begin_timeline(pm::Mwpm& mwpm, const std::vector<uint64_t>& detection_e
     }
 }
 
-void process_timeline_until_completion(pm::Mwpm& mwpm, const std::vector<uint64_t>& detection_events) {
+pm::CompletionStatus pm::process_timeline_until_completion_or_report(
+    pm::Mwpm& mwpm, const std::vector<uint64_t>& detection_events) {
     pm::begin_timeline(mwpm, detection_events);
 
     while (true) {
@@ -140,8 +141,15 @@ void process_timeline_until_completion(pm::Mwpm& mwpm, const std::vector<uint64_
         mwpm.process_event(event);
     }
 
-    // If some alternating tree nodes remain, a perfect matching cannot be found
-    if (mwpm.node_arena.allocated.size() != mwpm.node_arena.available.size()) {
+    // If some alternating tree nodes remain, a perfect matching cannot be found.
+    if (mwpm.node_arena.allocated.size() != mwpm.node_arena.available.size())
+        return pm::CompletionStatus::NO_PERFECT_MATCHING;
+    return pm::CompletionStatus::COMPLETE;
+}
+
+void process_timeline_until_completion(pm::Mwpm& mwpm, const std::vector<uint64_t>& detection_events) {
+    if (pm::process_timeline_until_completion_or_report(mwpm, detection_events) ==
+        pm::CompletionStatus::NO_PERFECT_MATCHING) {
         mwpm.reset();
         throw std::invalid_argument(
             "No perfect matching could be found. This likely means that the syndrome has odd "
@@ -269,18 +277,11 @@ void flip_edge(const pm::SearchGraphEdge& edge) {
     }
 }
 
-void pm::decode_detection_events_to_edges(
-    pm::Mwpm& mwpm, const std::vector<uint64_t>& detection_events, std::vector<int64_t>& edges) {
+void pm::expand_match_edges_to_edges(pm::Mwpm& mwpm, std::vector<int64_t>& edges) {
     if (mwpm.flooder.graph.nodes.size() != mwpm.search_flooder.graph.nodes.size()) {
         throw std::invalid_argument(
             "Mwpm object does not contain search flooder, which is required to decode to edges.");
     }
-    process_timeline_until_completion(mwpm, detection_events);
-    mwpm.flooder.match_edges.clear();
-    shatter_blossoms_for_all_detection_events_and_extract_match_edges(mwpm, detection_events);
-    if (!mwpm.flooder.negative_weight_detection_events.empty())
-        shatter_blossoms_for_all_detection_events_and_extract_match_edges(
-            mwpm, mwpm.flooder.negative_weight_detection_events);
     // Flip edges with negative weights and add to edges vector.
     for (const auto& neg_node_pair : mwpm.search_flooder.graph.negative_weight_edges) {
         auto node1_ptr = &mwpm.search_flooder.graph.nodes[neg_node_pair.first];
@@ -327,6 +328,21 @@ void pm::decode_detection_events_to_edges(
             i++;
         }
     }
+}
+
+void pm::decode_detection_events_to_edges(
+    pm::Mwpm& mwpm, const std::vector<uint64_t>& detection_events, std::vector<int64_t>& edges) {
+    if (mwpm.flooder.graph.nodes.size() != mwpm.search_flooder.graph.nodes.size()) {
+        throw std::invalid_argument(
+            "Mwpm object does not contain search flooder, which is required to decode to edges.");
+    }
+    process_timeline_until_completion(mwpm, detection_events);
+    mwpm.flooder.match_edges.clear();
+    shatter_blossoms_for_all_detection_events_and_extract_match_edges(mwpm, detection_events);
+    if (!mwpm.flooder.negative_weight_detection_events.empty())
+        shatter_blossoms_for_all_detection_events_and_extract_match_edges(
+            mwpm, mwpm.flooder.negative_weight_detection_events);
+    pm::expand_match_edges_to_edges(mwpm, edges);
 }
 
 void pm::decode_detection_events_to_edges_with_edge_correlations(

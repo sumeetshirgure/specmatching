@@ -57,9 +57,33 @@ Mwpm detector_error_model_to_mwpm(
 /// detection events implied by negative weight edges.
 ///
 /// Factored out of `process_timeline_until_completion` so that the truncated timeline
-/// (`pm::two_phase::process_timeline_until_horizon`) reuses this preamble verbatim rather than
+/// (`pm::spec_matching::process_timeline_until_horizon`) reuses this preamble verbatim rather than
 /// copying it.
 void begin_timeline(pm::Mwpm& mwpm, const std::vector<uint64_t>& detection_events);
+
+/// Did the timeline complete, or is the graph one on which no perfect matching exists?
+enum class CompletionStatus {
+    /// The queue drained with no alternating tree standing: the primal is a perfect
+    /// matching-with-boundary and the dual is optimal.
+    COMPLETE,
+    /// Alternating trees survived the drained queue, so the graph admits no perfect matching on
+    /// this syndrome. An *expected* outcome for a caller that has somewhere to escalate to, which
+    /// is why this is reported rather than thrown (§M7.2).
+    NO_PERFECT_MATCHING,
+};
+
+/// Stock sparse blossom, run to completion, reporting rather than throwing.
+///
+/// Identical to `process_timeline_until_completion` in every respect except the failure mode: where
+/// that one calls `Mwpm::reset` and throws `std::invalid_argument`, this returns
+/// `NO_PERFECT_MATCHING` and **leaves the instance untouched**, so the caller owns the teardown and
+/// can inspect the state first. `process_timeline_until_completion` is implemented on top of this,
+/// so there is one timeline loop and one tree-survival test, not two.
+///
+/// No horizon is set, consulted or restored: `GraphFlooder::horizon` keeps its `pm::NO_HORIZON`
+/// sentinel throughout, which is the machine-checkable form of §M7.1's "no hardcoded horizon".
+CompletionStatus process_timeline_until_completion_or_report(
+    pm::Mwpm& mwpm, const std::vector<uint64_t>& detection_events);
 
 MatchingResult decode_detection_events_for_up_to_64_observables(
     pm::Mwpm& mwpm, const std::vector<uint64_t>& detection_events, bool edge_correlations);
@@ -80,6 +104,18 @@ void decode_detection_events(
 /// Returns the compressed edges in the matching: the pairs of detection events that are
 /// matched to each other via paths.
 void decode_detection_events_to_match_edges(pm::Mwpm& mwpm, const std::vector<uint64_t>& detection_events);
+
+/// Turns `mwpm.flooder.match_edges` — matched detection-event *pairs* — into the *edges* of a
+/// correction, appended to `edges` as detector id pairs with `-1` for the boundary. Flips each
+/// edge along the search graph's shortest path between the matched pair, adds the graph's own
+/// negative-weight edges, and drops any edge flipped an even number of times.
+///
+/// Factored out of `decode_detection_events_to_edges` (pyrematching M5) so that the spec-matching
+/// driver's oracle front end can reuse it verbatim on a *truncated* timeline, where the match
+/// edges come from `pm::spec_matching::harvest_to_match_edges` rather than from a completed decode.
+/// Copying it instead would have put the cancellation pass in two places, and the cancellation is
+/// the part with no independent check on it.
+void expand_match_edges_to_edges(pm::Mwpm& mwpm, std::vector<int64_t>& edges);
 
 /// Decode detection events using a Mwpm object and vector of detection event indices.
 /// Returns the edges in the matching: these are pairs of *detectors* forming *edges* in the

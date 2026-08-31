@@ -16,6 +16,7 @@
 #include "pyrematching/rand/rand_gen.pybind.h"
 #include "pyrematching/sparse_blossom/driver/namespaced_main.h"
 #include "pyrematching/sparse_blossom/driver/user_graph.pybind.h"
+#include "pyrematching/spec_matching/driver/spec_matching.pybind.h"
 
 namespace py = pybind11;
 using namespace py::literals;
@@ -33,6 +34,7 @@ PYBIND11_MODULE(_cpp_pyrematching, m) {
     auto matching_graph = pm_pybind::pybind_user_graph(m);
     pm_pybind::pybind_user_graph_methods(m, matching_graph);
     pm_pybind::pybind_rand_gen_methods(m);
+    pm_pybind::pybind_spec_matching(m);
     m.def("main", &pyrematching_main, pybind11::kw_only(), pybind11::arg("command_line_args"), R"pbdoc(
 Runs the command line tool version of pyrematching with the given arguments.
 )pbdoc");

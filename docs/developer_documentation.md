@@ -12,10 +12,13 @@
 
 # <a name="build-cmake"></a>Build the pyrematching command line tool with cmake
 
+All cmake builds are out-of-source: everything generated goes under `build/`, which is gitignored,
+so the source tree stays clean and `rm -rf build` is a full reset.
+
 ```bash
-cmake .
-make pyrematching
-# result is at ./pyrematching
+cmake -S . -B build
+cmake --build build -j4 --target pyrematching
+# result is at ./build/pyrematching
 ```
 
 # <a name="decode"></a>Decode a problem using the pyrematching command line tool
@@ -124,17 +127,21 @@ ffmpeg \
 # <a name="cmake-test"></a>Run C++ unit tests using cmake
 
 ```bash
-cmake .
-make pyrematching_tests
-./pyrematching_tests
+cmake -S . -B build
+cmake --build build -j4 --target pyrematching_tests
+./build/pyrematching_tests
 ```
+
+The test target is built with ASan, UBSan and `-UNDEBUG`, so it is slow to compile and to run
+(a few minutes for the full suite); that is deliberate, since the debug-build invariants are part
+of what the suite checks.
 
 # <a name="cmake-perf"></a>Run C++ performance benchmarks tests using cmake
 
 ```bash
-cmake .
-make pyrematching_perf
-./pyrematching_perf
+cmake -S . -B build
+cmake --build build -j4 --target pyrematching_perf
+./build/pyrematching_perf
 ```
 
 Use `--target_seconds=#` to change how long each benchmark runs for.

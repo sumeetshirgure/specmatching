@@ -94,6 +94,15 @@ class AltTreeNode {
     std::vector<AltTreeEdge> children;
     /// Ephemeral state used during algorithms.
     bool visited;
+    /// Slot in `Arena<AltTreeNode>::live`, maintained by the arena (pyrematching §M2.9.1).
+    /// Declaring it is what opts this type into arena liveness tracking; nothing in the matcher
+    /// reads or writes it. It lets harvest enumerate the surviving alternating tree nodes directly,
+    /// instead of finding a root per detection event and descending `children` from it.
+    ///
+    /// Every constructor leaves it at its default member initializer, and the arena assigns the
+    /// slot only after construction has finished, so a placement-new can never clobber a live slot.
+    /// Sits next to `visited` so that it costs padding rather than size.
+    uint32_t arena_live_index = pm::ARENA_NOT_LIVE;
 
     AltTreeNode();
     AltTreeNode(

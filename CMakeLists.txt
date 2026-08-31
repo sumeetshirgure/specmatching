@@ -59,9 +59,17 @@ set(SOURCE_FILES_NO_MAIN
         src/pyrematching/sparse_blossom/search/search_flooder.cc
         src/pyrematching/sparse_blossom/driver/user_graph.cc
         src/pyrematching/rand/rand_gen.cc
-        src/pyrematching/two_phase/truncation/truncated_timeline.cc
-        src/pyrematching/two_phase/truncation/harvest.cc
-        src/pyrematching/two_phase/truncation/exposed_blossom.cc
+        src/pyrematching/spec_matching/truncation/truncated_timeline.cc
+        src/pyrematching/spec_matching/truncation/harvest.cc
+        src/pyrematching/spec_matching/truncation/exposed_blossom.cc
+        src/pyrematching/spec_matching/manifold/ball_tables.cc
+        src/pyrematching/spec_matching/manifold/ball_serialize.cc
+        src/pyrematching/spec_matching/manifold/ball_graph.cc
+        src/pyrematching/spec_matching/manifold/ball_mwpm.cc
+        src/pyrematching/spec_matching/manifold/ball_decoding.cc
+        src/pyrematching/spec_matching/certificate/max_dual.cc
+        src/pyrematching/spec_matching/escalation/escalate.cc
+        src/pyrematching/spec_matching/driver/spec_matching_decoding.cc
         )
 
 set(TEST_FILES
@@ -85,10 +93,17 @@ set(TEST_FILES
         src/pyrematching/sparse_blossom/search/search_graph.test.cc
         src/pyrematching/sparse_blossom/search/search_flooder.test.cc
         src/pyrematching/sparse_blossom/driver/user_graph.test.cc
-        tests/two_phase/truncation_timeline.test.cc
-        tests/two_phase/truncation_harvest.test.cc
-        tests/two_phase/truncation_exposed_blossom.test.cc
-        tests/two_phase/truncation_fuzz.test.cc
+        tests/spec_matching/truncation_timeline.test.cc
+        tests/spec_matching/truncation_harvest.test.cc
+        tests/spec_matching/truncation_harvest_staged.test.cc
+        tests/spec_matching/truncation_exposed_blossom.test.cc
+        tests/spec_matching/truncation_fuzz.test.cc
+        tests/spec_matching/manifold_ball_tables.test.cc
+        tests/spec_matching/manifold_ball_graph.test.cc
+        tests/spec_matching/manifold_ball_identity.test.cc
+        tests/spec_matching/escalation_escalate.test.cc
+        tests/spec_matching/stock_on_h_certificate.test.cc
+        tests/spec_matching/spec_matching_driver.test.cc
         )
 
 set(PERF_FILES
@@ -103,6 +118,7 @@ set(PERF_FILES
 set(PYTHON_API_FILES
         src/pyrematching/sparse_blossom/driver/user_graph.pybind.cc
         src/pyrematching/rand/rand_gen.pybind.cc
+        src/pyrematching/spec_matching/driver/spec_matching.pybind.cc
         src/pyrematching/pyrematching.pybind.cc
         )
 
@@ -118,7 +134,7 @@ install(TARGETS pyrematching RUNTIME DESTINATION bin)
 enable_testing()
 
 add_executable(pyrematching_tests ${SOURCE_FILES_NO_MAIN} ${TEST_FILES})
-# The two-phase tests share a helper header under tests/, which is outside the `src` include root.
+# The spec-matching tests share a helper header under tests/, which is outside the `src` include root.
 target_include_directories(pyrematching_tests PRIVATE ${CMAKE_CURRENT_LIST_DIR})
 # -UNDEBUG so the debug-build invariants (asserts, and the M1 horizon gate counters) are live in the
 # test binary even when the tree is configured as a Release build.
@@ -137,14 +153,17 @@ if (NOT (MSVC))
 endif ()
 target_link_libraries(pyrematching_perf libstim)
 
-# M1 exit artifact: sweeps (d, p, T) and reports the residual/fallback statistics the M1 go/no-go
-# read is made from. Built optimised, like the perf harness.
-add_executable(two_phase_m1_artifact benchmarks/two_phase/m1_exit_artifact.cc ${SOURCE_FILES_NO_MAIN})
-target_compile_options(two_phase_m1_artifact PRIVATE ${ARCH_OPT})
+# Profiler driver: per-shot latency of stock exact decode on the original detector graph G against
+# the front end on the sparsified graph H, escalation included, logged shot by shot to one file per
+# (d, p, T, mode) for `plot_latency_histograms.py`, which draws the two distributions.
+# No aggregation — this is the distribution, not the mean.
+add_executable(profiler_driver benchmarks/spec_matching/profiler_driver.cc ${SOURCE_FILES_NO_MAIN})
+target_include_directories(profiler_driver PRIVATE ${CMAKE_CURRENT_LIST_DIR})
+target_compile_options(profiler_driver PRIVATE ${ARCH_OPT})
 if (NOT (MSVC))
-    target_link_options(two_phase_m1_artifact PRIVATE -pthread -O3)
+    target_link_options(profiler_driver PRIVATE -pthread -O3)
 endif ()
-target_link_libraries(two_phase_m1_artifact libstim)
+target_link_libraries(profiler_driver libstim)
 
 add_library(libpyrematching ${SOURCE_FILES_NO_MAIN})
 set_target_properties(libpyrematching PROPERTIES PREFIX "")
