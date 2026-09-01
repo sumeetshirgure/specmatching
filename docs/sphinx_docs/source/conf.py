@@ -6,11 +6,11 @@
 # -- Project information -----------------------------------------------------
 # https://www.sphinx-doc.org/en/master/usage/configuration.html#project-information
 
-project = 'PyReMatching'
-copyright = '2022, PyReMatching Contributors'
+project = 'SpecMatching'
+copyright = '2022, SpecMatching Contributors'
 author = 'Oscar Higgott and Craig Gidney'
 
-from pyrematching._version import __version__
+from specmatching._version import __version__
 version = __version__
 release = __version__
 

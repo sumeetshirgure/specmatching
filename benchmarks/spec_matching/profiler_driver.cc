@@ -1,4 +1,4 @@
-// Copyright 2026 PyReMatching contributors
+// Copyright 2026 SpecMatching contributors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -139,7 +139,7 @@
 #endif
 
 #include "benchmarks/spec_matching/profiler_util.h"
-#include "pyrematching/spec_matching/driver/spec_matching_decoding.h"
+#include "specmatching/spec_matching/driver/spec_matching_decoding.h"
 
 using namespace pm::spec_matching;
 using namespace pm::spec_matching::profiler;
@@ -845,7 +845,7 @@ int main(int argc, char** argv) {
         // exact counter, and where the threshold came from.
         std::printf(
             "  a shot is contaminated when wall time exceeds this thread's CPU time by more than"
-            " %llu ns\n  (PYREMATCHING_PREEMPTION_SLACK_NS)\n",
+            " %llu ns\n  (SPECMATCHING_PREEMPTION_SLACK_NS)\n",
             (unsigned long long)PreemptionProbe::slack_ns());
     }
     std::error_code dir_error;

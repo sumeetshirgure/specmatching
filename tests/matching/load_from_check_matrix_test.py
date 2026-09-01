@@ -16,8 +16,8 @@ import numpy as np
 from scipy.sparse import csr_matrix, csc_matrix
 import pytest
 
-from pyrematching import Matching
-from pyrematching._cpp_pyrematching import sparse_column_check_matrix_to_matching_graph
+from specmatching import Matching
+from specmatching._cpp_specmatching import sparse_column_check_matrix_to_matching_graph
 
 
 def test_boundary_from_check_matrix():

@@ -26,12 +26,12 @@ generated using `circuit.detector_error_model(decompose_errors=True)`.
 
 
 Then, using stim to generate some samples, the time per shot 
-in microseconds for pyrematching 2 was measured (on an M1 Max processor) by running `pyrematching.Matching.decode_batch` on 
+in microseconds for specmatching 2 was measured (on an M1 Max processor) by running `specmatching.Matching.decode_batch` on 
 at least 10000 shots. For example, the number of microseconds per shot can be measured using the following function:
 ```python
 import time
 import stim
-import pyrematching
+import specmatching
 
 
 def time_surface_code_circuit(distance: int, p: float, num_shots: int = 10000) -> float:
@@ -45,7 +45,7 @@ def time_surface_code_circuit(distance: int, p: float, num_shots: int = 10000) -
         after_reset_flip_probability=p
     )
     dem = circuit.detector_error_model(decompose_errors=True)
-    matching = pyrematching.Matching.from_detector_error_model(dem)
+    matching = specmatching.Matching.from_detector_error_model(dem)
     sampler = circuit.compile_detector_sampler()
     shots, actual_observables = sampler.sample(shots=num_shots, separate_observables=True)
     # Decode one shot first to ensure internal C++ representation of the matching graph is fully cached
@@ -60,11 +60,11 @@ def time_surface_code_circuit(distance: int, p: float, num_shots: int = 10000) -
 
 In the figure in each subdirectory, 
 the time per shot is divided by the number of rounds (equal to the distance) to give the time per _round_.
-The time per _shot_ in microseconds using PyReMatching v2.0 is given in `pyrematching_v2.csv`.
-For comparison, the plot also includes timing data for the same stim circuits using PyReMatching v0.7 
+The time per _shot_ in microseconds using SpecMatching v2.0 is given in `specmatching_v2.csv`.
+For comparison, the plot also includes timing data for the same stim circuits using SpecMatching v0.7 
 (with `num_neighbours=30`) and using NetworkX.
 
-Note that here the detector error models decoded by pyrematching contain detectors associated with both X basis _and_ 
+Note that here the detector error models decoded by specmatching contain detectors associated with both X basis _and_ 
 Z basis measurements, despite the fact that only the X basis measurements have any impact on the 
 logical error rate of the MWPM decoder when measuring the X logical observable as we do here.
 However, we choose to include both the X-type and Z-type detectors, as this more accurately represents the work that 
@@ -78,6 +78,6 @@ versions of the data. In the first version,
 only the X basis was decoded, which did not fully represent the work required to decode a surface code at scale, 
 as described above. In the second version, both bases were decoded (and since the problems became 2x bigger, 
 the time per round also doubled). However, for both the first and second versions, the timing data was collected by 
-decoding shot data from file using the pyrematching command line interface. At low p (e.g. around 0.1%), it turned out 
+decoding shot data from file using the specmatching command line interface. At low p (e.g. around 0.1%), it turned out 
 that almost half the time was spent reading the shot data from file. So in the current version the shot data is 
 decoded in a batch from memory (see above), with both bases still decoded.

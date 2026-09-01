@@ -1,18 +1,18 @@
 # Upstream provenance
 
-`src/pyrematching/`, excluding `spec_matching/`, is [PyMatching](https://github.com/oscarhiggott/PyMatching)
+`src/specmatching/`, excluding `spec_matching/`, is [PyMatching](https://github.com/oscarhiggott/PyMatching)
 vendored in and renamed wholesale, per §M0 of the implementation plan. This file is the difference
 between a fork and a laundering: it says what was taken, from where, and how.
 
 | | |
 |---|---|
 | Upstream | `https://github.com/oscarhiggott/PyMatching` |
-| Upstream version | **v2.4.0** — the version `src/pyrematching/_version.py` carried before the reset below, and the version §M0.0's ground-truth table was verified against |
+| Upstream version | **v2.4.0** — the version `src/specmatching/_version.py` carried before the reset below, and the version §M0.0's ground-truth table was verified against |
 | Upstream commit SHA | **not recorded.** See "the gap" below |
-| Vendoring commit | `66d374669267f01fd53f7993e9ac45535e1c7499`, *"Fork" pymatching and rename to pyrematching*, tagged `vendor-base` |
+| Vendoring commit | `66d374669267f01fd53f7993e9ac45535e1c7499`, *"Fork" pymatching and rename to specmatching*, tagged `vendor-base` |
 | Vendoring command | `python tools/vendor_pymatching.py`, verified by `tools/check_vendor.sh` |
 | `extern/pybind11` | pinned at commit `59565095fafae453b15d2a9e8a66d8ca4758b6d5` (`v3.0.2-79-g59565095`) |
-| Licence | Apache-2.0. `LICENSE` is upstream's, verbatim, with its copyright line intact. `NOTICE` names PyMatching, its copyright holder and the upstream URL, and identifies `src/pyrematching/sparse_blossom/` as derived work |
+| Licence | Apache-2.0. `LICENSE` is upstream's, verbatim, with its copyright line intact. `NOTICE` names PyMatching, its copyright holder and the upstream URL, and identifies `src/specmatching/sparse_blossom/` as derived work |
 | Package version | reset to `0.0.1` (§M0.5). Inheriting upstream's `2.4.0` on PyPI would be confusing and would look like a hijack |
 
 Every subsequent edit to a vendored file has a row in [`upstream_edits.md`](upstream_edits.md).

@@ -25,7 +25,7 @@ TEST_FILES = glob(
 )
 
 cc_binary(
-    name = "pyrematching",
+    name = "specmatching",
     srcs = SOURCE_FILES_NO_MAIN + glob(["src/**/main.cc"]),
     copts = [
         "-std=c++20",
@@ -37,7 +37,7 @@ cc_binary(
 )
 
 cc_library(
-    name = "libpyrematching",
+    name = "libspecmatching",
     srcs = SOURCE_FILES_NO_MAIN,
     copts = [
         "-std=c++20",
@@ -49,7 +49,7 @@ cc_library(
 )
 
 cc_test(
-    name = "pyrematching_test",
+    name = "specmatching_test",
     srcs = SOURCE_FILES_NO_MAIN + TEST_FILES,
     copts = [
         "-std=c++20",

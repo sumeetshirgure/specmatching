@@ -5,9 +5,9 @@ from unittest.mock import patch
 
 import pytest
 
-import pyrematching
-from pyrematching import cli
-from pyrematching._cli_argv import cli_argv
+import specmatching
+from specmatching import cli
+from specmatching._cli_argv import cli_argv
 
 
 def predict_args(dem_file: Path, input_file: Path, output_file: Path) -> List[str]:
@@ -21,7 +21,7 @@ def predict_args(dem_file: Path, input_file: Path, output_file: Path) -> List[st
     ]
 
 
-@pytest.mark.parametrize("cli_function", [cli, pyrematching._cpp_pyrematching.main])
+@pytest.mark.parametrize("cli_function", [cli, specmatching._cpp_specmatching.main])
 @pytest.mark.parametrize("input_format", ["dets", "b8"])
 def test_calling_cli_creates_expected_file(
     tmp_path: Path,
@@ -62,7 +62,7 @@ def test_load_surface_code_b8_cli(tmp_path: Path, data_dir: Path):
     dets_b8_in_path = data_dir / "surface_code_rotated_memory_x_13_0.01_1000_shots.b8"
     out_fn = tmp_path / "surface_code_rotated_memory_x_13_0.01_1000_shots_temp_predictions.b8"
 
-    pyrematching._cpp_pyrematching.main(command_line_args=[
+    specmatching._cpp_specmatching.main(command_line_args=[
         "predict",
         "--dem", str(dem_path),
         "--in", str(dets_b8_in_path),

@@ -14,7 +14,7 @@
 
 import networkx as nx
 
-from pyrematching import Matching
+from specmatching import Matching
 
 
 def test_repr():
@@ -26,5 +26,5 @@ def test_repr():
     g.nodes[3]['is_boundary'] = True
     g.add_edge(0, 3, weight=0.0)
     m = Matching(g)
-    assert m.__repr__() == ("<pyrematching.Matching object with "
+    assert m.__repr__() == ("<specmatching.Matching object with "
                             "2 detectors, 2 boundary nodes, and 4 edges>")

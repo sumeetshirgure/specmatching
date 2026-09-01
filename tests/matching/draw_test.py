@@ -15,7 +15,7 @@
 import networkx as nx
 import matplotlib.pyplot as plt
 
-from pyrematching import Matching
+from specmatching import Matching
 
 
 def test_draw_matching():

@@ -1,6 +1,6 @@
 import pytest
 
-from pyrematching import Matching
+from specmatching import Matching
 
 
 def test_load_from_retworkx_deprecated():

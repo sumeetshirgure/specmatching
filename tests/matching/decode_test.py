@@ -20,8 +20,8 @@ from scipy.sparse import csc_matrix
 import pytest
 import networkx as nx
 
-import pyrematching
-from pyrematching import Matching
+import specmatching
+from specmatching import Matching
 
 
 def repetition_code(n: int):
@@ -128,7 +128,7 @@ def test_matching_solution_integral_weights():
 
 
 def get_full_data_path(filename: str) -> str:
-    for data_dir in ("./PyReMatching/data/", "./data/", "../data/", "../../data/"):
+    for data_dir in ("./SpecMatching/data/", "./data/", "../data/", "../../data/"):
         fullpath = os.path.join(data_dir, filename)
         if os.path.isfile(fullpath):
             return fullpath
@@ -149,14 +149,14 @@ def test_surface_code_solution_weights(data_dir: Path):
     )
     with open(
         data_dir
-        / "surface_code_rotated_memory_x_13_0.01_1000_shots_no_buckets_weights_pyrematchingv0.7_exact.txt",
+        / "surface_code_rotated_memory_x_13_0.01_1000_shots_no_buckets_weights_specmatchingv0.7_exact.txt",
         "r",
         encoding="utf-8",
     ) as f:
         expected_weights = [float(w) for w in f.readlines()]
     with open(
         data_dir
-        / "surface_code_rotated_memory_x_13_0.01_1000_shots_no_buckets_predictions_pyrematchingv0.7_exact.txt",
+        / "surface_code_rotated_memory_x_13_0.01_1000_shots_no_buckets_predictions_specmatchingv0.7_exact.txt",
         "r",
         encoding="utf-8",
     ) as f:
@@ -226,8 +226,8 @@ def test_surface_code_solution_weights_with_correlations(data_dir: Path):
         num_observables=m.num_fault_ids,
     )
     # Test correlated decoding
-    corr_weights_path = data_dir / "surface_code_rotated_memory_x_13_0.01_1000_shots_no_buckets_weights_pyrematching_correlated.txt"
-    corr_predictions_path = data_dir / "surface_code_rotated_memory_x_13_0.01_1000_shots_no_buckets_predictions_pyrematching_correlated.txt"
+    corr_weights_path = data_dir / "surface_code_rotated_memory_x_13_0.01_1000_shots_no_buckets_weights_specmatching_correlated.txt"
+    corr_predictions_path = data_dir / "surface_code_rotated_memory_x_13_0.01_1000_shots_no_buckets_predictions_specmatching_correlated.txt"
     with open(
         corr_weights_path,
         "r",
@@ -270,7 +270,7 @@ def test_surface_code_solution_weights_with_correlations(data_dir: Path):
 
 
 def test_decode_batch_to_bitpacked_predictions():
-    m = pyrematching.Matching()
+    m = specmatching.Matching()
     m.add_edge(0, 1, fault_ids={0})
     m.add_edge(1, 2, fault_ids={10})
     m.add_edge(2, 3, fault_ids={3, 5})
@@ -297,7 +297,7 @@ def test_decode_batch_to_bitpacked_predictions():
 
 
 def test_detection_event_too_large_raises_value_error():
-    m = pyrematching.Matching()
+    m = specmatching.Matching()
     m.add_edge(0, 1)
     with pytest.raises(ValueError):
         m.decode([1, 0, 1])
@@ -429,8 +429,8 @@ def test_load_from_circuit_with_correlations():
         after_clifford_depolarization=0.001
     )
     shots = circuit.compile_detector_sampler().sample(shots=10)
-    matching_1 = pyrematching.Matching(circuit, enable_correlations=True)
-    matching_2 = pyrematching.Matching.from_stim_circuit(circuit=circuit, enable_correlations=True)
+    matching_1 = specmatching.Matching(circuit, enable_correlations=True)
+    matching_2 = specmatching.Matching.from_stim_circuit(circuit=circuit, enable_correlations=True)
     for m in (matching_1, matching_2):
         predictions, weights = m.decode_batch(shots=shots, return_weights=True, enable_correlations=True)
 
@@ -447,19 +447,19 @@ def test_use_correlations_with_uncorrelated_dem_load_raises_value_error(tmp_path
     )
     dem = circuit.detector_error_model(decompose_errors=True)
     shots = circuit.compile_detector_sampler().sample(shots=10)
-    matching_1 = pyrematching.Matching(circuit, enable_correlations=False)
-    matching_2 = pyrematching.Matching.from_stim_circuit(circuit=circuit, enable_correlations=False)
-    matching_3 = pyrematching.Matching.from_detector_error_model(
+    matching_1 = specmatching.Matching(circuit, enable_correlations=False)
+    matching_2 = specmatching.Matching.from_stim_circuit(circuit=circuit, enable_correlations=False)
+    matching_3 = specmatching.Matching.from_detector_error_model(
         model=dem,
         enable_correlations=False
     )
     fn = f"surface_code_x_d{d}_r{d}_p{p}"
     stim_file = tmp_path / f"{fn}.stim"
     circuit.to_file(stim_file)
-    matching_4 = pyrematching.Matching.from_stim_circuit_file(stim_file, enable_correlations=False)
+    matching_4 = specmatching.Matching.from_stim_circuit_file(stim_file, enable_correlations=False)
     dem_file = tmp_path / f"{fn}.dem"
     dem.to_file(dem_file)
-    matching_5 = pyrematching.Matching.from_detector_error_model_file(dem_file, enable_correlations=False)
+    matching_5 = specmatching.Matching.from_detector_error_model_file(dem_file, enable_correlations=False)
     for m in (matching_1, matching_2, matching_3, matching_4, matching_5):
         with pytest.raises(ValueError):
             m.decode_batch(shots=shots, return_weights=True, enable_correlations=True)
@@ -485,8 +485,8 @@ def test_use_correlations_without_decompose_errors_raises_value_error(tmp_path):
     dem_file = tmp_path / "surface_code.dem"
     dem.to_file(dem_file)
     with pytest.raises(ValueError):
-        pyrematching.Matching.from_detector_error_model(dem, enable_correlations=True)
+        specmatching.Matching.from_detector_error_model(dem, enable_correlations=True)
     with pytest.raises(ValueError):
-        pyrematching.Matching(dem, enable_correlations=True)
+        specmatching.Matching(dem, enable_correlations=True)
     with pytest.raises(ValueError):
-        pyrematching.Matching.from_detector_error_model_file(dem_file, enable_correlations=True)
+        specmatching.Matching.from_detector_error_model_file(dem_file, enable_correlations=True)

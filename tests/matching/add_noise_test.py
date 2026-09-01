@@ -14,7 +14,7 @@
 
 import numpy as np
 import networkx as nx
-from pyrematching import Matching
+from specmatching import Matching
 
 
 def test_add_noise():

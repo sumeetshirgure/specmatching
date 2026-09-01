@@ -15,7 +15,7 @@
 import networkx as nx
 import pytest
 
-from pyrematching import Matching
+from specmatching import Matching
 
 
 def test_matching_to_networkx():
