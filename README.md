@@ -36,7 +36,7 @@ is memory bound on CPU.
 The paper for the speculation-accelerated version is coming out soon.
 
 When using SpecMatching please also cite the original [paper](https://arxiv.org/abs/2303.15933) on the sparse blossom
-as `specmatching` is build on `pymatching`:
+as `specmatching` is built on `pymatching`:
 
 ```
 @article{Higgott2025sparseblossom,
