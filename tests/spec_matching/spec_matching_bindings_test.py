@@ -1,4 +1,4 @@
-# Copyright 2026 PyReMatching contributors
+# Copyright 2026 SpecMatching contributors
 
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -22,7 +22,7 @@ import numpy as np
 import pytest
 import stim
 
-import pyrematching
+import specmatching
 
 
 def _circuit(distance=5, rounds=5, noise=0.01):
@@ -51,7 +51,7 @@ def corpus():
 
 
 def _stock_predictions(dem, shots):
-    matching = pyrematching.Matching.from_detector_error_model(dem)
+    matching = specmatching.Matching.from_detector_error_model(dem)
     out = []
     for shot in shots:
         obs, weight = matching.decode(
@@ -63,7 +63,7 @@ def _stock_predictions(dem, shots):
 
 def test_decode_is_exact_against_stock(corpus):
     dem, shots = corpus
-    decoder = pyrematching.spec_matching_decoder(dem, T=2.0)
+    decoder = specmatching.spec_matching_decoder(dem, T=2.0)
     expected = _stock_predictions(dem, shots)
     for shot, (want_obs, want_weight) in zip(shots, expected):
         got_obs, got_weight = decoder.decode_to_obs(shot)
@@ -74,7 +74,7 @@ def test_decode_is_exact_against_stock(corpus):
 
 def test_decode_batch_and_profile_are_row_aligned(corpus):
     dem, shots = corpus
-    decoder = pyrematching.spec_matching_decoder(dem, T=2.0)
+    decoder = specmatching.spec_matching_decoder(dem, T=2.0)
     obs, weights, profile = decoder.decode_batch(shots, profile=True)
     assert obs.shape == (len(shots), decoder.num_observables)
     assert weights.shape == (len(shots),)
@@ -93,12 +93,12 @@ def test_decode_batch_and_profile_are_row_aligned(corpus):
 
 def test_summarize_reconciles_the_amortised_mean(corpus):
     dem, shots = corpus
-    config = pyrematching.SpecMatchingConfig()
+    config = specmatching.SpecMatchingConfig()
     config.measure_exact_reference = True
-    decoder = pyrematching.spec_matching_decoder(dem, T=2.0, config=config)
+    decoder = specmatching.spec_matching_decoder(dem, T=2.0, config=config)
     decoder.decode_batch(shots, profile=True)
 
-    summary = pyrematching.summarize(decoder.get_aggregate_stats())
+    summary = specmatching.summarize(decoder.get_aggregate_stats())
     assert summary["shots"] == len(shots)
     # `q` is meaningless without its denominator: a zero below 1/shots is a resolution floor.
     assert summary["q"] == summary["shots_escalated"] / summary["shots"]
@@ -112,10 +112,10 @@ def test_summarize_reconciles_the_amortised_mean(corpus):
 
 def test_edges_flavor_is_a_valid_correction(corpus):
     dem, shots = corpus
-    config = pyrematching.SpecMatchingConfig()
+    config = specmatching.SpecMatchingConfig()
     config.edges_flavor = True
     config.store_paths = True
-    decoder = pyrematching.spec_matching_decoder(dem, T=2.0, config=config)
+    decoder = specmatching.spec_matching_decoder(dem, T=2.0, config=config)
 
     for shot in shots[:50]:
         edges, _ = decoder.decode_to_edges(shot)
@@ -129,7 +129,7 @@ def test_edges_flavor_is_a_valid_correction(corpus):
 
 def test_ball_artifact_round_trips(corpus):
     dem, shots = corpus
-    decoder = pyrematching.spec_matching_decoder(dem, T=2.0)
+    decoder = specmatching.spec_matching_decoder(dem, T=2.0)
     stats = decoder.ball_stats()
     assert stats["bytes_total"] > 0
     assert stats["num_nodes"] == dem.num_detectors
@@ -137,7 +137,7 @@ def test_ball_artifact_round_trips(corpus):
     with tempfile.TemporaryDirectory() as directory:
         path = os.path.join(directory, "balls.artifact")
         decoder.save_ball_artifact(path)
-        loaded = pyrematching.spec_matching_decoder(dem, T=2.0, ball_artifact_path=path)
+        loaded = specmatching.spec_matching_decoder(dem, T=2.0, ball_artifact_path=path)
         for shot in shots[:50]:
             np.testing.assert_array_equal(loaded.decode_to_obs(shot)[0], decoder.decode_to_obs(shot)[0])
 
@@ -145,7 +145,7 @@ def test_ball_artifact_round_trips(corpus):
 def test_stock_on_h_is_exact_against_stock(corpus):
     """§M7 from python: the certificate front end is exact MWPM on every shot, and reports itself."""
     dem, shots = corpus
-    decoder = pyrematching.spec_matching_decoder(dem, T=2.0, stock_on_h=True)
+    decoder = specmatching.spec_matching_decoder(dem, T=2.0, stock_on_h=True)
     expected = _stock_predictions(dem, shots)
     for shot, (want_obs, want_weight) in zip(shots, expected):
         got_obs, got_weight = decoder.decode_to_obs(shot)
@@ -166,37 +166,37 @@ def test_stock_on_h_reports_q_this_against_q_current(corpus):
     and "measured, zero" are different claims, and at these rates the second is a resolution floor.
     """
     dem, shots = corpus
-    config = pyrematching.SpecMatchingConfig()
+    config = specmatching.SpecMatchingConfig()
     config.stock_on_h = True
     config.measure_truncated_reference = True
-    decoder = pyrematching.spec_matching_decoder(dem, T=1.0, config=config)
+    decoder = specmatching.spec_matching_decoder(dem, T=1.0, config=config)
     decoder.decode_batch(shots, profile=True)
 
-    summary = pyrematching.summarize(decoder.get_aggregate_stats())
+    summary = specmatching.summarize(decoder.get_aggregate_stats())
     assert summary["q_this"] == summary["q"]
     assert summary["shots_with_truncated_reference"] == len(shots)
     assert summary["q_current_on_same_corpus"] is not None
     # §M7.0's corollary, on identical shots.
     assert summary["q"] <= summary["q_current_on_same_corpus"]
 
-    without_replay = pyrematching.spec_matching_decoder(dem, T=1.0, stock_on_h=True)
+    without_replay = specmatching.spec_matching_decoder(dem, T=1.0, stock_on_h=True)
     without_replay.decode_batch(shots, profile=True)
-    assert pyrematching.summarize(without_replay.get_aggregate_stats())["q_current_on_same_corpus"] is None
+    assert specmatching.summarize(without_replay.get_aggregate_stats())["q_current_on_same_corpus"] is None
 
 
 def test_stock_on_h_rejects_the_m1_harvest_oracle(corpus):
     """The M1 oracle has no truncated intermediate state to reproduce here; M7's oracle is stock-on-G."""
     dem, _ = corpus
-    config = pyrematching.SpecMatchingConfig()
+    config = specmatching.SpecMatchingConfig()
     config.stock_on_h = True
     config.verify_against_g = True
     with pytest.raises(ValueError):
-        pyrematching.spec_matching_decoder(dem, T=2.0, config=config)
+        specmatching.spec_matching_decoder(dem, T=2.0, config=config)
 
 
 def test_unbounded_horizon_requires_the_oracle_front_end(corpus):
     dem, _ = corpus
-    config = pyrematching.SpecMatchingConfig()
+    config = specmatching.SpecMatchingConfig()
     config.unbounded_horizon = True
     with pytest.raises(ValueError):
-        pyrematching.spec_matching_decoder(dem, T=2.0, config=config)
+        specmatching.spec_matching_decoder(dem, T=2.0, config=config)

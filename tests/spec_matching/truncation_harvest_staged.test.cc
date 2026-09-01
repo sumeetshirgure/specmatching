@@ -1,4 +1,4 @@
-// Copyright 2026 PyReMatching contributors
+// Copyright 2026 SpecMatching contributors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -24,9 +24,9 @@
 
 #include "gtest/gtest.h"
 
-#include "pyrematching/sparse_blossom/flooder/graph_flooder.h"
-#include "pyrematching/spec_matching/truncation/harvest.h"
-#include "pyrematching/spec_matching/truncation/truncated_timeline.h"
+#include "specmatching/sparse_blossom/flooder/graph_flooder.h"
+#include "specmatching/spec_matching/truncation/harvest.h"
+#include "specmatching/spec_matching/truncation/truncated_timeline.h"
 #include "tests/spec_matching/spec_matching_test_util.h"
 
 using namespace pm::spec_matching;

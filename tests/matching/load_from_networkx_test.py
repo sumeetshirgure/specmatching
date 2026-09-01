@@ -16,8 +16,8 @@ import numpy as np
 import pytest
 import networkx as nx
 
-from pyrematching import Matching
-from pyrematching._cpp_pyrematching import MatchingGraph
+from specmatching import Matching
+from specmatching._cpp_specmatching import MatchingGraph
 
 
 def test_bad_fault_ids_raises_value_error():

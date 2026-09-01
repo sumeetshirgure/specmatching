@@ -15,7 +15,7 @@
 import networkx as nx
 import pytest
 
-from pyrematching.matching import Matching
+from specmatching.matching import Matching
 
 
 def test_set_boundary_nodes():

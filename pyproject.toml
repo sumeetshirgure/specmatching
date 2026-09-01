@@ -3,7 +3,7 @@ requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [project]
-name = "pyrematching"
+name = "specmatching"
 version = "0.0.1"
 description = "Accelerating pymatching."
 readme = "README.md"
@@ -36,12 +36,12 @@ dev = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/sumeetshirgure/pyrematching"
-Source = "https://github.com/sumeetshigure/pyrematching"
-Issues = "https://github.com/sumeetshirgure/pyrematching/issues"
+Homepage = "https://github.com/sumeetshirgure/specmatching"
+Source = "https://github.com/sumeetshigure/specmatching"
+Issues = "https://github.com/sumeetshirgure/specmatching/issues"
 
 [tool.hatch.build.targets.wheel]
-packages = ["src/pyrematching"]
+packages = ["src/specmatching"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

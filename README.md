@@ -1,6 +1,6 @@
-# PyReMatching
+# SpecMatching
 
-PyReMatching is a Python/C++ library for accelerating the PyMatching decoder.
+SpecMatching is a Python/C++ library for accelerating the PyMatching decoder.
 
 ## The spec-matching decoder
 
@@ -10,25 +10,25 @@ not an approximation, it is the inherited decoder run in full on the shots the t
 not finish.
 
 ```python
-import pyrematching
+import specmatching
 import stim
 
 circuit = stim.Circuit.generated("surface_code:rotated_memory_x", distance=11, rounds=11,
                                  after_clifford_depolarization=1e-3)
 dem = circuit.detector_error_model(decompose_errors=True)
 
-decoder = pyrematching.spec_matching_decoder(dem, T=2.0)   # T is in DEM weight units
+decoder = specmatching.spec_matching_decoder(dem, T=2.0)   # T is in DEM weight units
 observables, weight = decoder.decode_to_obs(detection_event_indices)
 
 observables, weights, profile = decoder.decode_batch(shots, profile=True)
-print(pyrematching.summarize(decoder.get_aggregate_stats()))
+print(specmatching.summarize(decoder.get_aggregate_stats()))
 ```
 
 `T` is the truncation horizon; the ball tables are sized from it and take `R >= 2 * T` of radius,
 which is the memory cost. Lowering `T` raises the fraction of shots that fall back — measured at
 `5e-6` to `1.3e-4` at `T = 2` and one to two orders higher at `T = 1.5`.
 
-`pyrematching.spec_matching_decoder(dem, T=2.0, stock_on_h=True)` selects an alternative front end:
+`specmatching.spec_matching_decoder(dem, T=2.0, stock_on_h=True)` selects an alternative front end:
 **stock** (untruncated) sparse blossom on the ball graph, kept when its terminal duals certify the
 shot globally optimal and escalated otherwise. Same exact output, same escalation rate (measured
 identical over 10⁶ shots), about 3% slower, and a cleaner correctness argument — it is checked by
@@ -44,7 +44,7 @@ tail percentiles and the method are in [`docs/latency_speedups.md`](docs/latency
 
 ## Attribution
 
-When using PyReMatching please cite the original [paper](https://arxiv.org/abs/2303.15933) on the sparse blossom algorithm (implemented in version 2):
+When using SpecMatching please cite the original [paper](https://arxiv.org/abs/2303.15933) on the sparse blossom algorithm (implemented in version 2):
 
 ```
 @article{Higgott2025sparseblossom,

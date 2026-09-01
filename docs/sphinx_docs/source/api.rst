@@ -4,16 +4,16 @@ Python API Documentation
 
 Matching
 --------
-.. automodule:: pyrematching.matching
+.. automodule:: specmatching.matching
     :members:
     :special-members: __init__
 
 Command line interface
 ----------------------
-.. automethod:: pyrematching.cli
+.. automethod:: specmatching.cli
 
 Random number generator
 -----------------------
-.. automethod:: pyrematching.set_seed
-.. automethod:: pyrematching.randomize
-.. automethod:: pyrematching.rand_float
+.. automethod:: specmatching.set_seed
+.. automethod:: specmatching.randomize
+.. automethod:: specmatching.rand_float

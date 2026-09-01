@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import pyrematching
+import specmatching
 
 import doctest
 import pytest
@@ -21,8 +21,8 @@ import pytest
 def test_matching_docstrings():
     pytest.importorskip("stim")
     pytest.importorskip("rustworkx")
-    doctest.testmod(pyrematching.matching, raise_on_error=True)
+    doctest.testmod(specmatching.matching, raise_on_error=True)
 
 
-def test_cpp_pyrematching_docstrings():
-    doctest.testmod(pyrematching._cpp_pyrematching, raise_on_error=True)
+def test_cpp_specmatching_docstrings():
+    doctest.testmod(specmatching._cpp_specmatching, raise_on_error=True)

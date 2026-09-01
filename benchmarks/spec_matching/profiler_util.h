@@ -1,4 +1,4 @@
-// Copyright 2026 PyReMatching contributors
+// Copyright 2026 SpecMatching contributors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -16,8 +16,8 @@
 /// parsing helpers and the CSV writer it shares nothing with any more, kept in their own header so
 /// that the driver reads as the measurement it is.
 
-#ifndef PYREMATCHING_BENCHMARKS_SPEC_MATCHING_PROFILER_UTIL_H
-#define PYREMATCHING_BENCHMARKS_SPEC_MATCHING_PROFILER_UTIL_H
+#ifndef SPECMATCHING_BENCHMARKS_SPEC_MATCHING_PROFILER_UTIL_H
+#define SPECMATCHING_BENCHMARKS_SPEC_MATCHING_PROFILER_UTIL_H
 
 #include <algorithm>
 #include <cmath>
@@ -28,8 +28,8 @@
 #include <string>
 #include <vector>
 
-#include "pyrematching/sparse_blossom/driver/mwpm_decoding.h"
-#include "pyrematching/sparse_blossom/driver/user_graph.h"
+#include "specmatching/sparse_blossom/driver/mwpm_decoding.h"
+#include "specmatching/sparse_blossom/driver/user_graph.h"
 #include "stim.h"
 
 namespace pm {
@@ -232,4 +232,4 @@ inline Fit fit_log_ler(const std::vector<double>& distances, const std::vector<d
 }  // namespace spec_matching
 }  // namespace pm
 
-#endif  // PYREMATCHING_BENCHMARKS_SPEC_MATCHING_PROFILER_UTIL_H
+#endif  // SPECMATCHING_BENCHMARKS_SPEC_MATCHING_PROFILER_UTIL_H

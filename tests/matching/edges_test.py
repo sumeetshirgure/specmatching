@@ -14,7 +14,7 @@
 
 import pytest
 
-from pyrematching.matching import Matching
+from specmatching.matching import Matching
 
 
 def test_qubit_id_accepted_using_add_edge():

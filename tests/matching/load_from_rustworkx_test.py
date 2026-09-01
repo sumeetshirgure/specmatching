@@ -15,8 +15,8 @@
 import numpy as np
 import pytest
 
-from pyrematching import Matching
-from pyrematching._cpp_pyrematching import MatchingGraph
+from specmatching import Matching
+from specmatching._cpp_specmatching import MatchingGraph
 
 
 def test_boundary_from_rustworkx():

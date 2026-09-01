@@ -55,7 +55,7 @@ class CMakeBuild(build_ext):
             cmake_args += [item for item in os.environ["CMAKE_ARGS"].split(" ") if item]
 
         # # In this example, we pass in the version to C++. You might not need to.
-        # cmake_args += [f"-DPYREMATCHING_VERSION_INFO={self.distribution.get_version()}"]
+        # cmake_args += [f"-DSPECMATCHING_VERSION_INFO={self.distribution.get_version()}"]
 
         if self.compiler.compiler_type != "msvc":
             # Using Ninja-build since it a) is available as a wheel and b)
@@ -125,18 +125,18 @@ class CMakeBuild(build_ext):
         if not os.path.exists(build_temp):
             os.makedirs(build_temp)
         subprocess.check_call(["cmake", ext.sourcedir] + cmake_args, cwd=build_temp)
-        subprocess.check_call(["cmake", "--build", ".", "--target", "_cpp_pyrematching"] + build_args, cwd=build_temp)
+        subprocess.check_call(["cmake", "--build", ".", "--target", "_cpp_specmatching"] + build_args, cwd=build_temp)
 
 
 version = {}
-with open("src/pyrematching/_version.py") as fp:
+with open("src/specmatching/_version.py") as fp:
     exec(fp.read(), version)
 
 with open("README.md", "r", encoding="utf-8") as fh:
     long_description = fh.read()
 
 setup(
-    name="PyReMatching",
+    name="SpecMatching",
     version=version['__version__'],
     author="Oscar Higgott and Craig Gidney",
     url="https://github.com/oscarhiggott/PyMatching",
@@ -144,14 +144,14 @@ setup(
     long_description=long_description,
     long_description_content_type='text/markdown',
     license="Apache 2",
-    ext_modules=[CMakeExtension("pyrematching._cpp_pyrematching")],
+    ext_modules=[CMakeExtension("specmatching._cpp_specmatching")],
     packages=find_packages("src"),
     package_dir={'': 'src'},
     cmdclass={"build_ext": CMakeBuild},
     zip_safe=False,
     extras_require={"test": ["pytest>=6.0"]},
     entry_points={
-        'console_scripts': ['pyrematching=pyrematching._cli_argv:cli_argv'],
+        'console_scripts': ['specmatching=specmatching._cli_argv:cli_argv'],
     },
     python_requires=">=3.8",
     install_requires=['scipy', 'numpy', 'networkx', 'matplotlib'],

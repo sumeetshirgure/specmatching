@@ -5,7 +5,7 @@ coverage.xml
 .idea
 cmake-build*
 Makefile
-PyReMatching2.cbp
+SpecMatching2.cbp
 Testing/
 _deps/
 *.cmake

@@ -1,27 +1,27 @@
 # Index
 
-- [Build the pyrematching command line tool with cmake](#build-cmake)
-- [Decode a problem using the pyrematching command line tool](#decode)
-- [Create a decoding animation using the pyrematching command line tool](#decode-animate)
+- [Build the specmatching command line tool with cmake](#build-cmake)
+- [Decode a problem using the specmatching command line tool](#decode)
+- [Create a decoding animation using the specmatching command line tool](#decode-animate)
 - [Run C++ unit tests using cmake](#cmake-test)
 - [Run C++ performance benchmarks tests using cmake](#cmake-perf)
-- [Build and install development version of pyrematching python package](#pip-install)
-- [Linking to pyrematching with cmake](#cmake-linking)
-- [Linking to pyrematching with bazel](#bazel-linking)
+- [Build and install development version of specmatching python package](#pip-install)
+- [Linking to specmatching with cmake](#cmake-linking)
+- [Linking to specmatching with bazel](#bazel-linking)
 - [Build the sphinx documentation](#sphinx)
 
-# <a name="build-cmake"></a>Build the pyrematching command line tool with cmake
+# <a name="build-cmake"></a>Build the specmatching command line tool with cmake
 
 All cmake builds are out-of-source: everything generated goes under `build/`, which is gitignored,
 so the source tree stays clean and `rm -rf build` is a full reset.
 
 ```bash
 cmake -S . -B build
-cmake --build build -j4 --target pyrematching
-# result is at ./build/pyrematching
+cmake --build build -j4 --target specmatching
+# result is at ./build/specmatching
 ```
 
-# <a name="decode"></a>Decode a problem using the pyrematching command line tool
+# <a name="decode"></a>Decode a problem using the specmatching command line tool
 
 Generate a problem with stim:
 
@@ -47,10 +47,10 @@ stim detect \
     --out_format b8
 ```
 
-Solve problem with pyrematching:
+Solve problem with specmatching:
 
 ```bash
-pyrematching predict \
+specmatching predict \
     --dem error_model.dem \
     --in detection_events.b8 \
     --in_format b8 \
@@ -67,7 +67,7 @@ echo wrong predictions:
 paste -d " " predicted_obs_flips.01 actual_obs_flips.01 | grep "0 1\|1 0" | wc -l
 ```
 
-# <a name="decode-animate"></a>Create a decoding animation using the pyrematching command line tool
+# <a name="decode-animate"></a>Create a decoding animation using the specmatching command line tool
 
 Generate a problem using stim:
 
@@ -93,13 +93,13 @@ stim detect \
     --out_format b8
 ```
 
-Produce animation frames of solving the problem using pyrematching:
+Produce animation frames of solving the problem using specmatching:
 
 ```bash
 rm out_frames -rf
 mkdir out_frames
 
-pyrematching animate \
+specmatching animate \
     --dem_in error_model.dem \
     --dets_in detection_events.b8 \
     --dets_in_format b8 \
@@ -128,8 +128,8 @@ ffmpeg \
 
 ```bash
 cmake -S . -B build
-cmake --build build -j4 --target pyrematching_tests
-./build/pyrematching_tests
+cmake --build build -j4 --target specmatching_tests
+./build/specmatching_tests
 ```
 
 The test target is built with ASan, UBSan and `-UNDEBUG`, so it is slow to compile and to run
@@ -140,8 +140,8 @@ of what the suite checks.
 
 ```bash
 cmake -S . -B build
-cmake --build build -j4 --target pyrematching_perf
-./build/pyrematching_perf
+cmake --build build -j4 --target specmatching_perf
+./build/specmatching_perf
 ```
 
 Use `--target_seconds=#` to change how long each benchmark runs for.
@@ -150,7 +150,7 @@ Use `--only=name` to only run one benchmark.
 
 Use `--only=prefix*` to only run benchmarks beginning with a prefix.
 
-# <a name="pip-install"></a>Build and install development version of pyrematching python package
+# <a name="pip-install"></a>Build and install development version of specmatching python package
 
 ```bash
 pip install -e .
@@ -158,16 +158,16 @@ pip install -e .
 
 # <a name="cmake-linking"></a>Linking from CMake
 
-To use pyrematching as a cmake dependency, fetch it using `FetchContent` in the CMakeLists.txt file:
+To use specmatching as a cmake dependency, fetch it using `FetchContent` in the CMakeLists.txt file:
 
 ```
-FetchContent_Declare(pyrematching
+FetchContent_Declare(specmatching
         GIT_REPOSITORY https://github.com/oscarhiggott/pymatching.git
         GIT_TAG eea3501a1c1e2dc2b6d34221c6f1eb51edb06e1e)
-FetchContent_GetProperties(pyrematching)
-if(NOT pyrematching_POPULATED)
-  FetchContent_Populate(pyrematching)
-  add_subdirectory(${pyrematching_SOURCE_DIR})
+FetchContent_GetProperties(specmatching)
+if(NOT specmatching_POPULATED)
+  FetchContent_Populate(specmatching)
+  add_subdirectory(${specmatching_SOURCE_DIR})
 endif()
 ```
 
@@ -177,18 +177,18 @@ You can then link to it:
 
 ```
 [...]
-target_link_libraries(YOURLIBRARY libpyrematching)
+target_link_libraries(YOURLIBRARY libspecmatching)
 [...]
 ```
 
 # <a name="bazel-linking"></a>Linking from Bazel
 
-In your `WORKSPACE` file, include the pyrematching git repo using `git_repository`:
+In your `WORKSPACE` file, include the specmatching git repo using `git_repository`:
 
 ```
 load("@bazel_tools//tools/build_defs/repo:git.bzl", "git_repository")
 git_repository(
-    name = "pyrematching",
+    name = "specmatching",
     commit = "eea3501a1c1e2dc2b6d34221c6f1eb51edb06e1e",
     remote = "https://github.com/oscarhiggott/pymatching.git",
 )
@@ -203,7 +203,7 @@ cc_binary(
     name = "your_project",
     ...
     deps = [
-        "@pyrematching//:libpyrematching",
+        "@specmatching//:libspecmatching",
     ],
 )
 ```
@@ -216,7 +216,7 @@ First install the sphinx requirements:
 pip install -r docs/sphinx_docs/requirements.txt
 ```
 
-You will also need to install the latest version of pyrematching, and you may also need to [install pandoc](https://pandoc.org/installing.html).
+You will also need to install the latest version of specmatching, and you may also need to [install pandoc](https://pandoc.org/installing.html).
 
 Then, to build the html sphinx docs, run:
 ```bash

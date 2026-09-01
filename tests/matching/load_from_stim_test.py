@@ -16,7 +16,7 @@ from pathlib import Path
 
 import pytest
 
-from pyrematching.matching import Matching
+from specmatching.matching import Matching
 
 
 def test_load_from_stim_objects():

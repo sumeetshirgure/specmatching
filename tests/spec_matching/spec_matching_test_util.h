@@ -1,4 +1,4 @@
-// Copyright 2026 PyReMatching contributors
+// Copyright 2026 SpecMatching contributors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -12,8 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#ifndef PYREMATCHING_TESTS_SPEC_MATCHING_TEST_UTIL_H
-#define PYREMATCHING_TESTS_SPEC_MATCHING_TEST_UTIL_H
+#ifndef SPECMATCHING_TESTS_SPEC_MATCHING_TEST_UTIL_H
+#define SPECMATCHING_TESTS_SPEC_MATCHING_TEST_UTIL_H
 
 #include <algorithm>
 #include <cstdio>
@@ -23,10 +23,10 @@
 #include <string>
 #include <vector>
 
-#include "pyrematching/sparse_blossom/driver/mwpm_decoding.h"
-#include "pyrematching/sparse_blossom/driver/user_graph.h"
-#include "pyrematching/spec_matching/truncation/harvest.h"
-#include "pyrematching/spec_matching/truncation/truncated_timeline.h"
+#include "specmatching/sparse_blossom/driver/mwpm_decoding.h"
+#include "specmatching/sparse_blossom/driver/user_graph.h"
+#include "specmatching/spec_matching/truncation/harvest.h"
+#include "specmatching/spec_matching/truncation/truncated_timeline.h"
 #include "stim.h"
 
 namespace pm {
@@ -284,4 +284,4 @@ inline std::vector<uint64_t> expected_seeded_detection_events(
 }  // namespace spec_matching
 }  // namespace pm
 
-#endif  // PYREMATCHING_TESTS_SPEC_MATCHING_TEST_UTIL_H
+#endif  // SPECMATCHING_TESTS_SPEC_MATCHING_TEST_UTIL_H
