@@ -1,5 +1,46 @@
 # Latency speedups
 
+> ## ⚠ Superseded in part — read this first
+>
+> **Every row in this file was produced with the lookup-table small-component resolver, and every
+> row that names a `k` other than 0 is invalid: those runs decoded a *different decoder output*.**
+>
+> That resolver settled a connected component of `H` of size `<= k` by asking whether a perfect
+> matching exists in `H` — a static, primal question. The solver decides a component by asking
+> whether truncated sparse blossom *finishes by `T`* — a dynamic, dual-certified one. The two
+> differ: `H` holds every edge blossom could traverse by `T` on the assumption that both endpoints
+> grow for the full `T`, but blossom freezes a region the moment it is matched, so an `H` edge can
+> be present and still not be reached by `T`. When that happened the solver truncated and the shot
+> escalated to stock, which found the true optimum — often using an edge *outside* `H` — while the
+> resolver committed `H`'s optimum, which is not the global one, and suppressed the escalation.
+> Which components got which question depended on the size threshold, so the escalation rate
+> depended on `k` and the output was not exact MWPM.
+>
+> The resolver is gone. Every component is now decided by truncated sparse blossom run on it in
+> isolation, whatever its size, which is exact by the independence property: two regions interact
+> only when the sum of their radii reaches the distance between their defects, every radius is
+> `<= T`, so interaction needs `d_G <= 2T` — exactly the condition for an `H` edge. Defects in
+> different components have no `H` edge and never interact before `T`.
+>
+> What this means for the tables below:
+>
+> * **The `k = 2` and `k = 4` rows are not measurements of any decoder that now exists.** Their
+>   latencies were taken on a smaller solver input than the current path uses, and their escalation
+>   rates were suppressed by the resolver's silent commits.
+> * **The `escalated` column is superseded by `sparse_graph_stats`,** which measures the escalation
+>   rate `q` directly, with no resolver in the path and with a per-component `COMPLETE`/`TRUNCATED`
+>   breakdown behind it. Take `q` from there, not from here.
+> * **The `to solver` column no longer describes anything.** Every defect goes to the solver now, so
+>   that share is 1 by construction.
+> * The structural columns — `components`, `largest` — describe `H` itself and are unaffected by
+>   which question was asked of a component. They are the only numbers here that carry over, and
+>   `sparse_graph_stats` measures them too, in more detail.
+>
+> **No new latency numbers were produced on this branch.** The latency profiler still charges each
+> stage once per shot while the work now runs once per component, and re-reading it for that is
+> separate, deferred work. This file is left in place as the record of what was measured, with the
+> above stated rather than the rows quietly deleted.
+
 Per-shot decode latency of the spec-matching decoder system against stock exact sparse blossom, over
 a 48-point sweep of a rotated surface-code memory-X experiment. This file is the record of that
 measurement; it replaces the per-milestone exit reports the project carried while the pipeline was
@@ -254,7 +295,10 @@ every timed window — this is the explanation for the table above, not another 
 
 ## Reproducing
 
-Build the profiler and run the sweep:
+The command below is the one that produced the rows above. **`--k` no longer exists** — the flag is
+rejected rather than ignored, for the reason at the top of this file — so the sweep as written will
+not run against the current tree, and a run without it is not a reproduction of these numbers. It is
+recorded as provenance, not as an instruction.
 
 ```
 cmake -B build -DCMAKE_BUILD_TYPE=Release && cmake --build build --target profiler_driver -j4
@@ -262,7 +306,22 @@ build/profiler_driver --distances 17,21,25,31 --error-rates 0.0005,0.001,0.003 \
     --horizons 1.5,2 --k 2,4 --modes scan --shots 200000 --seed 20260907 --out-dir results/latency
 ```
 
-`profiler_driver` writes one CSV per `(d, p, T, k, mode)`, one row per shot, with no aggregation in
+For the escalation rate `q` and the structure of `H`, use the `H`-structure profiler instead. It
+runs no timers, keeps no decoder output and never escalates — the trigger is the whole measurement —
+and it reports `q` with a Wilson interval beside a per-component `COMPLETE`/`TRUNCATED` breakdown:
+
+```
+cmake --build build --target sparse_graph_stats -j4
+build/sparse_graph_stats --d 17,21,25,31 --p 0.0005,0.001,0.003 --T 1.5,2 \
+    --shots 1000000 --seed 20260907 --out results/sparse_graph_stats
+```
+
+That writes `summary.csv` (one row per `(d, p, T)`), `hists.json` (the size, degree, hop-diameter
+and weighted-diameter distributions plus the `size x status` and `hop_diameter x status` tables) and
+`run.log` (git hash, build flags, stim version, the exact generator call). Add `--verify` on a
+smaller run to check the per-component decomposition against the monolithic solve on every shot.
+
+`profiler_driver` writes one CSV per `(d, p, T, mode)`, one row per shot, with no aggregation in
 the C++ at all — the reduction above is entirely in the reader. Draw the distributions with:
 
 ```

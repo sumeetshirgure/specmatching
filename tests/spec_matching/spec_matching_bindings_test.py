@@ -87,8 +87,11 @@ def test_decode_batch_and_profile_are_row_aligned(corpus):
         np.testing.assert_array_equal(obs[i], single_obs)
         assert weights[i] == single_weight
 
-    # Invariant 12, visible from python: escalation fires exactly when the timeline truncated.
-    np.testing.assert_array_equal(profile["escalated"], profile["truncated"])
+    # Invariant 12, visible from python: escalation fires exactly when some connected component of
+    # `H` failed to resolve within `T`, and the predicate agrees with the count behind it (§2.6).
+    np.testing.assert_array_equal(profile["escalated"], profile["any_component_truncated"])
+    np.testing.assert_array_equal(profile["escalated"], profile["components_truncated"] > 0)
+    assert np.all(profile["components_truncated"] <= profile["components_total"])
 
 
 def test_summarize_reconciles_the_amortised_mean(corpus):

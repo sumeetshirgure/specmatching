@@ -138,7 +138,9 @@ TEST(EscalationEscalate, X2TriggerFiresExactlyOnANonEmptyResidual) {
         SpecMatchingProfile profile;
         spec_matching_decode(decoder, shot, &profile);
         ASSERT_EQ(profile.escalated, profile.residual_size > 0) << "invariant 12";
-        ASSERT_EQ(profile.escalated, profile.truncated) << "invariant 12";
+        ASSERT_EQ(profile.escalated, profile.any_component_truncated) << "invariant 12";
+        ASSERT_EQ(profile.any_component_truncated, profile.components_truncated > 0)
+            << "§2.6: the escalation predicate and the component tally disagree";
         ASSERT_EQ(profile.residual_size, profile.num_trees) << "one exposed defect per surviving tree";
         if (!profile.escalated)
             ASSERT_EQ(profile.escalation_ns, 0);
@@ -340,21 +342,20 @@ TEST(EscalationEscalate, X9ProductionPathDoesNoTreeWork) {
         ASSERT_EQ(counters.full_harvests, 0u) << "the production path ran the full harvest";
         ASSERT_EQ(counters.tree_nodes_visited, 0u) << "the production path enumerated alternating tree nodes";
         ASSERT_EQ(counters.base_descents, 0u) << "M1.4's base descent is still on the production path";
+        // §2. The unit of extraction is the **component**, not the shot: a component that completed
+        // is extracted, one that truncated is abandoned, and a shot that escalates on one component
+        // still extracted the others before its Phase 1 was discarded. Stated as an equality
+        // against the shot's own component tally, so a harvest that goes missing for any other
+        // reason still fails here.
+        size_t completed_components = (size_t)(profile.components_total - profile.components_truncated);
+        ASSERT_EQ(counters.extract_only_harvests, completed_components)
+            << profile.components_truncated << " of " << profile.components_total << " components truncated";
         if (profile.escalated) {
             escalated++;
-            ASSERT_EQ(counters.extract_only_harvests, 0u) << "an escalating shot harvested instead of being abandoned";
-            ASSERT_EQ(counters.extractions, 0u);
+            ASSERT_GT(profile.components_truncated, 0) << "a shot escalated with no truncated component";
         } else {
             completed++;
-            // One extract-only harvest, unless §A's resolver settled the whole of `H` off the
-            // solver — then §A.4 skips the build, the solve and the extraction together, and zero
-            // harvests is the honest count rather than a missed one. Stated as an equality against
-            // which case the shot was in, so a harvest that goes missing for any *other* reason
-            // still fails here.
-            size_t h_nodes = decoder.ball->arena.graph.num_nodes();
-            bool fully_resolved = (size_t)profile.defects_resolved_small == h_nodes;
-            ASSERT_EQ(counters.extract_only_harvests, fully_resolved ? 0u : 1u)
-                << "defects_resolved_small = " << profile.defects_resolved_small << " of " << h_nodes << " H nodes";
+            ASSERT_EQ(profile.components_truncated, 0) << "a shot completed with a truncated component";
         }
     }
     ASSERT_GT(escalated, 0u);

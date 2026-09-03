@@ -50,156 +50,62 @@ BoundaryCost boundary_cost(const BallTables& tables, uint64_t det) {
     return BoundaryCost{true, (pm::cumulative_time_int)tables.bcost_w_int[det]};
 }
 
-/// What the small-component resolver did with a component. `COMMIT` means it settled the component
-/// exactly and performed the matches; `RESIDUAL` means the component has no feasible matching at
-/// all and the shot escalates on it; `SOLVER` means it was larger than `k` and was handed on.
+/// §2's per-component harvests, folded into the shot's one `HarvestResult`.
 ///
-/// There is no fourth outcome. Ties are broken here, not deferred, and an exact-`T` match is legal
-/// rather than ambiguous — nothing routes to the solver except by being size `> k`.
-enum class SmallVerdict : uint8_t { SOLVER = 0, COMMIT = 1, RESIDUAL = 2 };
+/// Every field here is either a XOR, a sum or a max over the components, which is what §1's
+/// independence property says it has to be: the components' event sequences are disjoint, so the
+/// shot's committed observable is the XOR of theirs, its weight and dual the sums, and its residual
+/// the union. `part` is moved from, so the caller must not read it afterwards.
+void accumulate_component_harvest(HarvestResult& into, HarvestResult& part) {
+    into.committed.obs_mask ^= part.committed.obs_mask;
+    into.committed.weight += part.committed.weight;
 
-constexpr uint32_t MAX_SMALL = BallPrune::MAX_SMALL_COMPONENT_SIZE;
+    into.residual.insert(into.residual.end(), part.residual.begin(), part.residual.end());
+    into.residual_dual_sum.insert(
+        into.residual_dual_sum.end(), part.residual_dual_sum.begin(), part.residual_dual_sum.end());
 
-/// The resolver's view of one component of size 1..4: which matches are legal, and what they weigh,
-/// in integer time units and in local indices `0..size-1` (ascending `H`-node order).
-///
-/// Legality comes from **`H`'s own inclusion cutoffs**, so the resolver and `H` agree by
-/// construction: a defect-defect pairing is legal iff `H` gave the pair an edge, i.e.
-/// `d_G(u,v) <= 2T`, and a boundary match is legal iff `bcost_int(x) <= T_int`. Both are weak
-/// inequalities, exactly as `H`'s are; there is no separate exact-`T` event to route around.
-struct SmallProblem {
-    uint32_t size{0};
-    bool boundary_legal[MAX_SMALL]{};
-    pm::cumulative_time_int boundary_w[MAX_SMALL]{};
-    bool pair_legal[MAX_SMALL][MAX_SMALL]{};
-    pm::cumulative_time_int pair_w[MAX_SMALL][MAX_SMALL]{};
-};
+    into.committed_pairs_frozen += part.committed_pairs_frozen;
+    into.committed_pairs_tree += part.committed_pairs_tree;
+    into.committed_pairs_blossom_cycle += part.committed_pairs_blossom_cycle;
+    into.committed_boundary += part.committed_boundary;
+    into.num_trees += part.num_trees;
+    into.exposed_root_blossoms += part.exposed_root_blossoms;
 
-/// One configuration of "defect-pairings-with-boundary-fill": a set of disjoint legal
-/// defect-defect pairs, with every unpaired member taking a legal boundary match.
-struct SmallMatching {
-    /// False on the empty result, i.e. the component admits no such configuration at all.
-    bool feasible{false};
-    pm::cumulative_time_int weight{0};
-    uint32_t num_pairs{0};
-    /// Local indices of the paired members, `pair_a[i] < pair_b[i]`, and the list ascending in
-    /// `pair_a` — which is the sorted `(min, max)` pair list the tie-break compares.
-    uint32_t pair_a[MAX_SMALL / 2]{};
-    uint32_t pair_b[MAX_SMALL / 2]{};
-    uint32_t num_boundary{0};
-    uint32_t boundary[MAX_SMALL]{};
-};
+    into.dual_sum_at_truncation += part.dual_sum_at_truncation;
+    into.max_region_dual = std::max(into.max_region_dual, part.max_region_dual);
 
-/// The order the resolver minimises in: total `w_int` first, and among equal-weight configurations
-/// the lexicographically smallest sorted `(min, max)` defect pair list, with a shorter list — one
-/// that is a prefix of the other — ordered first.
-///
-/// Equal weight means equal committed weight, and an observable that differs by at most a
-/// homologically trivial cycle (zero flip), so either configuration is exact. The tie-break decides
-/// only *which* one, so that two runs are bit-identical (§0).
-bool small_matching_better(const SmallMatching& a, const SmallMatching& b) {
-    if (!b.feasible)
-        return a.feasible;
-    if (!a.feasible)
-        return false;
-    if (a.weight != b.weight)
-        return a.weight < b.weight;
-    for (uint32_t i = 0; i < a.num_pairs && i < b.num_pairs; i++) {
-        if (a.pair_a[i] != b.pair_a[i])
-            return a.pair_a[i] < b.pair_a[i];
-        if (a.pair_b[i] != b.pair_b[i])
-            return a.pair_b[i] < b.pair_b[i];
-    }
-    return a.num_pairs < b.num_pairs;
+    // Maxima, because they describe the worst structure anywhere in the shot — the same reading
+    // they had when one solve saw all of `H`.
+    into.largest_tree_size = std::max(into.largest_tree_size, part.largest_tree_size);
+    into.max_blossom_nesting_depth = std::max(into.max_blossom_nesting_depth, part.max_blossom_nesting_depth);
+    into.max_blossom_members = std::max(into.max_blossom_members, part.max_blossom_members);
+    into.max_exposed_blossom_depth = std::max(into.max_exposed_blossom_depth, part.max_exposed_blossom_depth);
+    into.max_exposed_blossom_members = std::max(into.max_exposed_blossom_members, part.max_exposed_blossom_members);
+    into.matched_blossom_shatters += part.matched_blossom_shatters;
+    into.harvest_dependent_depth = std::max(into.harvest_dependent_depth, part.harvest_dependent_depth);
+
+    into.enumerate_ns += part.enumerate_ns;
+    into.reduce_ns += part.reduce_ns;
+    into.base_descent_ns += part.base_descent_ns;
+    into.shatter_ns += part.shatter_ns;
 }
 
-/// Extends `current` from the lowest unmatched member and keeps the best complete configuration.
-///
-/// Taking the *lowest* unmatched member at every step enumerates each configuration exactly once,
-/// and emits its pairs in ascending `pair_a` order, which is the sorted pair list the tie-break
-/// wants without a sort. The candidate sets of the design's sizes 1–4 are what this generates:
-/// a singleton's boundary match; a pair's `u–v` or `u,v` both to boundary; a triple's three
-/// "one to boundary, the other two paired" plus all-three-to-boundary; a quadruple's three internal
-/// perfect matchings, its `C(4,2)` "one pair plus two boundaries", and all-four-to-boundary.
-void extend_small_matching(const SmallProblem& problem, uint32_t used, SmallMatching& current, SmallMatching& best) {
-    uint32_t i = 0;
-    while (i < problem.size && (used & (1u << i)) != 0)
-        i++;
-    if (i == problem.size) {
-        current.feasible = true;
-        if (small_matching_better(current, best))
-            best = current;
+/// `HarvestResult::residual` is contracted to be sorted ascending, and the union of the components'
+/// residuals is not: each component's is sorted within itself, but the blocks interleave. One sort
+/// of the `(defect, Y(u))` pairs restores it, which is also what makes the §2.5 set comparison
+/// against the monolithic residual a plain `==`.
+void sort_residual(HarvestResult& result, std::vector<std::pair<uint64_t, pm::total_weight_int>>& scratch) {
+    if (result.residual.size() < 2)
         return;
+    scratch.clear();
+    scratch.reserve(result.residual.size());
+    for (size_t i = 0; i < result.residual.size(); i++)
+        scratch.emplace_back(result.residual[i], result.residual_dual_sum[i]);
+    std::sort(scratch.begin(), scratch.end());
+    for (size_t i = 0; i < scratch.size(); i++) {
+        result.residual[i] = scratch[i].first;
+        result.residual_dual_sum[i] = scratch[i].second;
     }
-
-    // The boundary fill is tried before the pairings, so that among equal-weight configurations the
-    // shorter pair list is reached first. That is the tie-break's order made explicit in the
-    // enumeration; `small_matching_better` still decides, so the two cannot drift apart.
-    if (problem.boundary_legal[i]) {
-        current.boundary[current.num_boundary++] = i;
-        current.weight += problem.boundary_w[i];
-        extend_small_matching(problem, used | (1u << i), current, best);
-        current.weight -= problem.boundary_w[i];
-        current.num_boundary--;
-    }
-    for (uint32_t j = i + 1; j < problem.size; j++) {
-        if ((used & (1u << j)) != 0 || !problem.pair_legal[i][j])
-            continue;
-        current.pair_a[current.num_pairs] = i;
-        current.pair_b[current.num_pairs] = j;
-        current.num_pairs++;
-        current.weight += problem.pair_w[i][j];
-        extend_small_matching(problem, used | (1u << i) | (1u << j), current, best);
-        current.weight -= problem.pair_w[i][j];
-        current.num_pairs--;
-    }
-}
-
-/// Sizes 1–4, exactly: the minimum-weight pairing-with-boundary-fill, or infeasible.
-///
-/// Infeasible is not a failure and not an error. Even size does not guarantee a complete matching —
-/// a size-4 "star" whose centre is within `2T` of three mutually far members, none of them with a
-/// legal boundary, has no feasible pairing, and neither does an odd component with no legal
-/// boundary. The caller routes those to the residual and the shot escalates, exactly as the solver
-/// would have left it.
-SmallMatching resolve_small_component(const SmallProblem& problem) {
-    SmallMatching best;
-    SmallMatching current;
-    extend_small_matching(problem, 0, current, best);
-    return best;
-}
-
-/// Position of an `H`-node within its component's ascending member block, i.e. the local index the
-/// two structs above are written in. A linear scan over at most four entries.
-template <typename Members>
-uint32_t local_index_of(const Members& members, uint32_t size, uint32_t node) {
-    for (uint32_t a = 0; a < size; a++) {
-        if (members[a] == node)
-            return a;
-    }
-    assert(false && "an H edge names a node outside the component it is internal to");
-    return 0;
-}
-
-/// The observable mask of one ball entry's stored path, XORed out of the entry's observable id
-/// list. Zero above 64 observables, exactly as `BallMwpm::rebuild` leaves it there: the mask is
-/// unusable and the match-edge flavour is the only correct readout (§0's observables rule).
-pm::obs_int path_obs_mask(const BallTables& tables, uint64_t entry, bool use_masks) {
-    if (!use_masks)
-        return 0;
-    pm::obs_int mask = 0;
-    for (uint64_t k = tables.ball_mask_offsets[entry]; k < tables.ball_mask_offsets[entry + 1]; k++)
-        mask ^= (pm::obs_int)1 << tables.ball_mask_ids[k];
-    return mask;
-}
-
-pm::obs_int boundary_obs_mask(const BallTables& tables, uint64_t det, bool use_masks) {
-    if (!use_masks)
-        return 0;
-    pm::obs_int mask = 0;
-    for (uint64_t k = tables.bcost_mask_offsets[det]; k < tables.bcost_mask_offsets[det + 1]; k++)
-        mask ^= (pm::obs_int)1 << tables.bcost_mask_ids[k];
-    return mask;
 }
 
 void sort_pairs(std::vector<CommittedPair>& pairs) {
@@ -256,15 +162,8 @@ void BallDecoder::finish_construction(const char* ball_artifact_path) {
         throw std::invalid_argument(
             "verify_against_g compares H's truncated harvest against M1 on G; the stock-on-H path (§M7) has no "
             "truncated harvest. Its oracle is stock exact decode on G — see §M7.6 level 1.");
-    // §A. `k` is capped at 4 because no resolver is defined above it: the enumeration of
-    // pairings-with-boundary-fill is written out for sizes 1–4 and for nothing larger. Rejected here
-    // rather than silently clamped, so a run cannot report a `k` it did not decode at.
-    if (config.prune_component_max_size < 0 ||
-        config.prune_component_max_size > (int)BallPrune::MAX_SMALL_COMPONENT_SIZE)
-        throw std::invalid_argument(
-            "prune_component_max_size (k) must be in [0, " + std::to_string(BallPrune::MAX_SMALL_COMPONENT_SIZE) +
-            "]; no small-component resolver is defined above that.");
-    assert(config.prune_component_max_size <= (int)BallPrune::MAX_SMALL_COMPONENT_SIZE && "k exceeds the resolver cap");
+    if (config.diameter_cap == 0)
+        throw std::invalid_argument("BallConfig::diameter_cap must be positive; 0 would measure no component at all.");
 
     const pm::MatchingGraph& graph = g_mwpm.flooder.graph;
     horizon = to_time_units(config.T, graph.normalising_constant);
@@ -291,176 +190,110 @@ void BallDecoder::finish_construction(const char* ball_artifact_path) {
         g_mwpm.flooder.negative_weight_sum != 0 || !g_mwpm.flooder.negative_weight_detection_events.empty();
 
     h_mwpm.configure(graph.num_observables, graph.normalising_constant);
+    // §2.5's monolithic instance is configured either way — it costs one empty `pm::Mwpm` — but it
+    // only ever grows a node pool if the flag actually turns the check on.
+    verify_mwpm.configure(graph.num_observables, graph.normalising_constant);
     arena.reset_for_graph(graph.nodes.size());
 }
 
-const BallGraph& BallDecoder::resolve_small_components(
-    const BallGraph& h, pm::MatchingResult& resolved, SmallCommitCounts& counts) {
-    // Untimed by construction: no timer is started here and none may be added (hard constraint 1).
-    // This is a serial pre-pass on the critical path, excluded from what this branch reports by
-    // measurement scope; see `decode_impl`'s call site.
-    BallPrune& prune = arena.prune;
-    compute_prune_components(h, prune);
-
-    // The horizon in the decoder's own stored integer units. Read, never re-derived: converting
-    // `config.T` a second time here would be the §0 unit-rule trap.
-    const pm::cumulative_time_int t_int = horizon;
-    bool use_masks = g_mwpm.flooder.graph.num_observables <= sizeof(pm::obs_int) * 8;
-    // `k`, capped at the largest size a resolver is defined for. The cap is enforced at
-    // construction; clamping again here is what keeps this loop's fixed-width blocks in range no
-    // matter how the config was reached.
-    uint32_t max_size = config.prune_component_max_size <= 0
-                            ? 0
-                            : std::min<uint32_t>((uint32_t)config.prune_component_max_size, MAX_SMALL);
-    uint32_t n = (uint32_t)h.num_nodes();
-
-    auto commit_boundary = [&](uint32_t node) {
-        uint64_t det = h.h_to_det[node];
-        resolved.obs_mask ^= boundary_obs_mask(tables, det, use_masks);
-        resolved.weight += (pm::total_weight_int)tables.bcost_w_int[det];
-        resolved_pairs.push_back(CommittedPair{(int64_t)det, -1, CommittedPair::NO_BALL_ENTRY});
-        counts.boundary++;
-    };
-
-    // ---- One pass over the components, in ascending root order (§0 determinism). Roots are the
-    // minimum member of their set, so `root` ascending is `H`-node order and the accumulation below
-    // is a function of `H` alone.
-    for (uint32_t root = 0; root < n; root++) {
-        if (prune.component_of[root] != root)
-            continue;
-        uint32_t size = prune.component_size[root];
-        if (size > max_size) {
-            prune.verdict[root] = (uint8_t)SmallVerdict::SOLVER;
-            continue;
-        }
-
-        // The component's legality table, off `H` and the ball tables and nothing else. The
-        // presence of an `H` edge *is* the pairing's legality test (`d_G <= 2T`), and its `w_int`
-        // is the pairing's weight, so the resolver cannot disagree with `H` about either.
-        const auto& members = prune.small_members[root];
-        assert(prune.small_member_count[root] == size && "the small-component member block is short");
-        SmallProblem problem;
-        problem.size = size;
-        for (uint32_t a = 0; a < size; a++) {
-            BoundaryCost cost = boundary_cost(tables, h.h_to_det[members[a]]);
-            problem.boundary_legal[a] = cost.exists && cost.w_int <= t_int;
-            problem.boundary_w[a] = cost.w_int;
-        }
-        uint32_t edge_of[MAX_SMALL][MAX_SMALL] = {};
-        for (uint32_t e = 0; e < prune.small_edge_count[root]; e++) {
-            uint32_t index = prune.small_edges[root][e];
-            const BallGraphEdge& edge = h.edges[index];
-            uint32_t a = local_index_of(members, size, edge.i);
-            uint32_t b = local_index_of(members, size, edge.j);
-            problem.pair_legal[a][b] = problem.pair_legal[b][a] = true;
-            problem.pair_w[a][b] = problem.pair_w[b][a] = (pm::cumulative_time_int)edge.w_int;
-            edge_of[a][b] = edge_of[b][a] = index;
-        }
-
-        SmallMatching matching = resolve_small_component(problem);
-        if (!matching.feasible) {
-            // No configuration at all: the component survives past the horizon and the shot
-            // escalates on it, exactly as the solver would have left it.
-            counts.residual++;
-            prune.verdict[root] = (uint8_t)SmallVerdict::RESIDUAL;
-            continue;
-        }
-        for (uint32_t p = 0; p < matching.num_pairs; p++) {
-            // Mask and weight come off the ball entry behind the edge, which is the same entry
-            // harvest would have extracted for this match — that is what keeps the committed
-            // observables and weight bit-exact.
-            const BallGraphEdge& edge = h.edges[edge_of[matching.pair_a[p]][matching.pair_b[p]]];
-            resolved.obs_mask ^= path_obs_mask(tables, edge.entry, use_masks);
-            resolved.weight += (pm::total_weight_int)edge.w_int;
-            resolved_pairs.push_back(
-                CommittedPair{(int64_t)h.h_to_det[edge.i], (int64_t)h.h_to_det[edge.j], edge.entry});
-            counts.pairs++;
-        }
-        for (uint32_t b = 0; b < matching.num_boundary; b++)
-            commit_boundary(members[matching.boundary[b]]);
-        counts.defects_resolved += (int)size;
-        prune.verdict[root] = (uint8_t)SmallVerdict::COMMIT;
-    }
-
-    // ---- Spread each component's verdict to its members, and count what is left for the solver.
-    uint32_t solver_nodes = 0;
-    for (uint32_t i = 0; i < n; i++) {
-        // A RESIDUAL component is neither committed nor solved: the shot escalates on it and §A.5
-        // discards Phase 1 in full, so there is nothing for the solver to learn from it.
-        bool to_solver = (SmallVerdict)prune.verdict[prune.component_of[i]] == SmallVerdict::SOLVER;
-        prune.node_to_solver[i] = to_solver ? 1 : 0;
-        solver_nodes += to_solver ? 1 : 0;
-    }
-
-    // Nothing was resolved away: hand the solver `H` itself rather than copying it into an
-    // identical sub-graph. This is the shot class the prune cannot help, and it should not pay for
-    // being looked at.
-    if (solver_nodes == n) {
-        assert(counts.pairs == 0 && counts.boundary == 0 && counts.residual == 0 && counts.defects_resolved == 0);
-        return h;
-    }
-    build_solver_subgraph(h, prune);
-    return prune.solver_graph;
+void BallDecoder::set_horizon(double T) {
+    if (T > config.ball.T_max)
+        throw std::invalid_argument(
+            "BallConfig::T exceeds BallParams::T_max; the compiled tables do not cover that horizon.");
+    horizon_int next = to_time_units(T, g_mwpm.flooder.graph.normalising_constant);
+    if (next > tables.t_max_int)
+        throw std::invalid_argument("BallConfig::T exceeds the compiled T_max in time units.");
+    config.T = T;
+    horizon = next;
 }
 
 void BallDecoder::save_ball_artifact(const std::string& path) const {
     save_ball_tables(tables, path);
 }
 
-void BallDecoder::analyze_last_shot_components(BallProfile& prof, ComponentHistograms& histograms) {
-    // No timer is started anywhere in this function, and none may be added: §C is untimed by
+void BallDecoder::analyze_last_shot_components(
+    BallProfile& prof,
+    ComponentHistograms& histograms,
+    ComponentStatusTable& size_x_status,
+    ComponentStatusTable& hop_diameter_x_status) {
+    // No timer is started anywhere in this function, and none may be added: §3.5.2 is untimed by
     // construction and the caller has already closed the shot's window.
     ComponentStats& stats = prof.components;
     stats = ComponentStats();
     histograms.clear();
+    size_x_status.clear();
+    hop_diameter_x_status.clear();
 
     const BallGraph& h = arena.graph;
     BallComponents& components = arena.components;
-    analyze_ball_components(h, components);
+    analyze_ball_components(h, components, config.diameter_cap);
+
+    // The decode's own statuses, for the joint tables. Both decompositions are union-find over the
+    // same edge set enumerated in ascending root order, so component `c` is the same component in
+    // both — asserted rather than assumed, because a joint table joined on the wrong key is a table
+    // that looks right and says nothing.
+    const BallComponentSplit& split = arena.split;
+    assert(split.roots.size() == components.roots.size() && "the two decompositions of H disagree on the components");
+    assert(
+        std::equal(split.roots.begin(), split.roots.end(), components.roots.begin()) &&
+        "the two decompositions of H disagree on the component roots");
 
     // The horizon in the decoder's own stored integer units. Read, never re-derived: converting
     // `config.T` a second time here would be the §0 unit-rule trap.
     const pm::cumulative_time_int t_int = horizon;
     uint32_t num_nodes = (uint32_t)h.num_nodes();
-    // The same `k` the decode path resolves at, clamped the same way, so the classification below
-    // describes the run it is collected beside rather than a fixed size-2 rule.
-    uint32_t max_size = config.prune_component_max_size <= 0
-                            ? 0
-                            : std::min<uint32_t>((uint32_t)config.prune_component_max_size, MAX_SMALL);
 
     stats.measured = 1;
     stats.num_components = (int)components.num_components();
+    stats.component_defects = (int)num_nodes;
+    stats.components_truncated = (int)split.num_truncated();
 
     // ---- Per-edge and per-node distributions. Every `H` edge weight is an exact `d_G` between two
-    // defects, which is the path-length distribution §C.2 asks for.
+    // defects, which is the path-length distribution §C.2 asks for. The two weight histograms are
+    // filled here and simply not written by `sparse_graph_stats` (§3.5.2, "Not collected").
     for (const BallGraphEdge& edge : h.edges) {
         histograms.edge_weight_hist[ComponentHistograms::weight_bin(
-            (pm::cumulative_time_int)edge.w_int, t_int, ComponentHistograms::WEIGHT_HIST_BINS)]++;
+            (pm::cumulative_time_int)edge.w_int, t_int, histograms.edge_weight_hist.size())]++;
     }
     for (uint32_t i = 0; i < num_nodes; i++) {
         histograms.degree_hist[ComponentHistograms::count_bin(
-            components.degree_of(i), ComponentHistograms::DEGREE_HIST_BINS)]++;
+            components.degree_of(i), histograms.degree_hist.size())]++;
         BoundaryCost cost = boundary_cost(tables, h.h_to_det[i]);
         if (cost.exists) {
             histograms.bcost_hist[ComponentHistograms::weight_bin(
-                cost.w_int, t_int, ComponentHistograms::BCOST_HIST_BINS)]++;
+                cost.w_int, t_int, histograms.bcost_hist.size())]++;
         }
     }
+    // `H` gives a node at most one boundary edge, so the edge count *is* the node count. Both are
+    // reported because §3.5.2 names both, and they are asserted equal rather than one derived from
+    // the other.
+    stats.nodes_with_boundary_edge = (int)h.boundary_edges.size();
 
     // ---- Per component, in ascending root order (§0 determinism).
     for (size_t c = 0; c < components.num_components(); c++) {
         uint32_t size = components.sizes[c];
         uint32_t begin = components.member_offsets[c];
-        histograms.size_hist[ComponentHistograms::count_bin(size, ComponentHistograms::SIZE_HIST_BINS)]++;
+        size_t status = split.status[c] == BallComponentSplit::COMPONENT_TRUNCATED ? ComponentStatusTable::TRUNCATED
+                                                                                  : ComponentStatusTable::COMPLETE;
+
+        histograms.size_hist[ComponentHistograms::count_bin(size, histograms.size_hist.size())]++;
+        size_x_status.add(size, status);
         stats.largest_component_size = std::max(stats.largest_component_size, (int)size);
 
-        pm::cumulative_time_int diameter = component_diameter(components, c);
+        pm::cumulative_time_int diameter = component_diameter(components, c, config.diameter_cap);
+        int32_t hop_diameter = component_hop_diameter(components, c, config.diameter_cap);
         if (diameter < 0) {
+            // One cap governs both walks, so a component either has both diameters or neither.
+            assert(hop_diameter < 0 && "the two diameter walks disagreed about the cap");
             stats.diameter_uncomputed_components++;
         } else {
             histograms.diameter_hist[ComponentHistograms::weight_bin(
-                diameter, t_int, ComponentHistograms::DIAMETER_HIST_BINS)]++;
+                diameter, t_int, histograms.diameter_hist.size())]++;
             stats.max_component_diameter_wint = std::max(stats.max_component_diameter_wint, (int)diameter);
+            histograms.hop_diameter_hist[ComponentHistograms::count_bin(
+                (uint64_t)hop_diameter, histograms.hop_diameter_hist.size())]++;
+            hop_diameter_x_status.add((size_t)hop_diameter, status);
+            stats.max_component_hop_diameter = std::max(stats.max_component_hop_diameter, (int)hop_diameter);
         }
 
         bool touches_boundary = false;
@@ -472,61 +305,35 @@ void BallDecoder::analyze_last_shot_components(BallProfile& prof, ComponentHisto
             }
         }
         stats.num_boundary_touching_components += touches_boundary ? 1 : 0;
+        // §3.5.2's certain-truncation class: an odd component with nowhere legal to send its odd
+        // member cannot be perfectly matched inside `T` at all, so it truncates whatever blossom
+        // does with it. Counted, never acted on — the status beside it comes from the solve.
+        bool odd_without_boundary = (size % 2 == 1) && !touches_boundary;
+        stats.num_odd_components_without_boundary += odd_without_boundary ? 1 : 0;
+        assert(
+            (!odd_without_boundary || status == ComponentStatusTable::TRUNCATED) &&
+            "an odd component with no legal boundary completed, which no perfect matching allows");
 
-        // The size classes, which are structural and say nothing about `k`: "trivial" is size <= 2
-        // in this table whatever the resolver is configured to attempt, so the §C series stays
-        // comparable across runs.
+        // The size classes, which are structural: "trivial" is size <= 2 whatever the solve does
+        // with it, so the series stays comparable across runs and across branches.
         if (size == 1) {
             stats.num_singleton_components++;
         } else if (size == 2) {
             stats.num_pair_components++;
         } else {
-            stats.num_nontrivial_components++;
+            stats.num_components_size_ge3++;
         }
         if (size <= 2) {
             stats.num_trivial_components++;
             stats.defects_in_trivial_components += (int)size;
         }
-
-        // The resolver's classification, at the `k` this decoder is configured with. Nothing is
-        // committed here: the verdict is counted and discarded, so this is a measurement of what
-        // the prune removes and not the prune itself.
-        SmallVerdict verdict = SmallVerdict::SOLVER;
-        if (size <= max_size) {
-            SmallProblem problem;
-            problem.size = size;
-            for (uint32_t a = 0; a < size; a++) {
-                uint32_t node = components.members[begin + a];
-                BoundaryCost cost = boundary_cost(tables, h.h_to_det[node]);
-                problem.boundary_legal[a] = cost.exists && cost.w_int <= t_int;
-                problem.boundary_w[a] = cost.w_int;
-                // The §C adjacency carries both directions of every `H` edge and the local index of
-                // a member is its position in this block, so one walk per member fills the pairing
-                // table — the same legality test the decode path makes off `BallPrune`.
-                for (uint32_t e = components.adj_offsets[node]; e < components.adj_offsets[node + 1]; e++) {
-                    uint32_t b = components.local_index[components.adj_target[e]];
-                    problem.pair_legal[a][b] = true;
-                    problem.pair_w[a][b] = (pm::cumulative_time_int)components.adj_weight[e];
-                }
-            }
-            verdict = resolve_small_component(problem).feasible ? SmallVerdict::COMMIT : SmallVerdict::RESIDUAL;
-        }
-
-        if (verdict == SmallVerdict::COMMIT) {
-            stats.defects_committed_trivially += (int)size;
-        } else if (verdict == SmallVerdict::RESIDUAL) {
-            stats.defects_residual_trivially += (int)size;
-        } else {
-            stats.defects_to_solver += (int)size;
-        }
     }
 
-    // The three classifications partition `H`'s nodes; the aggregate's fractions are taken over
-    // their sum, so a gap here would silently rescale every one of them.
+    // The components partition `H`'s nodes; every per-shot fraction below is taken over that sum, so
+    // a gap here would silently rescale all of them.
     assert(
-        stats.defects_committed_trivially + stats.defects_residual_trivially + stats.defects_to_solver ==
-            (int)num_nodes &&
-        "the resolver's classification did not partition H's defects");
+        stats.num_singleton_components + 2 * stats.num_pair_components <= (int)num_nodes &&
+        "the component size classes overran H's node count");
 }
 
 void BallDecoder::compute_seeded_detection_events(const std::vector<uint64_t>& dets, std::vector<uint64_t>& out) const {
@@ -577,11 +384,144 @@ void BallDecoder::compute_seeded_detection_events(const std::vector<uint64_t>& d
     }
 }
 
-template <typename HarvestOnH>
-Phase1Outcome BallDecoder::decode_impl(
-    const std::vector<uint64_t>& dets, BallProfile* prof, bool allow_prune, const HarvestOnH& harvest_on_h) {
-    HiResTimer total_timer;
+void BallDecoder::drain_component_match_edges() {
+    // The sub-`H` the component instance was just built on. The instance's node indices are indices
+    // into *that* graph, and so is the edge list the ball entry is looked up in — which is why this
+    // has to run before the next component rebuilds the instance underneath these pointers.
+    const BallGraph& sub = arena.split.sub;
+    const pm::DetectorNode* base = h_mwpm.mwpm.flooder.graph.nodes.data();
+    for (const pm::CompressedEdge& edge : match_edge_scratch) {
+        size_t i = (size_t)(edge.loc_from - base);
+        int64_t from = (int64_t)sub.h_to_det[i];
+        if (edge.loc_to == nullptr) {
+            committed_pair_scratch.push_back(CommittedPair{from, -1, CommittedPair::NO_BALL_ENTRY});
+            continue;
+        }
+        size_t j = (size_t)(edge.loc_to - base);
+        int64_t to = (int64_t)sub.h_to_det[j];
+        // Every committed pair is an edge of the component's sub-`H` — a region only ever meets
+        // another region across one, and §1 says it cannot meet one outside its component at all —
+        // so the ball entry behind it is in `sub.edges`, which is sorted by `(i, j)` with `i < j`.
+        // One binary search; no map, no per-shot allocation.
+        uint32_t lo = (uint32_t)std::min(i, j);
+        uint32_t hi = (uint32_t)std::max(i, j);
+        auto it = std::lower_bound(
+            sub.edges.begin(),
+            sub.edges.end(),
+            std::pair<uint32_t, uint32_t>{lo, hi},
+            [](const BallGraphEdge& e, const std::pair<uint32_t, uint32_t>& key) {
+                return e.i != key.first ? e.i < key.first : e.j < key.second;
+            });
+        assert(it != sub.edges.end() && it->i == lo && it->j == hi && "a committed pair that is not an edge of H[C]");
+        committed_pair_scratch.push_back(CommittedPair{from, to, it->entry});
+    }
+    match_edge_scratch.clear();
+}
+
+template <typename HarvestComponent>
+TimelineStatus BallDecoder::solve_component(
+    BallProfile* prof, const HarvestComponent& harvest_component, HarvestResult& harvest) {
+    const BallGraph& sub = arena.split.sub;
     HiResTimer step;
+
+    if (prof != nullptr)
+        step.start();
+    BallMwpmCounts mwpm_counts;
+    bool structural = prof != nullptr && config.collect_structural_counters;
+    h_mwpm.rebuild(tables, sub, arena, structural ? &mwpm_counts : nullptr);
+    if (prof != nullptr) {
+        prof->mwpm_build_ns += step.elapsed_ns();
+        if (structural) {
+            prof->mwpm_init_node_elements += (int)mwpm_counts.node_records;
+            prof->mwpm_init_edge_elements += (int)mwpm_counts.edge_records;
+        }
+    }
+
+    // The component's nodes are `0..s-1` by construction, so its detection events are every node.
+    h_dets_scratch.clear();
+    h_dets_scratch.reserve(sub.num_nodes());
+    for (size_t i = 0; i < sub.num_nodes(); i++)
+        h_dets_scratch.push_back(i);
+
+    TimelineStatus status = TimelineStatus::COMPLETE;
+    if (config.stock_on_h) {
+        // §M7's front end, asked of the component rather than of `H`. The certificate composes over
+        // the split for the same reason the timeline does: `max_u Y(u)` over `H` is the max over the
+        // components of their own terminal duals, and `H` has a perfect matching iff every component
+        // does. Both follow from §1 — the regions of two components never interact before `T`.
+        if (prof != nullptr)
+            step.start();
+        CertificateOutcome certificate = run_stock_and_certify(h_mwpm.mwpm, h_dets_scratch, horizon, prof != nullptr);
+        if (prof != nullptr) {
+            // The solve proper, with the certificate's own scan netted out, so the two stages are
+            // additive and §M7.8's read can charge the scan separately from the blossom work.
+            prof->blossom_on_h_ns += step.elapsed_ns() - certificate.dual_scan_ns;
+            prof->dual_scan_ns += certificate.dual_scan_ns;
+            prof->h_no_perfect_matching |= certificate.status == CertificateStatus::NO_PERFECT_MATCHING ? 1 : 0;
+            prof->max_dual_at_completion = std::max(prof->max_dual_at_completion, certificate.max_dual);
+        }
+        status = certificate.certified() ? TimelineStatus::COMPLETE : TimelineStatus::TRUNCATED;
+
+        // Debug invariant 3, per component: it escalates **iff** this component had no perfect
+        // matching or completed with `max_u Y(u) > T_int`, read off the certificate's own
+        // recomputed dual rather than off a proxy such as "the residual is empty".
+        assert(
+            (status == TimelineStatus::TRUNCATED) ==
+                (certificate.status == CertificateStatus::NO_PERFECT_MATCHING || certificate.max_dual > horizon) &&
+            "invariant 3: the escalation trigger and the certificate disagree");
+        // Debug invariant 4, the machine guard against §M7.0's "catching the throw is enough"
+        // fallacy: a component that *completed* with a dual over `T` must escalate.
+        assert(
+            !(certificate.status == CertificateStatus::DUAL_EXCEEDS_HORIZON && status == TimelineStatus::COMPLETE) &&
+            "invariant 4: a completing-but-over-T H-matching escaped as if it were certified");
+    } else {
+        if (prof != nullptr)
+            step.start();
+        status = config.collect_harvest_diagnostics
+                     ? process_timeline_until_horizon_measured(h_mwpm.mwpm, h_dets_scratch, horizon, depth_model)
+                     : process_timeline_until_horizon(h_mwpm.mwpm, h_dets_scratch, horizon);
+        if (prof != nullptr) {
+            prof->blossom_on_h_ns += step.elapsed_ns();
+            if (config.collect_harvest_diagnostics) {
+                // §M2.9.6 measurement 4 is a serial depth, so it is the deepest chain anywhere in
+                // the shot; the event count is the total.
+                prof->solve_dependent_depth = std::max(prof->solve_dependent_depth, depth_model.depth);
+                prof->solve_events += depth_model.events;
+            }
+        }
+    }
+
+    // Invariant 5's second half: no exposed-root-blossom routine may be entered on a certified
+    // component. §M1.4 is unreachable there — its precondition is a *surviving* tree root.
+    uint64_t base_descents_before = harvester.counters.base_descents;
+
+    if (prof != nullptr)
+        step.start();
+    match_edge_scratch.clear();
+    harvest = harvest_component(h_mwpm.mwpm, h_dets_scratch, status);
+    if (prof != nullptr)
+        prof->harvest_ns += step.elapsed_ns();
+
+    assert(
+        (!config.stock_on_h || status != TimelineStatus::COMPLETE ||
+         harvester.counters.base_descents == base_descents_before) &&
+        "invariant 5: a certified component entered the exposed-root-blossom base descent");
+    (void)base_descents_before;
+
+    // Back to `G`'s detector ids through the component's own `h_to_det`, which is a strictly
+    // ascending subsequence of `H`'s — so a residual sorted inside the component is sorted in `G`,
+    // and nothing downstream of harvest has to know the component existed.
+    for (uint64_t& defect : harvest.residual) {
+        assert(defect < sub.num_nodes());
+        defect = sub.h_to_det[defect];
+    }
+    return status;
+}
+
+template <typename HarvestComponent>
+Phase1Outcome BallDecoder::decode_impl(
+    const std::vector<uint64_t>& dets, BallProfile* prof, bool want_pairs, const HarvestComponent& harvest_component) {
+    HiResTimer total_timer;
     if (prof != nullptr) {
         prof->clear();
         total_timer.start();
@@ -606,214 +546,59 @@ Phase1Outcome BallDecoder::decode_impl(
         structural ? &counts : nullptr);
     const BallGraph& h = arena.graph;
 
-    // ---- §A. Resolve the components of size <= k off the ball tables and hand the solver what is
-    // left.
-    //
-    // serial pre-pass; excluded from this measurement by intent. It runs before the solve, in
-    // series, on the critical path, and it is a real cost — it is outside every `step.start()`
-    // below because this branch's reported latency is scoped to the solver and the harvest on the
-    // size-`> k` graph, to be measured and optimised separately, and not because it is free or
-    // concurrent. `allow_prune` is false on the verification entry points, whose whole job is to
-    // solve the same `H` the oracle does.
-    resolved_pairs.clear();
-    pm::MatchingResult resolved(0, 0);
-    SmallCommitCounts resolved_counts;
-    bool pruning = allow_prune && config.prune_component_max_size > 0;
-    const BallGraph& solver_h = pruning ? resolve_small_components(h, resolved, resolved_counts) : h;
-    solved_graph = &solver_h;
+    // ---- §2.2. The connected components of `H`, in ascending root order. This is the *only*
+    // partition of the shot: there is no size threshold and no second way to decide a component.
+    BallComponentSplit& split = arena.split;
+    decompose_ball_components(h, split);
 
-    // §A.5's verdict, known here rather than only at the combine below: a RESIDUAL component decides
-    // the branch on its own, whatever the solver goes on to do with the size-`> k` remainder.
-    //
-    // It has to be known *before* the harvest. The production entry points abandon an escalating
-    // shot in O(1) instead of extracting from it (§M3.4), and they decide that off the status they
-    // are handed at the harvest call site — so leaving the residual to flip `outcome.status` after
-    // that call had the shot extract a Phase 1 result that §A.5 then discarded, which is the wasted
-    // work §M3.3 X9 counts.
-    bool resolver_forces_escalation = pruning && resolved_counts.residual > 0;
+    committed_pair_scratch.clear();
+    match_edge_scratch.clear();
 
-    // §A.4. With every component resolved off the solver — the common case at `p = 1e-3` — there is no
-    // `Mwpm(H)` to build, no timeline to run and nothing to extract. That is where the reduction
-    // comes from, so it is a skip of the whole stage rather than a solve over an empty node set.
-    //
-    // The skip is conditioned on the prune, not merely on the node count, so that at `k = 0` the
-    // path is byte-identical to the un-pruned one down to the harvest counters: a defect-free shot
-    // still builds its empty `Mwpm(H)` and still runs its empty solve and extraction, exactly as it
-    // does today.
-    bool solver_runs = !pruning || solver_h.num_nodes() != 0;
-
-    BallMwpmCounts mwpm_counts;
-    if (solver_runs) {
-        if (prof != nullptr)
-            step.start();
-        h_mwpm.rebuild(tables, solver_h, arena, structural ? &mwpm_counts : nullptr);
-        if (prof != nullptr)
-            prof->mwpm_build_ns = step.elapsed_ns();
-    }
-
-    // The solved graph's nodes are `0..n-1` by construction, so its detection events are every node.
-    h_dets_scratch.clear();
-    h_dets_scratch.reserve(solver_h.num_nodes());
-    for (size_t i = 0; i < solver_h.num_nodes(); i++)
-        h_dets_scratch.push_back(i);
-
-    // §M2.9.6 measurement 3. A process-wide counter, so it is read as a delta around the solve.
+    // §M2.9.6 measurement 3. A process-wide counter, so it is read as a delta around the solves.
     uint64_t formations_before = pm::blossom_formation_stats.formations;
     harvester.collect_diagnostics = config.collect_harvest_diagnostics;
     harvester.use_legacy_enumeration = config.use_legacy_harvest_enumeration;
 
     Phase1Outcome outcome;
-    if (!solver_runs) {
-        // §A.4's skip. Nothing ran, so nothing is reported: `blossom_on_h_ns`, `dual_scan_ns` and
-        // `harvest_ns` stay at the zero `prof->clear()` left them at, which is the honest reading —
-        // the stage did not happen. Under §M7 there is no dual scan to certify the shot with, and
-        // none is needed *for the components the resolver committed*: it settled those exactly, at
-        // `H`'s own cutoffs, so every committed match is inside the horizon the certificate tests —
-        // a pair at `d <= 2T`, a boundary match at `bcost <= T`.
-        //
-        // This is the provisional reading only. A RESIDUAL component also leaves the solver empty
-        // without being settled, and §A.5 below withdraws the certificate when there was one.
-        if (prof != nullptr && config.stock_on_h)
-            prof->certified = 1;
-    } else if (config.stock_on_h) {
-        // §M7. Stock blossom on `H`, no horizon, run to completion; the certificate is then read
-        // once off the terminal dual. `TimelineStatus::TRUNCATED` keeps its meaning as *the branch*
-        // — "Phase 1 has no usable answer, escalate" — which is all M3–M6 downstream consume; on
-        // this path the timeline was never truncated, and `HarvestResult` is empty rather than
-        // partial.
-        if (prof != nullptr)
-            step.start();
-        CertificateOutcome certificate = run_stock_and_certify(h_mwpm.mwpm, h_dets_scratch, horizon, prof != nullptr);
+    outcome.components_total = (int)split.num_components();
+
+    // ---- §2.2's loop. Every component, whatever its size, is decided by truncated sparse blossom
+    // run on it in isolation. A component that truncates escalates the shot on its own; the others
+    // are still solved and extracted, because their statuses are what §3's profiler reads and
+    // because the escalating shot discards Phase 1 in full anyway (§M3.1).
+    HarvestResult part;
+    for (size_t c = 0; c < split.num_components(); c++) {
+        build_component_subgraph(h, split, c);
+        TimelineStatus status = solve_component(prof, harvest_component, part);
+        split.status[c] = status == TimelineStatus::TRUNCATED ? BallComponentSplit::COMPONENT_TRUNCATED
+                                                              : BallComponentSplit::COMPONENT_COMPLETE;
+        if (status == TimelineStatus::TRUNCATED)
+            outcome.components_truncated++;
+        if (want_pairs)
+            drain_component_match_edges();
+        accumulate_component_harvest(outcome.harvest, part);
         if (prof != nullptr) {
-            // The solve proper, with the certificate's own scan netted out, so the two stages are
-            // additive and §M7.8's read can charge the scan separately from the blossom work.
-            prof->blossom_on_h_ns = step.elapsed_ns() - certificate.dual_scan_ns;
-            prof->dual_scan_ns = certificate.dual_scan_ns;
-            prof->certified = certificate.certified() ? 1 : 0;
-            prof->h_no_perfect_matching = certificate.status == CertificateStatus::NO_PERFECT_MATCHING ? 1 : 0;
-            prof->max_dual_at_completion = certificate.max_dual;
-        }
-        outcome.status = certificate.certified() ? TimelineStatus::COMPLETE : TimelineStatus::TRUNCATED;
-
-        // Debug invariant 3: the shot escalates **iff** `H` had no perfect matching or it completed
-        // with `max_u Y(u) > T_int`, read off the certificate's own recomputed dual rather than off
-        // a proxy such as "the residual is empty" or "the solve threw".
-        assert(
-            (outcome.status == TimelineStatus::TRUNCATED) ==
-                (certificate.status == CertificateStatus::NO_PERFECT_MATCHING || certificate.max_dual > horizon) &&
-            "invariant 3: the escalation trigger and the certificate disagree");
-        // Debug invariant 4, the machine guard against §M7.0's "catching the throw is enough"
-        // fallacy: a run that *completed* on `H` with a dual over `T` must escalate. Trivially true
-        // where it is written, and written anyway, because a refactor that reintroduced the fallacy
-        // would be silent everywhere else.
-        assert(
-            !(certificate.status == CertificateStatus::DUAL_EXCEEDS_HORIZON &&
-              outcome.status == TimelineStatus::COMPLETE) &&
-            "invariant 4: a completing-but-over-T H-matching escaped as if it were certified");
-    } else {
-        if (prof != nullptr)
-            step.start();
-        outcome.status =
-            config.collect_harvest_diagnostics
-                ? process_timeline_until_horizon_measured(h_mwpm.mwpm, h_dets_scratch, horizon, depth_model)
-                : process_timeline_until_horizon(h_mwpm.mwpm, h_dets_scratch, horizon);
-        if (prof != nullptr)
-            prof->blossom_on_h_ns = step.elapsed_ns();
-    }
-
-    // Invariant 5's second half: no exposed-root-blossom routine may be entered on a certified shot.
-    // §M1.4 is unreachable here — its precondition is a *surviving* tree root — and this is that
-    // statement asked of the code that would have run it rather than of the argument for why it
-    // cannot.
-    uint64_t base_descents_before = harvester.counters.base_descents;
-
-    if (solver_runs) {
-        if (prof != nullptr)
-            step.start();
-        // The status the *shot* has, not the one the solver's own components have: a residual
-        // elsewhere means this result is about to be discarded, so the production path abandons
-        // rather than extracts. `outcome.status` itself is left for §A.5, which is where the two
-        // are reconciled and where the `stock_on_h` certificate has already written its verdict.
-        outcome.harvest = harvest_on_h(
-            h_mwpm.mwpm, h_dets_scratch, resolver_forces_escalation ? TimelineStatus::TRUNCATED : outcome.status);
-        if (prof != nullptr)
-            prof->harvest_ns = step.elapsed_ns();
-    }
-    HarvestResult& result = outcome.harvest;
-
-    assert(
-        (!config.stock_on_h || outcome.status != TimelineStatus::COMPLETE ||
-         harvester.counters.base_descents == base_descents_before) &&
-        "invariant 5: a certified shot entered the exposed-root-blossom base descent");
-    (void)base_descents_before;
-
-    // Back to `G`'s detector ids, through whichever graph the solver ran on. `h_to_det` is strictly
-    // ascending in both cases — §A.4's sub-graph is a subsequence of `H` — so a residual sorted
-    // there stays sorted in `G`, and nothing downstream of harvest has to know either graph existed.
-    for (uint64_t& defect : result.residual) {
-        assert(defect < solver_h.num_nodes());
-        defect = solver_h.h_to_det[defect];
-    }
-
-    // ---- §A.5. Combine, and decide the branch.
-    //
-    // `escalate <=> resolver residual OR (the solver ran and truncated)`. That is the current
-    // trigger restated, not a new one: the pipeline escalates a shot iff some component fails to
-    // resolve within `T`, and here that surfaces either as a resolver RESIDUAL (a component of size
-    // `<= k` with no feasible matching at all) or as the solver's own status on the components it
-    // was handed. Nothing was deferred to the solver except by being size `> k`, so it decides
-    // those exactly as it did before.
-    if (pruning) {
-        if (resolver_forces_escalation) {
-            outcome.status = TimelineStatus::TRUNCATED;
-            // §M7. The certificate is a statement about the *whole* of `H`, and the resolver owns
-            // part of it, so its verdict has to reach the profile too. A RESIDUAL component is
-            // exactly "`H` has no perfect matching": the enumeration is exhaustive over
-            // pairings-with-boundary-fill at `H`'s own cutoffs, so no feasible configuration means
-            // the solver — handed that component — would have reported NO_PERFECT_MATCHING itself.
-            //
-            // Both branches above can reach here with `certified == 1`: the empty-solver branch set
-            // it provisionally, and the stock branch reads only the components it was handed, which
-            // certify on their own while another component is residual. Withdrawing it here is what
-            // keeps invariant 3's `escalated <=> !certified` true through the prune.
-            //
-            // `max_dual_at_completion` is deliberately left where it is. It is undefined rather
-            // than merely unmeasured when `H` cannot complete (§M7), and the escalating shot
-            // discards Phase 1 in full anyway.
-            if (prof != nullptr && config.stock_on_h) {
-                prof->certified = 0;
-                prof->h_no_perfect_matching = 1;
+            // Read off the instance the component was solved on, so it is the largest degree any
+            // one solve actually saw. `H`'s own degree distribution is §3.5.2's `degree_hist`.
+            for (size_t i = 0; i < arena.split.sub.num_nodes(); i++) {
+                prof->max_degree =
+                    std::max(prof->max_degree, (int)h_mwpm.mwpm.flooder.graph.nodes[i].neighbors.size());
             }
         }
-        if (outcome.status == TimelineStatus::TRUNCATED) {
-            // The escalating shot re-decodes the whole raw syndrome on `G` and discards **all** of
-            // Phase 1, the off-solver commits included — there is nothing to XOR and nothing to add
-            // (§A.5, §M3.3 X3). Dropping them here is what keeps a caller from combining them by
-            // accident.
-            resolved_pairs.clear();
-        } else {
-            result.committed.obs_mask ^= resolved.obs_mask;
-            result.committed.weight += resolved.weight;
-            // §M3.4/§M4.2. `dual_sum_at_truncation` is a sum over the regions of `H`, and the
-            // resolver removed regions from the solve, so the harvest's reduction now runs over a
-            // strict subset and under-reports the shot's dual by exactly what the resolver settled.
-            //
-            // What it settled is that dual: each committed match is frozen and tight, so the two
-            // halves of a pair matched across `d` contribute `d / 2` each and a boundary match at
-            // `bcost` contributes `bcost` — a component's regions sum to its committed weight,
-            // which is `resolved.weight` over all of them. That is the same tightness §M4.2
-            // measures as a ratio of exactly 1.0000 on a completed shot, and dropping the term
-            // would have degraded the certificate silently: `weight_out >= dual_sum` survives a
-            // dual that is too *small*, so only §M3.3 X8's bit-identity against the un-pruned full
-            // harvest catches it.
-            result.dual_sum_at_truncation += resolved.weight;
-            // The off-solver commits are matches like any other, so they belong in the commit
-            // tallies the profile reports; a pair settled by the resolver is frozen at the horizon
-            // in the same sense a solver-frozen one is.
-            result.committed_pairs_frozen += resolved_counts.pairs;
-            result.committed_boundary += resolved_counts.boundary;
-        }
     }
+
+    // ---- §2.6. **The** escalation predicate, in one place: some component truncated. Everything
+    // downstream reads this and nothing re-derives it — not from a residual, not from a certificate,
+    // not from a size threshold.
+    bool any_component_truncated = outcome.components_truncated > 0;
+    outcome.status = any_component_truncated ? TimelineStatus::TRUNCATED : TimelineStatus::COMPLETE;
+    assert(any_component_truncated == split.any_truncated() && "§2.6: the status array and the tally disagree");
+
+    // `HarvestResult::residual` is contracted to be sorted ascending in `G`'s ids. Each component's
+    // is, but the blocks interleave, so the union is not — this is where that is restored. A no-op
+    // on the production path, whose residual is always empty; it is the verification entry points,
+    // which harvest every component in full, that actually produce one (§2.5).
+    sort_residual(outcome.harvest, harvester.scratch.residual_sort_buffer);
 
     if (prof != nullptr) {
         prof->intersect_ns = timing.intersect_ns;
@@ -822,13 +607,14 @@ Phase1Outcome BallDecoder::decode_impl(
         prof->h_nodes = (int)h.num_nodes();
         prof->h_edges = (int)h.edges.size();
         prof->h_boundary_edges = (int)h.boundary_edges.size();
-        // The run's `k`, and what the resolver actually settled off the solver this shot. Both are
-        // labels on the latency numbers beside them, not latency numbers themselves: the resolve is
-        // a serial pre-pass excluded from `blossom_on_h_ns` and `harvest_ns` by scope. `k` is
-        // reported as the decoder was configured, so a `k > 0` run whose shot resolved nothing is
-        // still distinguishable from a `k = 0` one.
-        prof->prune_component_max_size = pruning ? config.prune_component_max_size : 0;
-        prof->defects_resolved_small = resolved_counts.defects_resolved;
+        // §2.6's tally, and the predicate read off it.
+        prof->components_total = outcome.components_total;
+        prof->components_truncated = outcome.components_truncated;
+        prof->any_component_truncated = any_component_truncated ? 1 : 0;
+        // §M7. The shot is certified iff **every** component was: the certificate is a statement
+        // about the whole of `H`, and `H`'s matching is the union of the components'.
+        if (config.stock_on_h)
+            prof->certified = any_component_truncated ? 0 : 1;
         // §M2 structural counters, left at zero unless they were collected, so that a profile
         // never reports a counter it did not measure. `hbld_edges_written` is the count taken at
         // the `push_back`s, not `h_edges + h_boundary_edges` read back off the vectors —
@@ -840,12 +626,11 @@ Phase1Outcome BallDecoder::decode_impl(
             prof->isect_scan_bytes_other_mode = counts.isect_scan_bytes_other_mode;
             prof->isect_mode_bitset = config.mode == BallGraphBuildMode::BITSET;
             prof->hbld_edges_written = (int)(counts.edges_written + counts.boundary_edges_written);
-            prof->mwpm_init_node_elements = (int)mwpm_counts.node_records;
-            prof->mwpm_init_edge_elements = (int)mwpm_counts.edge_records;
         }
         prof->shells_materialized = 1;
         prof->restarts = 0;
         prof->blossom_formations = (int)(pm::blossom_formation_stats.formations - formations_before);
+        const HarvestResult& result = outcome.harvest;
         prof->harvest_enumerate_ns = result.enumerate_ns;
         prof->harvest_reduce_ns = result.reduce_ns;
         prof->harvest_base_descent_ns = result.base_descent_ns;
@@ -857,62 +642,11 @@ Phase1Outcome BallDecoder::decode_impl(
         prof->matched_blossom_shatters = result.matched_blossom_shatters;
         prof->largest_tree_size = result.largest_tree_size;
         prof->harvest_dependent_depth = result.harvest_dependent_depth;
-        // §M2.9.6 measurement 4 is a property of the *truncated* timeline loop, which is the only
-        // one instrumented; §M7's front end runs stock's loop untouched, which is the point, so it
-        // reports no solve depth rather than a stale one from the previous shot.
-        bool measured_solve = config.collect_harvest_diagnostics && !config.stock_on_h;
-        prof->solve_dependent_depth = measured_solve ? depth_model.depth : 0;
-        prof->solve_events = measured_solve ? depth_model.events : 0;
         if (h.num_nodes() != 0)
             prof->mean_degree = 2.0 * (double)h.edges.size() / (double)h.num_nodes();
-        // `max_degree` is read off the matching graph the solve was built on, so under §A it is the
-        // largest degree the *solver* saw rather than `H`'s. That is the quantity the number is
-        // used for; `H`'s own degree distribution is §C's `degree_hist`, which is taken over the
-        // whole graph whether or not anything was pruned.
-        if (solver_runs) {
-            for (size_t i = 0; i < solver_h.num_nodes(); i++)
-                prof->max_degree = std::max(prof->max_degree, (int)h_mwpm.mwpm.flooder.graph.nodes[i].neighbors.size());
-        }
         prof->total_ns = total_timer.elapsed_ns();
     }
     return outcome;
-}
-
-void BallDecoder::map_match_edges_to_committed_pairs(std::vector<CommittedPair>& committed_pairs) const {
-    // The graph the solve ran on: the whole of `H`, or §A.4's sub-`H`. The solver's node indices are
-    // indices into *that* graph, and so is the edge list the ball entry is looked up in.
-    const BallGraph& h = solved_graph != nullptr ? *solved_graph : arena.graph;
-    const pm::DetectorNode* base = h_mwpm.mwpm.flooder.graph.nodes.data();
-    committed_pairs.clear();
-    committed_pairs.reserve(match_edge_scratch.size() + resolved_pairs.size());
-    for (const pm::CompressedEdge& edge : match_edge_scratch) {
-        size_t i = (size_t)(edge.loc_from - base);
-        int64_t from = (int64_t)h.h_to_det[i];
-        if (edge.loc_to == nullptr) {
-            committed_pairs.push_back(CommittedPair{from, -1, CommittedPair::NO_BALL_ENTRY});
-            continue;
-        }
-        size_t j = (size_t)(edge.loc_to - base);
-        int64_t to = (int64_t)h.h_to_det[j];
-        // Every committed pair is an edge of `H` — a region only ever meets another region across
-        // one — so the ball entry behind it is in `h.edges`, which is sorted by `(i, j)` with
-        // `i < j`. One binary search; no map, no per-shot allocation.
-        uint32_t lo = (uint32_t)std::min(i, j);
-        uint32_t hi = (uint32_t)std::max(i, j);
-        auto it = std::lower_bound(
-            h.edges.begin(),
-            h.edges.end(),
-            std::pair<uint32_t, uint32_t>{lo, hi},
-            [](const BallGraphEdge& e, const std::pair<uint32_t, uint32_t>& key) {
-                return e.i != key.first ? e.i < key.first : e.j < key.second;
-            });
-        assert(it != h.edges.end() && it->i == lo && it->j == hi && "a committed pair that is not an edge of H");
-        committed_pairs.push_back(CommittedPair{from, to, it->entry});
-    }
-    // §A's off-solver commits, already in `G`'s detector ids and already carrying the ball entry
-    // the mask and weight came from. Empty unless the prune ran and the shot completed.
-    committed_pairs.insert(committed_pairs.end(), resolved_pairs.begin(), resolved_pairs.end());
-    sort_pairs(committed_pairs);
 }
 
 namespace {
@@ -928,15 +662,111 @@ namespace {
 
 }  // namespace
 
+void BallDecoder::verify_decomposition(const Phase1Outcome& outcome, bool full_harvest, bool committed_comparable) {
+    // §2.5. The monolithic solve, on a **separate** instance so the two share no state, compared
+    // against what the per-component path just produced. This is §1's independence property asked
+    // of the machine rather than of the argument for it.
+    const BallGraph& h = arena.graph;
+    verify_mwpm.rebuild(tables, h, arena, nullptr);
+
+    std::vector<uint64_t>& mono_dets = verify_dets;
+    mono_dets.clear();
+    mono_dets.reserve(h.num_nodes());
+    for (size_t i = 0; i < h.num_nodes(); i++)
+        mono_dets.push_back(i);
+
+    TimelineStatus mono_status = TimelineStatus::COMPLETE;
+    if (config.stock_on_h) {
+        CertificateOutcome certificate = run_stock_and_certify(verify_mwpm.mwpm, mono_dets, horizon, false);
+        mono_status = certificate.certified() ? TimelineStatus::COMPLETE : TimelineStatus::TRUNCATED;
+    } else {
+        mono_status = process_timeline_until_horizon(verify_mwpm.mwpm, mono_dets, horizon);
+    }
+
+    auto fail = [](const std::string& what, const std::string& expected, const std::string& actual) {
+        throw std::logic_error(
+            "The per-component decode disagreed with the monolithic solve on the same H at §2.5 (" + what +
+            "): monolithic gave " + expected + ", per-component gave " + actual +
+            ". This voids §1's independence property and is a release blocker.");
+    };
+
+    // 1. The escalation predicate. This is the one that matters: the set of shots that escalate is a
+    //    property of `(DEM, shot, T)` alone (§0), and partitioning `H` must not move it.
+    if ((mono_status == TimelineStatus::TRUNCATED) != (outcome.status == TimelineStatus::TRUNCATED)) {
+        fail(
+            "escalation predicate",
+            mono_status == TimelineStatus::TRUNCATED ? "TRUNCATED" : "COMPLETE",
+            outcome.status == TimelineStatus::TRUNCATED ? "TRUNCATED" : "COMPLETE");
+    }
+
+    HarvestResult mono;
+    if (full_harvest) {
+        mono = verify_harvester.harvest_to_obs(verify_mwpm.mwpm, mono_dets);
+    } else if (mono_status == TimelineStatus::COMPLETE) {
+        mono = verify_harvester.extract_only_to_obs(verify_mwpm.mwpm, mono_dets);
+    } else {
+        // Nothing to compare on a truncated shot the production path never harvested, but the
+        // instance still has to be left clean for the next shot.
+        abandon_shot(verify_mwpm.mwpm);
+        return;
+    }
+
+    // 2. On a completing shot: equal weight and equal observable bytes.
+    //
+    //    `committed` is the **obs** flavour's field. The match-edges flavour appends to the
+    //    caller's `CompressedEdge` vector and leaves `committed` at zero on purpose, so on that
+    //    flavour this compares `dual_sum_at_truncation` instead — the same flat reduction over the
+    //    same live regions, filled by both, and equal to the committed weight on a completed
+    //    timeline where every region is frozen and tight.
+    //
+    //    Above 64 observables the mask is unusable and reads 0 on **both** sides, so the observable
+    //    check degenerates to the weight one there. That is stated rather than silently relied on.
+    if (outcome.status == TimelineStatus::COMPLETE) {
+        if (mono.dual_sum_at_truncation != outcome.harvest.dual_sum_at_truncation)
+            fail(
+                "dual sum",
+                std::to_string(mono.dual_sum_at_truncation),
+                std::to_string(outcome.harvest.dual_sum_at_truncation));
+        if (committed_comparable) {
+            if (mono.committed.weight != outcome.harvest.committed.weight)
+                fail(
+                    "committed weight",
+                    std::to_string(mono.committed.weight),
+                    std::to_string(outcome.harvest.committed.weight));
+            if (mono.committed.obs_mask != outcome.harvest.committed.obs_mask)
+                fail(
+                    "committed observables",
+                    std::to_string((uint64_t)mono.committed.obs_mask),
+                    std::to_string((uint64_t)outcome.harvest.committed.obs_mask));
+        }
+    }
+
+    // 3. With the full harvest on: the sorted residual set is the union of the per-component
+    //    residual sets, and `num_trees` is the sum. The per-component side is already sorted and
+    //    already in `G`'s ids; the monolithic side has to be mapped and sorted the same way.
+    if (full_harvest) {
+        for (uint64_t& defect : mono.residual)
+            defect = h.h_to_det[defect];
+        std::sort(mono.residual.begin(), mono.residual.end());
+        if (mono.residual != outcome.harvest.residual)
+            fail("residual set", describe(mono.residual), describe(outcome.harvest.residual));
+        if (mono.num_trees != outcome.harvest.num_trees)
+            fail("num_trees", std::to_string(mono.num_trees), std::to_string(outcome.harvest.num_trees));
+    }
+}
+
 HarvestResult BallDecoder::decode_phase1(const std::vector<uint64_t>& dets, BallProfile* prof) {
     if (config.stock_on_h)
         reject_harvest_entry_point();
-    // No prune (§A): this is the verification path, and the oracle it is compared against solves
-    // the whole of `H`.
+    // The verification path harvests every component in full, residual and all. It is the same
+    // per-component decode the production path takes: §2 leaves exactly one way to decide a
+    // component, so there is no longer an "unpruned" variant for an oracle to compare against.
     Phase1Outcome outcome =
         decode_impl(dets, prof, false, [this](pm::Mwpm& mwpm, const std::vector<uint64_t>& h_dets, TimelineStatus) {
             return harvester.harvest_to_obs(mwpm, h_dets);
         });
+    if (config.verify_component_decomposition)
+        verify_decomposition(outcome, true, true);
     if (config.verify_against_g)
         verify_level1(dets, outcome.harvest, nullptr, prof);
     return outcome.harvest;
@@ -946,79 +776,113 @@ HarvestResult BallDecoder::decode_phase1_to_match_edges(
     const std::vector<uint64_t>& dets, std::vector<CommittedPair>& committed_pairs, BallProfile* prof) {
     if (config.stock_on_h)
         reject_harvest_entry_point();
-    match_edge_scratch.clear();
     Phase1Outcome outcome =
-        decode_impl(dets, prof, false, [this](pm::Mwpm& mwpm, const std::vector<uint64_t>& h_dets, TimelineStatus) {
+        decode_impl(dets, prof, true, [this](pm::Mwpm& mwpm, const std::vector<uint64_t>& h_dets, TimelineStatus) {
             return harvester.harvest_to_match_edges(mwpm, h_dets, match_edge_scratch);
         });
-    map_match_edges_to_committed_pairs(committed_pairs);
+    committed_pairs = committed_pair_scratch;
+    sort_pairs(committed_pairs);
 
+    if (config.verify_component_decomposition)
+        verify_decomposition(outcome, true, false);
     if (config.verify_against_g)
         verify_level1(dets, outcome.harvest, &committed_pairs, prof);
     return outcome.harvest;
 }
 
 Phase1Outcome BallDecoder::decode_phase1_production(const std::vector<uint64_t>& dets, BallProfile* prof) {
-    return decode_impl(
-        dets, prof, true, [this, prof](pm::Mwpm& mwpm, const std::vector<uint64_t>& h_dets, TimelineStatus status) {
+    Phase1Outcome outcome = decode_impl(
+        dets, prof, false, [this, prof](pm::Mwpm& mwpm, const std::vector<uint64_t>& h_dets, TimelineStatus status) {
             if (status == TimelineStatus::TRUNCATED) {
+                // §M3.4's abandon, now per **component** rather than per shot: it is `Mwpm::reset`,
+                // which frees the region and node arena pools, so the next component re-allocates
+                // them. That is the same teardown an escalating shot always paid, charged once per
+                // truncated component instead of once per shot — a shot escalates on ~1 of them, so
+                // the multiplier is small, and it is still inside §M3.2's cap on what a cheaper
+                // version of this could ever be worth. `abandon_ns` accumulates over the shot,
+                // which is why it is `+=`.
                 HiResTimer abandon;
                 if (prof != nullptr)
                     abandon.start();
                 abandon_shot(mwpm);
                 if (prof != nullptr)
-                    prof->abandon_ns = abandon.elapsed_ns();
+                    prof->abandon_ns += abandon.elapsed_ns();
                 return HarvestResult();
             }
             return harvester.extract_only_to_obs(mwpm, h_dets);
         });
+    if (config.verify_component_decomposition)
+        verify_decomposition(outcome, false, true);
+    return outcome;
 }
 
 Phase1Outcome BallDecoder::decode_phase1_production_to_match_edges(
     const std::vector<uint64_t>& dets, std::vector<CommittedPair>& committed_pairs, BallProfile* prof) {
-    match_edge_scratch.clear();
     Phase1Outcome outcome = decode_impl(
         dets, prof, true, [this, prof](pm::Mwpm& mwpm, const std::vector<uint64_t>& h_dets, TimelineStatus status) {
             if (status == TimelineStatus::TRUNCATED) {
+                // §M3.4's abandon, now per **component** rather than per shot: it is `Mwpm::reset`,
+                // which frees the region and node arena pools, so the next component re-allocates
+                // them. That is the same teardown an escalating shot always paid, charged once per
+                // truncated component instead of once per shot — a shot escalates on ~1 of them, so
+                // the multiplier is small, and it is still inside §M3.2's cap on what a cheaper
+                // version of this could ever be worth. `abandon_ns` accumulates over the shot,
+                // which is why it is `+=`.
                 HiResTimer abandon;
                 if (prof != nullptr)
                     abandon.start();
                 abandon_shot(mwpm);
                 if (prof != nullptr)
-                    prof->abandon_ns = abandon.elapsed_ns();
+                    prof->abandon_ns += abandon.elapsed_ns();
                 return HarvestResult();
             }
             return harvester.extract_only_to_match_edges(mwpm, h_dets, match_edge_scratch);
         });
-    // On an escalating shot `match_edge_scratch` is empty and this yields no pairs, which is the
-    // right answer: the caller is about to discard Phase 1 entirely.
-    map_match_edges_to_committed_pairs(committed_pairs);
+    // §M3.1. The escalating shot re-decodes the whole raw syndrome on `G` and discards **all** of
+    // Phase 1 — including the pairs the components that *did* complete contributed, which under §2
+    // is most of them. Dropping them here is what keeps a caller from combining them by accident.
+    //
+    // The verification entry point above deliberately does not do this: it harvests every component
+    // in full precisely so that the committed pairs and the residual can be compared against M1 on
+    // an escalating shot, which is where §M2.6 level 1 has the most to say.
+    if (outcome.status == TimelineStatus::TRUNCATED)
+        committed_pair_scratch.clear();
+    committed_pairs = committed_pair_scratch;
+    sort_pairs(committed_pairs);
+    if (config.verify_component_decomposition)
+        verify_decomposition(outcome, false, false);
     return outcome;
 }
 
 bool BallDecoder::truncated_scheme_escalates(const std::vector<uint64_t>& dets) {
-    // The same `H`, built from the same tables at the same `T` filter — the two schemes differ only
-    // in the front end, so replaying the decision means replaying the solve, not rebuilding the
-    // problem differently.
+    // The same `H`, built from the same tables at the same `T` filter, and split the same way — the
+    // two schemes differ only in the front end, so replaying the decision means replaying the
+    // solves, not rebuilding the problem differently.
     compute_seeded_detection_events(dets, seeded_scratch);
     build_ball_graph(tables, seeded_scratch, horizon, arena, config.mode, nullptr, nullptr);
     const BallGraph& h = arena.graph;
-    // The landed scheme is what is being replayed, so no §A prune: it solves the whole of `H`. The
-    // pointer the last real decode left behind is dropped with it — the graph it named has just been
-    // rebuilt underneath it, and nothing here produces pairs to map through it.
-    solved_graph = nullptr;
-    h_mwpm.rebuild(tables, h, arena, nullptr);
+    BallComponentSplit& split = arena.split;
+    decompose_ball_components(h, split);
 
-    h_dets_scratch.clear();
-    h_dets_scratch.reserve(h.num_nodes());
-    for (size_t i = 0; i < h.num_nodes(); i++)
-        h_dets_scratch.push_back(i);
+    bool escalates = false;
+    for (size_t c = 0; c < split.num_components(); c++) {
+        build_component_subgraph(h, split, c);
+        h_mwpm.rebuild(tables, split.sub, arena, nullptr);
 
-    TimelineStatus status = process_timeline_until_horizon(h_mwpm.mwpm, h_dets_scratch, horizon);
-    // Nothing is harvested and nothing is read: only the *decision* is wanted. `abandon_shot` is
-    // the teardown that works from either outcome, and it is what an escalating shot pays anyway.
-    abandon_shot(h_mwpm.mwpm);
-    return status == TimelineStatus::TRUNCATED;
+        h_dets_scratch.clear();
+        h_dets_scratch.reserve(split.sub.num_nodes());
+        for (size_t i = 0; i < split.sub.num_nodes(); i++)
+            h_dets_scratch.push_back(i);
+
+        TimelineStatus status = process_timeline_until_horizon(h_mwpm.mwpm, h_dets_scratch, horizon);
+        // Nothing is harvested and nothing is read: only the *decision* is wanted. `abandon_shot` is
+        // the teardown that works from either outcome, and it is what an escalating shot pays anyway.
+        abandon_shot(h_mwpm.mwpm);
+        split.status[c] = status == TimelineStatus::TRUNCATED ? BallComponentSplit::COMPONENT_TRUNCATED
+                                                              : BallComponentSplit::COMPONENT_COMPLETE;
+        escalates = escalates || status == TimelineStatus::TRUNCATED;
+    }
+    return escalates;
 }
 
 HarvestResult BallDecoder::reference_phase1_on_g(

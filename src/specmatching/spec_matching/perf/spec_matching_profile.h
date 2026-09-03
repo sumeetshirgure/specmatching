@@ -16,6 +16,7 @@
 #define SPECMATCHING_SPEC_MATCHING_PERF_SPEC_MATCHING_PROFILE_H
 
 #include <algorithm>
+#include <cassert>
 #include <cmath>
 #include <cstdint>
 #include <cstdlib>
@@ -184,7 +185,7 @@ struct PreemptionProbe {
     }
 };
 
-/// §C.2's distributions, over one shot's components, `H` edges and defects.
+/// §3.5.2's distributions, over one shot's components, `H` edges and defects.
 ///
 /// Kept apart from the per-shot profile because their unit is the component, the edge or the node
 /// rather than the shot: the profile stays a flat row of scalars the pybind layer can column-ise,
@@ -196,13 +197,17 @@ struct PreemptionProbe {
 /// axis and a plot can label it without knowing the normalising constant. `H`'s defect-defect edges
 /// are `<= 2T` by construction, which is exactly the last bin of `edge_weight_hist`.
 ///
+/// `edge_weight_hist` and `bcost_hist` are the two §C.2 accumulators `sparse_graph_stats`
+/// deliberately does not write (§3.5.2, "Not collected"). They stay here and stay filled, because
+/// the latency profiler still writes them; the `H`-structure profiler simply does not read them.
+///
 /// Filled outside every timed region, and never counted toward any reported latency.
 struct ComponentHistograms {
     static constexpr size_t BINS_PER_T = 16;
     /// Component sizes `0..31`, last bin overflowing. Bin 0 is always empty: a component has at
-    /// least one member.
+    /// least one member. `--size-cap` moves this through `configure`.
     static constexpr size_t SIZE_HIST_BINS = 33;
-    /// `H`-node degrees, in the defect-defect adjacency alone.
+    /// `H`-node degrees, in the defect-defect adjacency alone. `--degree-cap` moves this.
     static constexpr size_t DEGREE_HIST_BINS = 33;
     /// `w_int` over `H`'s defect-defect edges: `0 .. 2T`, which is the whole range.
     static constexpr size_t WEIGHT_HIST_BINS = 33;
@@ -211,12 +216,26 @@ struct ComponentHistograms {
     static constexpr size_t BCOST_HIST_BINS = 33;
     /// Weighted `H`-subgraph diameters: `0 .. 4T`, then overflow.
     static constexpr size_t DIAMETER_HIST_BINS = 65;
+    /// Unweighted (hop) `H`-subgraph diameters, binned by count with the last bin overflowing. A
+    /// hop diameter is bounded by the component size, so this shares `--size-cap`'s scale.
+    static constexpr size_t HOP_DIAMETER_HIST_BINS = 33;
 
     std::vector<uint64_t> size_hist = std::vector<uint64_t>(SIZE_HIST_BINS, 0);
     std::vector<uint64_t> degree_hist = std::vector<uint64_t>(DEGREE_HIST_BINS, 0);
     std::vector<uint64_t> edge_weight_hist = std::vector<uint64_t>(WEIGHT_HIST_BINS, 0);
     std::vector<uint64_t> bcost_hist = std::vector<uint64_t>(BCOST_HIST_BINS, 0);
     std::vector<uint64_t> diameter_hist = std::vector<uint64_t>(DIAMETER_HIST_BINS, 0);
+    std::vector<uint64_t> hop_diameter_hist = std::vector<uint64_t>(HOP_DIAMETER_HIST_BINS, 0);
+
+    /// Moves the two count-binned caps of §3.3 (`--size-cap`, `--degree-cap`). The cap is the
+    /// **overflow bin**, so a cap of `c` gives `c + 1` bins and everything at or above `c` lands in
+    /// the last one — the `residual_size_hist` convention. Resizes and zeroes; two histogram sets
+    /// that are added together must have been configured the same way.
+    void configure(size_t size_cap, size_t degree_cap) {
+        size_hist.assign(size_cap + 1, 0);
+        hop_diameter_hist.assign(size_cap + 1, 0);
+        degree_hist.assign(degree_cap + 1, 0);
+    }
 
     /// Zeroes every bin without touching the buffers, so the next shot reuses the same storage.
     void clear() {
@@ -225,6 +244,7 @@ struct ComponentHistograms {
         std::fill(edge_weight_hist.begin(), edge_weight_hist.end(), (uint64_t)0);
         std::fill(bcost_hist.begin(), bcost_hist.end(), (uint64_t)0);
         std::fill(diameter_hist.begin(), diameter_hist.end(), (uint64_t)0);
+        std::fill(hop_diameter_hist.begin(), hop_diameter_hist.end(), (uint64_t)0);
     }
 
     /// The bin a weight-like quantity falls in, in sixteenths of `horizon`. A non-positive horizon
@@ -242,58 +262,124 @@ struct ComponentHistograms {
     }
 
     void add(const ComponentHistograms& other) {
-        for (size_t i = 0; i < size_hist.size(); i++)
-            size_hist[i] += other.size_hist[i];
-        for (size_t i = 0; i < degree_hist.size(); i++)
-            degree_hist[i] += other.degree_hist[i];
-        for (size_t i = 0; i < edge_weight_hist.size(); i++)
-            edge_weight_hist[i] += other.edge_weight_hist[i];
-        for (size_t i = 0; i < bcost_hist.size(); i++)
-            bcost_hist[i] += other.bcost_hist[i];
-        for (size_t i = 0; i < diameter_hist.size(); i++)
-            diameter_hist[i] += other.diameter_hist[i];
+        auto add_bins = [](std::vector<uint64_t>& into, const std::vector<uint64_t>& from) {
+            // Two sets configured differently would silently drop or misalign bins, and the caps
+            // are a run-level choice that cannot change mid-campaign.
+            assert(into.size() == from.size() && "histogram sets were configured with different caps");
+            for (size_t i = 0; i < into.size(); i++)
+                into[i] += from[i];
+        };
+        add_bins(size_hist, other.size_hist);
+        add_bins(degree_hist, other.degree_hist);
+        add_bins(edge_weight_hist, other.edge_weight_hist);
+        add_bins(bcost_hist, other.bcost_hist);
+        add_bins(diameter_hist, other.diameter_hist);
+        add_bins(hop_diameter_hist, other.hop_diameter_hist);
     }
 };
 
-/// §C.1's per-shot component structure, over **all** components of the shot's `H`.
+/// §2.6/§3.5.2's joint tables: how a component's `COMPLETE`/`TRUNCATED` status is distributed over
+/// its size, and over its hop diameter.
+///
+/// This is the table the whole branch exists to make readable — the status is now a per-component
+/// fact rather than a per-shot one, because every component is decided by its own truncated solve
+/// (§2). `hop_diameter` covers only the components a diameter was computed for; the rest are
+/// counted in `ComponentStats::diameter_uncomputed_components`.
+struct ComponentStatusTable {
+    /// Column 0 is `COMPLETE`, column 1 is `TRUNCATED`.
+    static constexpr size_t STATUSES = 2;
+    static constexpr size_t COMPLETE = 0;
+    static constexpr size_t TRUNCATED = 1;
+
+    /// Row-major `[bin][status]`, with the last bin overflowing.
+    std::vector<uint64_t> counts;
+    size_t bins{0};
+
+    void configure(size_t bin_count) {
+        bins = bin_count;
+        counts.assign(bin_count * STATUSES, 0);
+    }
+    static ComponentStatusTable with_bins(size_t bin_count) {
+        ComponentStatusTable table;
+        table.configure(bin_count);
+        return table;
+    }
+    inline void add(size_t bin, size_t status) {
+        if (bins == 0)
+            return;
+        counts[std::min(bin, bins - 1) * STATUSES + status]++;
+    }
+    inline uint64_t at(size_t bin, size_t status) const {
+        return counts[bin * STATUSES + status];
+    }
+    void add(const ComponentStatusTable& other) {
+        assert(bins == other.bins && "status tables were configured with different caps");
+        for (size_t i = 0; i < counts.size(); i++)
+            counts[i] += other.counts[i];
+    }
+    void clear() {
+        std::fill(counts.begin(), counts.end(), (uint64_t)0);
+    }
+};
+
+/// §3.5.2's per-shot component structure, over **all** components of the shot's `H`.
 ///
 /// Computed outside every timed window and read by nothing on the decode path. `BallProfile` holds
-/// the original and `SpecMatchingProfile` mirrors it, so the campaign accumulator and the row-aligned
-/// pybind columns both see one definition.
+/// the original and `SpecMatchingProfile` mirrors it, so the campaign accumulator and the
+/// row-aligned pybind columns both see one definition.
 ///
-/// The last three fields are the classification of §A.3 — what the trivial resolver *would* commit,
-/// leave as residual, and hand to the solver — evaluated for its counts alone. Nothing is committed
-/// and no decode output depends on them.
+/// There is no resolver classification here any more. §2 deleted every lookup-table resolver: each
+/// component is decided by truncated sparse blossom on `H[C]`, so "what the trivial resolver would
+/// have done" describes no code that runs. What replaces it is `components_truncated` — the actual
+/// per-component status, which is the quantity the escalation predicate is built from.
 struct ComponentStats {
     /// 1 iff this shot's components were analysed, so a campaign that left the flag off reports no
     /// component structure rather than a corpus of zeros.
     int measured{0};
 
     int num_components{0};
-    int num_trivial_components{0};
+    /// Components whose own truncated solve did not finish by `T`. The shot escalates iff this is
+    /// non-zero (§2.6), and it is read off the decode's own per-component statuses rather than
+    /// recomputed here.
+    int components_truncated{0};
+
     int num_singleton_components{0};
     int num_pair_components{0};
-    int num_nontrivial_components{0};
+    /// Components of size `>= 3`. Named for the structure rather than for a resolver's reach.
+    int num_components_size_ge3{0};
+    /// Size `<= 2`, and the defects in them. Structural size classes, kept so the §C series stays
+    /// comparable with the campaigns that were run before this branch.
+    int num_trivial_components{0};
     int defects_in_trivial_components{0};
     int largest_component_size{0};
+
     /// Weighted `H`-subgraph diameter, in integer time units. See `component_diameter` for what
     /// "confined to the component" means and why it is not a `G` distance.
     int max_component_diameter_wint{0};
-    /// Components too large for the diameter to be computed (§C.2's cap).
+    /// Unweighted (hop) `H`-subgraph diameter, same confinement.
+    int max_component_hop_diameter{0};
+    /// Components too large for a diameter to be computed (§3.3's `--diameter-cap`).
     int diameter_uncomputed_components{0};
-    /// Components with at least one member whose `bcost_int <= T_int`.
+
+    /// Components with at least one member whose `bcost_int <= T_int`, i.e. with a legal boundary
+    /// match somewhere in them.
     int num_boundary_touching_components{0};
+    /// Odd size, and no member with a boundary edge. These cannot be perfectly matched inside `T`
+    /// at all, so they truncate with certainty and give a per-shot lower bound on escalation
+    /// (§3.5.2).
+    int num_odd_components_without_boundary{0};
+    /// `H` nodes carrying a boundary edge. Equal to `h_boundary_edges` by construction — `H` gives
+    /// a node at most one — and reported as the node-side reading of the same fact.
+    int nodes_with_boundary_edge{0};
 
-    int defects_committed_trivially{0};
-    int defects_residual_trivially{0};
-    int defects_to_solver{0};
+    /// `H`'s node count, i.e. the post-preamble defects the components partition. The denominator
+    /// of every per-shot fraction of them.
+    int component_defects{0};
 
-    /// Every component resolved trivially, i.e. the solver's input would have been empty and both
-    /// the `Mwpm(H)` build and the harvest would have been skipped outright (§A.4). This is the
-    /// shot class the `blossom_on_h_ns` / `harvest_ns` reduction comes from, so it is counted
-    /// rather than derived from a mean.
+    /// The solve had nothing to do: `H` has no nodes, so there is no component and no instance to
+    /// build. Counted rather than derived from a mean.
     inline bool solver_set_empty() const {
-        return measured != 0 && defects_to_solver == 0;
+        return measured != 0 && component_defects == 0;
     }
 };
 
@@ -348,16 +434,16 @@ struct SpecMatchingProfile {
     int solve_dependent_depth{0};
     int solve_events{0};
 
-    /// §C.1, mirrored off `BallProfile` after the shot's timed window has closed. All zero, and
+    /// §3.5.2, mirrored off `BallProfile` after the shot's timed window has closed. All zero, and
     /// `components.measured == 0`, unless `collect_component_stats` is on and Phase 1 ran on `H`.
     ComponentStats components;
 
-    /// §A's run label, mirrored off `BallProfile`: the `k` this shot decoded at, and the defects the
-    /// small-component resolver settled off the solver. Labels on the latency fields above, never
-    /// latency themselves — the resolve is a serial pre-pass excluded from them by measurement
-    /// scope. See `BallProfile` for what `defects_resolved_small` counts.
-    int prune_component_max_size{0};
-    int defects_resolved_small{0};
+    /// §2. The components this shot's `H` decomposed into, and how many of them truncated. Mirrored
+    /// off `BallProfile`, and filled on **every** profiled shot rather than only the analysed ones:
+    /// they are the decode's own tally, not part of §3.5.2's post-shot decomposition, and
+    /// `any_component_truncated` is read from the second of them.
+    int components_total{0};
+    int components_truncated{0};
 
     /// `Sum_S y_S <= exact optimum`. Zero on an escalating shot: the truncated dual is discarded
     /// along with the rest of Phase 1's partial result, so there is nothing to certify against.
@@ -380,13 +466,17 @@ struct SpecMatchingProfile {
     bool truncated_reference_escalates{false};
     bool truncated_reference_measured{false};
 
-    /// Phase 1 did not yield a usable answer, so the shot escalates. On the truncated-`H` path that
-    /// is "trees survived at `T`", equivalently "the residual is non-empty"; on §M7's path it is
-    /// "the certificate did not hold". Same branch, same downstream contract, and it stays the
-    /// quantity invariant 12 is written against.
-    bool truncated{false};
-    /// Whether the shot was re-decoded by stock. Debug-asserted equal to `truncated`, which is
-    /// debug invariant 12.
+    /// §2.6's **one** escalation predicate: some component of `H` did not resolve within `T`. On
+    /// the truncated path that is "trees survived at `T`" in that component; on §M7's it is "the
+    /// component's certificate did not hold". Same branch, same downstream contract, and it stays
+    /// the quantity invariant 12 is written against.
+    ///
+    /// Named for what it is rather than for the shot, because after §2 there is no shot-level
+    /// truncation: `H` is never solved as one problem, so "the shot truncated" would be a statement
+    /// about a solve that does not happen.
+    bool any_component_truncated{false};
+    /// Whether the shot was re-decoded by stock. Debug-asserted equal to `any_component_truncated`,
+    /// which is debug invariant 12 and §2.6's "one predicate, in one place".
     bool escalated{false};
     /// The thread was descheduled during this shot. Its timings no longer *include* the off-CPU
     /// time — `HiResTimer` is thread-scoped — but it resumed on cold caches, so it is still an
@@ -407,7 +497,9 @@ struct SpecMatchingProfile {
         largest_tree_size = harvest.largest_tree_size;
         exposed_root_blossoms = harvest.exposed_root_blossoms;
         dual_sum_at_truncation = harvest.dual_sum_at_truncation;
-        truncated = !harvest.residual.empty();
+        // `any_component_truncated` is deliberately **not** set from the residual. It is the
+        // decode's own per-component predicate, and the production path never builds a residual at
+        // all — reading one here is how the two would drift apart (§2.6).
 
         harvest_enumerate_ns = harvest.enumerate_ns;
         harvest_reduce_ns = harvest.reduce_ns;
@@ -423,7 +515,9 @@ struct SpecMatchingProfile {
 /// `SpecMatchingDecoder::decode_batch` whenever profiling is on (§M6.2).
 struct SpecMatchingAggregateStats {
     uint64_t shots{0};
-    uint64_t shots_truncated{0};
+    /// §2.6. **The** escalation count: shots with at least one `TRUNCATED` component. There is no
+    /// separate `shots_truncated` any more — it counted a shot-level solve that no longer happens,
+    /// and every §M6.2 quantity that used to read it reads this instead.
     uint64_t shots_escalated{0};
     uint64_t shots_zero_defects{0};
     /// §M7. Shots the certificate kept, and the split of the escalating ones by trigger.
@@ -448,7 +542,9 @@ struct SpecMatchingAggregateStats {
     /// Escalating shots only.
     long long sum_escalation_ns{0};
     long long sum_total_ns{0};
-    long long sum_total_ns_truncated{0};
+    /// §2.6. End-to-end time of the escalating shots, which is what `sum_total_ns_truncated` used
+    /// to be under the other name — the two predicates are one now.
+    long long sum_total_ns_escalated{0};
     long long sum_exact_reference_ns{0};
     /// §M3.2: the stock decode measured on precisely the shots that escalate, which replaces that
     /// section's mean-over-all-shots estimate.
@@ -479,70 +575,92 @@ struct SpecMatchingAggregateStats {
     uint64_t sum_exposed_root_blossoms{0};
     uint64_t shots_with_exposed_root_blossoms{0};
 
-    /// §C.3. Running sums of §C.1 over the shots that were analysed, and the §C.2 distributions.
+    /// §2.6. The components decided across the campaign and how many of them truncated, summed over
+    /// **every** shot rather than only the analysed ones: they are the decode's own tally.
+    /// `components_truncated / components_total` is the per-component escalation rate, which is a
+    /// different and finer quantity than `q`, and `truncated_components_per_escalated_shot` is read
+    /// off the pair below (§3.5.1).
+    uint64_t components_total{0};
+    uint64_t components_truncated{0};
+    /// Truncated components summed over the escalating shots alone. Equal to `components_truncated`
+    /// by construction — a shot escalates iff it has one — and kept separately so the mean of
+    /// §3.5.1 has its own numerator rather than an identity a refactor could quietly break.
+    uint64_t sum_truncated_components_on_escalated{0};
+
+    /// §2.6/§3.5.2's joint tables, over the components of every analysed shot. Configured once per
+    /// campaign, beside the histograms, and defaulted to the same bins the histograms default to.
+    ComponentStatusTable size_x_status = ComponentStatusTable::with_bins(ComponentHistograms::SIZE_HIST_BINS);
+    ComponentStatusTable hop_diameter_x_status =
+        ComponentStatusTable::with_bins(ComponentHistograms::HOP_DIAMETER_HIST_BINS);
+
+    /// §3.5.2. Running sums over the shots that were analysed, and the distributions.
     ///
     /// `shots_with_component_stats` is the divisor for every mean below, and is *not* `shots`: a
     /// campaign may analyse a subset, and a campaign that left `collect_component_stats` off must
     /// report no component structure rather than a mean over zeros.
     uint64_t shots_with_component_stats{0};
     /// Analysed shots that had at least one `H` node. The divisor of `solver_set_empty_rate`, and
-    /// not `shots_with_component_stats`: a shot with no defects has an empty solver set for a reason
-    /// that has nothing to do with the prune, and pooling the two would quote a win that is really
-    /// the corpus's zero-defect rate.
+    /// not `shots_with_component_stats`: a shot with no defects has nothing to solve for a reason
+    /// that has nothing to do with `H`'s structure, and pooling the two would report the corpus's
+    /// zero-defect rate as if it were a property of the decomposition.
     uint64_t shots_with_component_defects{0};
-    /// Shots whose components were all resolved trivially, so the solver and the harvest would have
-    /// been skipped entirely (§A.4). Zero-defect shots are in here too — the solve really is skipped
-    /// on them — which is why the rate above is conditioned rather than taken over every shot.
+    /// Analysed shots with no `H` node at all, so there was no component and no instance to build.
     uint64_t shots_solver_set_empty{0};
-    /// Shots with at least one trivially-residual defect — a singleton whose boundary sits past the
-    /// horizon, which forces escalation on its own (§A.5).
-    uint64_t shots_with_trivial_residual{0};
     uint64_t sum_num_components{0};
     uint64_t sum_trivial_components{0};
     uint64_t sum_singleton_components{0};
     uint64_t sum_pair_components{0};
-    uint64_t sum_nontrivial_components{0};
     uint64_t sum_boundary_touching_components{0};
     uint64_t sum_diameter_uncomputed_components{0};
-    /// The denominator of the two fractions §D asks for. `H`'s node count summed over the analysed
-    /// shots — the post-preamble defects, which is what the components actually partition — and not
-    /// the raw detection-event count `sum_num_defects`.
+    /// `H`'s node count summed over the analysed shots — the post-preamble defects, which is what
+    /// the components actually partition, and not the raw detection-event count `sum_num_defects`.
     uint64_t sum_component_defects{0};
     uint64_t sum_defects_in_trivial_components{0};
-    uint64_t sum_defects_committed_trivially{0};
-    uint64_t sum_defects_residual_trivially{0};
-    uint64_t sum_defects_to_solver{0};
+    uint64_t sum_components_size_ge3{0};
+    uint64_t sum_odd_components_without_boundary{0};
+    uint64_t sum_nodes_with_boundary_edge{0};
+    /// Shots with at least one odd, boundary-less component. Those truncate with certainty, so this
+    /// is a lower bound on the escalating set read straight off `H`'s structure (§3.5.2).
+    uint64_t shots_with_odd_component_without_boundary{0};
     /// Per-shot maxima, summed and maximised: the mean says what a typical shot's worst component
     /// looks like, the max says what the worst shot of the campaign held.
     uint64_t sum_largest_component_size{0};
     uint64_t max_component_size{0};
     uint64_t sum_max_component_diameter_wint{0};
     uint64_t max_component_diameter_wint{0};
+    uint64_t sum_max_component_hop_diameter{0};
+    uint64_t max_component_hop_diameter{0};
     ComponentHistograms component_hist;
-
-    /// §A's run label. `k` is a property of the campaign rather than of a shot, so it is recorded
-    /// rather than summed — the last shot folded in wins, and pooling two campaigns decoded at
-    /// different `k` is a category error the reader has to avoid. `-1` until a shot is accumulated,
-    /// which is not the same statement as `0` (a run that resolved nothing off the solver).
-    int prune_component_max_size{-1};
-    /// Defects the resolver settled off the solver, summed over every accumulated shot. Not a
-    /// latency: the resolve is a serial pre-pass outside the reported stages by scope.
-    uint64_t sum_defects_resolved_small{0};
 
     void reset() {
         *this = SpecMatchingAggregateStats();
     }
 
-    /// §C.2's distributions for one shot, folded in. Called beside `accumulate` from the profiling
+    /// Moves the caps of §3.3 onto the histograms and the joint tables together, so a campaign
+    /// cannot end up with a `size_hist` and a `size_x_status` binned differently.
+    void configure_component_tables(size_t size_cap, size_t degree_cap) {
+        component_hist.configure(size_cap, degree_cap);
+        size_x_status.configure(size_cap + 1);
+        hop_diameter_x_status.configure(size_cap + 1);
+    }
+
+    /// §3.5.2's distributions for one shot, folded in. Called beside `accumulate` from the profiling
     /// branch of `decode_batch`, and by any driver that decodes shot by shot instead.
     void accumulate_component_histograms(const ComponentHistograms& histograms) {
         component_hist.add(histograms);
     }
 
+    /// §2.6/§3.5.2's joint tables for one shot, folded in beside the histograms.
+    void accumulate_component_status_tables(const ComponentStatusTable& size, const ComponentStatusTable& hop) {
+        size_x_status.add(size);
+        hop_diameter_x_status.add(hop);
+    }
+
     void accumulate(const SpecMatchingProfile& profile) {
         shots++;
-        if (profile.truncated)
-            shots_truncated++;
+        // §2.6's one predicate, counted once. `escalated` and `any_component_truncated` are the same
+        // fact and are debug-asserted equal where the branch is taken; this counts the branch.
+        assert(profile.escalated == profile.any_component_truncated && "§2.6: two escalation predicates disagree");
         if (profile.escalated)
             shots_escalated++;
         if (profile.num_defects == 0)
@@ -565,9 +683,9 @@ struct SpecMatchingAggregateStats {
         if (profile.escalated) {
             sum_escalation_ns += profile.escalation_ns;
             sum_stock_ns_on_escalated += profile.stock_ns;
+            sum_total_ns_escalated += profile.total_ns;
+            sum_truncated_components_on_escalated += (uint64_t)profile.components_truncated;
         }
-        if (profile.truncated)
-            sum_total_ns_truncated += profile.total_ns;
 
         if (!profile.contaminated) {
             max_total_ns = std::max(max_total_ns, profile.total_ns);
@@ -595,42 +713,42 @@ struct SpecMatchingAggregateStats {
         if (profile.exposed_root_blossoms > 0)
             shots_with_exposed_root_blossoms++;
 
-        // §A. `k` labels the campaign; the defect count is the resolver's load over it.
-        prune_component_max_size = profile.prune_component_max_size;
-        sum_defects_resolved_small += (uint64_t)profile.defects_resolved_small;
+        // §2.6. The decode's own per-component tally, over every shot: the escalation predicate is
+        // built from it, so it is not conditioned on the §3.5.2 analysis having run.
+        components_total += (uint64_t)profile.components_total;
+        components_truncated += (uint64_t)profile.components_truncated;
+        assert(
+            (profile.components_truncated > 0) == profile.any_component_truncated &&
+            "§2.6: the component tally and the escalation predicate disagree");
 
         const ComponentStats& components = profile.components;
         if (components.measured) {
             shots_with_component_stats++;
-            if (components.defects_committed_trivially + components.defects_residual_trivially +
-                    components.defects_to_solver >
-                0)
+            if (components.component_defects > 0)
                 shots_with_component_defects++;
             if (components.solver_set_empty())
                 shots_solver_set_empty++;
-            if (components.defects_residual_trivially > 0)
-                shots_with_trivial_residual++;
+            if (components.num_odd_components_without_boundary > 0)
+                shots_with_odd_component_without_boundary++;
             sum_num_components += (uint64_t)components.num_components;
             sum_trivial_components += (uint64_t)components.num_trivial_components;
             sum_singleton_components += (uint64_t)components.num_singleton_components;
             sum_pair_components += (uint64_t)components.num_pair_components;
-            sum_nontrivial_components += (uint64_t)components.num_nontrivial_components;
+            sum_components_size_ge3 += (uint64_t)components.num_components_size_ge3;
             sum_boundary_touching_components += (uint64_t)components.num_boundary_touching_components;
+            sum_odd_components_without_boundary += (uint64_t)components.num_odd_components_without_boundary;
+            sum_nodes_with_boundary_edge += (uint64_t)components.nodes_with_boundary_edge;
             sum_diameter_uncomputed_components += (uint64_t)components.diameter_uncomputed_components;
             sum_defects_in_trivial_components += (uint64_t)components.defects_in_trivial_components;
-            sum_defects_committed_trivially += (uint64_t)components.defects_committed_trivially;
-            sum_defects_residual_trivially += (uint64_t)components.defects_residual_trivially;
-            sum_defects_to_solver += (uint64_t)components.defects_to_solver;
-            // The components partition `H`'s nodes, so their three classifications sum to the node
-            // count — which is the denominator §D's fractions are taken over.
-            sum_component_defects += (uint64_t)components.defects_committed_trivially +
-                                     (uint64_t)components.defects_residual_trivially +
-                                     (uint64_t)components.defects_to_solver;
+            sum_component_defects += (uint64_t)components.component_defects;
             sum_largest_component_size += (uint64_t)components.largest_component_size;
             max_component_size = std::max(max_component_size, (uint64_t)components.largest_component_size);
             sum_max_component_diameter_wint += (uint64_t)components.max_component_diameter_wint;
             max_component_diameter_wint =
                 std::max(max_component_diameter_wint, (uint64_t)components.max_component_diameter_wint);
+            sum_max_component_hop_diameter += (uint64_t)components.max_component_hop_diameter;
+            max_component_hop_diameter =
+                std::max(max_component_hop_diameter, (uint64_t)components.max_component_hop_diameter);
         }
     }
 };
@@ -691,7 +809,16 @@ struct SpecMatchingSummary {
     double mean_residual_density{0};
     double exposed_root_blossom_rate{0};
 
-    /// §C/§D's component structure, derived once here rather than in every benchmark script.
+    /// §2.6/§3.5.1's per-component escalation reading, over **every** shot: the components decided,
+    /// how many truncated, and the mean number of truncated components on an escalating shot. `q`
+    /// says how often a shot escalates; these say how much of `H` was responsible.
+    uint64_t components_total{0};
+    uint64_t components_truncated{0};
+    double truncated_component_rate{0};
+    double mean_components_per_shot{0};
+    double truncated_components_per_escalated_shot{0};
+
+    /// §3.5.2's component structure, derived once here rather than in every benchmark script.
     ///
     /// `shots_with_component_stats` is the divisor of every mean and rate below, and is reported
     /// beside them for the same reason `shots` is reported beside `q`: zero of them means the
@@ -702,47 +829,45 @@ struct SpecMatchingSummary {
     double mean_components{0};
     double mean_singleton_components{0};
     double mean_pair_components{0};
-    double mean_nontrivial_components{0};
+    double mean_components_size_ge3{0};
     double mean_largest_component_size{0};
     double max_component_size{0};
     double mean_max_component_diameter_wint{0};
     double max_component_diameter_wint{0};
+    double mean_max_component_hop_diameter{0};
+    double max_component_hop_diameter{0};
     double boundary_touching_component_fraction{0};
     double diameter_uncomputed_component_fraction{0};
-    /// The two fractions §D asks for, over `H`'s nodes summed across the analysed shots: how much of
-    /// the defect set sits in a trivial (size `<= 2`) component, and how much of it the solver would
-    /// still have had to take. They do not sum to 1 — an ambiguous trivial component is in the first
-    /// and in the second, which is exactly the gap between "trivial" and "trivially resolvable".
+    /// §3.5.2's certain-truncation lower bound: components that are odd and have no member with a
+    /// boundary edge cannot be perfectly matched within `T` at all. `odd_component_without_boundary_rate`
+    /// is over the analysed shots, and is a lower bound on `q` read off `H`'s structure alone.
+    double odd_components_without_boundary_fraction{0};
+    double odd_component_without_boundary_rate{0};
+    /// Mean `H` nodes carrying a boundary edge, per analysed shot.
+    double mean_nodes_with_boundary_edge{0};
+    /// How much of the defect set sits in a component of size `<= 2`, over `H`'s nodes summed across
+    /// the analysed shots. Purely structural: after §2 every defect goes to the solver, so there is
+    /// no companion "fraction the solver would still have had to take" — it is 1 by construction.
     double frac_defects_in_trivial_components{0};
-    double frac_defects_to_solver{0};
-    double frac_defects_committed_trivially{0};
-    double frac_defects_residual_trivially{0};
-    /// Fraction of analysed shots **with at least one defect** on which the solver's input would
-    /// have been empty, so the `Mwpm(H)` build, the solve and the harvest would not have run at all
-    /// (§A.4). Conditioned on having defects so that a corpus's zero-defect rate is not read as the
-    /// prune's win; `shots_with_component_defects` is the divisor.
+    /// Fraction of analysed shots **with at least one defect** on which there was nothing to solve.
+    /// Conditioned on having defects so that a corpus's zero-defect rate is not read as a win;
+    /// `shots_with_component_defects` is the divisor.
     double solver_set_empty_rate{0};
-    double trivial_residual_rate{0};
 
-    /// §A's run label. `k` is what the campaign decoded at — the solver saw only components of size
-    /// `> k` — and `mean_defects_resolved_small` is how many of `H`'s defects the small-component
-    /// resolver settled off the solver per shot, over every shot, sizes `1..k` included.
-    ///
-    /// Neither is a latency. The resolve is a serial pre-pass on the critical path, excluded from
-    /// the latency this summary reports by measurement scope, to be measured separately. `k = -1`
-    /// means no shot was accumulated, which is not the same statement as `k = 0`.
-    int prune_component_max_size{-1};
-    double mean_defects_resolved_small{0};
-
-    /// §C.2's distributions, copied out of the accumulator so `summarize` is the one place a
+    /// §3.5.2's distributions, copied out of the accumulator so `summarize` is the one place a
     /// consumer has to look. See `ComponentHistograms` for the binning; `weight_hist_bins_per_T` is
     /// carried alongside so a plot can label the axis without restating the convention.
     uint64_t weight_hist_bins_per_T{ComponentHistograms::BINS_PER_T};
     std::vector<uint64_t> component_size_hist;
     std::vector<uint64_t> component_diameter_hist;
+    std::vector<uint64_t> component_hop_diameter_hist;
     std::vector<uint64_t> h_degree_hist;
     std::vector<uint64_t> h_edge_weight_hist;
     std::vector<uint64_t> boundary_cost_hist;
+    /// §2.6's `size x status` table, and its hop-diameter twin. Row-major `[bin][status]` with
+    /// `status` 0 = `COMPLETE`, 1 = `TRUNCATED`, last bin overflowing.
+    ComponentStatusTable size_x_status;
+    ComponentStatusTable hop_diameter_x_status;
 };
 
 inline double percentile_of(std::vector<long long> values, double fraction) {
@@ -780,9 +905,11 @@ inline SpecMatchingSummary summarize(const SpecMatchingAggregateStats& stats) {
     }
     if (summary.c_phase1 > 0)
         summary.amortised_penalty = summary.q * (summary.c_escalation / summary.c_phase1);
-    if (stats.shots_truncated && stats.sum_total_ns) {
+    // §2.6. Reads the escalation predicate, not a second truncation counter: the two were the same
+    // number under different names, and keeping only one is the point of that section.
+    if (stats.shots_escalated && stats.sum_total_ns) {
         summary.escalation_cost_ratio =
-            ((double)stats.sum_total_ns_truncated / (double)stats.shots_truncated) / summary.measured_mean_ns;
+            ((double)stats.sum_total_ns_escalated / (double)stats.shots_escalated) / summary.measured_mean_ns;
     }
     if (stats.shots_escalated)
         summary.mean_stock_ns_on_escalated = (double)stats.sum_stock_ns_on_escalated / (double)stats.shots_escalated;
@@ -800,7 +927,19 @@ inline SpecMatchingSummary summarize(const SpecMatchingAggregateStats& stats) {
         summary.mean_residual_density = (double)stats.sum_residual_size / (double)stats.sum_num_defects;
     summary.exposed_root_blossom_rate = (double)stats.shots_with_exposed_root_blossoms / shots;
 
-    // §C/§D. Every mean here is over the *analysed* shots, and the histograms are copied out
+    // §2.6/§3.5.1. The per-component reading, over every shot: the decode tallies its components
+    // whether or not the §3.5.2 analysis ran, because the escalation predicate is built from them.
+    summary.components_total = stats.components_total;
+    summary.components_truncated = stats.components_truncated;
+    summary.mean_components_per_shot = (double)stats.components_total / shots;
+    if (stats.components_total)
+        summary.truncated_component_rate = (double)stats.components_truncated / (double)stats.components_total;
+    if (stats.shots_escalated) {
+        summary.truncated_components_per_escalated_shot =
+            (double)stats.sum_truncated_components_on_escalated / (double)stats.shots_escalated;
+    }
+
+    // §3.5.2. Every mean here is over the *analysed* shots, and the histograms are copied out
     // whether or not any shot was analysed, so a consumer always finds the same keys with the same
     // shapes and reads "not measured" off `shots_with_component_stats` rather than off their absence.
     summary.shots_with_component_stats = stats.shots_with_component_stats;
@@ -811,39 +950,41 @@ inline SpecMatchingSummary summarize(const SpecMatchingAggregateStats& stats) {
     }
     summary.max_component_size = (double)stats.max_component_size;
     summary.max_component_diameter_wint = (double)stats.max_component_diameter_wint;
+    summary.max_component_hop_diameter = (double)stats.max_component_hop_diameter;
     if (stats.shots_with_component_stats) {
         double analysed = (double)stats.shots_with_component_stats;
         summary.mean_components = (double)stats.sum_num_components / analysed;
         summary.mean_singleton_components = (double)stats.sum_singleton_components / analysed;
         summary.mean_pair_components = (double)stats.sum_pair_components / analysed;
-        summary.mean_nontrivial_components = (double)stats.sum_nontrivial_components / analysed;
-        summary.trivial_residual_rate = (double)stats.shots_with_trivial_residual / analysed;
+        summary.mean_components_size_ge3 = (double)stats.sum_components_size_ge3 / analysed;
+        summary.mean_nodes_with_boundary_edge = (double)stats.sum_nodes_with_boundary_edge / analysed;
+        summary.odd_component_without_boundary_rate =
+            (double)stats.shots_with_odd_component_without_boundary / analysed;
         // Both are per-shot maxima, so their means are "the typical shot's worst", not a mean over
         // components — the histograms beside them are what describes the population.
         summary.mean_largest_component_size = (double)stats.sum_largest_component_size / analysed;
         summary.mean_max_component_diameter_wint = (double)stats.sum_max_component_diameter_wint / analysed;
+        summary.mean_max_component_hop_diameter = (double)stats.sum_max_component_hop_diameter / analysed;
     }
     if (stats.sum_num_components) {
         double components = (double)stats.sum_num_components;
         summary.boundary_touching_component_fraction = (double)stats.sum_boundary_touching_components / components;
         summary.diameter_uncomputed_component_fraction = (double)stats.sum_diameter_uncomputed_components / components;
+        summary.odd_components_without_boundary_fraction =
+            (double)stats.sum_odd_components_without_boundary / components;
     }
     if (stats.sum_component_defects) {
         double defects = (double)stats.sum_component_defects;
         summary.frac_defects_in_trivial_components = (double)stats.sum_defects_in_trivial_components / defects;
-        summary.frac_defects_to_solver = (double)stats.sum_defects_to_solver / defects;
-        summary.frac_defects_committed_trivially = (double)stats.sum_defects_committed_trivially / defects;
-        summary.frac_defects_residual_trivially = (double)stats.sum_defects_residual_trivially / defects;
     }
-    // §A's run label. Over every shot, not only the analysed ones: the resolver ran on all of them,
-    // and `collect_component_stats` has nothing to do with whether it did.
-    summary.prune_component_max_size = stats.prune_component_max_size;
-    summary.mean_defects_resolved_small = (double)stats.sum_defects_resolved_small / shots;
     summary.component_size_hist = stats.component_hist.size_hist;
     summary.component_diameter_hist = stats.component_hist.diameter_hist;
+    summary.component_hop_diameter_hist = stats.component_hist.hop_diameter_hist;
     summary.h_degree_hist = stats.component_hist.degree_hist;
     summary.h_edge_weight_hist = stats.component_hist.edge_weight_hist;
     summary.boundary_cost_hist = stats.component_hist.bcost_hist;
+    summary.size_x_status = stats.size_x_status;
+    summary.hop_diameter_x_status = stats.hop_diameter_x_status;
     return summary;
 }
 

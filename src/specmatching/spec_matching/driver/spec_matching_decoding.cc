@@ -131,7 +131,8 @@ SpecMatchingDecoder SpecMatchingDecoder::from_detector_error_model(
         ball_config.collect_harvest_diagnostics = config.collect_harvest_diagnostics;
         ball_config.collect_structural_counters = config.collect_structural_counters;
         ball_config.collect_component_stats = config.collect_component_stats;
-        ball_config.prune_component_max_size = config.prune_component_max_size;
+        ball_config.diameter_cap = config.diameter_cap;
+        ball_config.verify_component_decomposition = config.verify_component_decomposition;
         ball_config.skip_negative_weight_preamble_when_positive = config.skip_negative_weight_preamble_when_positive;
         decoder.ball =
             std::make_unique<BallDecoder>(BallDecoder::from_mwpm(std::move(g_mwpm), ball_config, ball_artifact_path));
@@ -170,6 +171,16 @@ Phase1Outcome SpecMatchingDecoder::run_phase1(const std::vector<uint64_t>& dets,
                                                : ball->decode_phase1(dets, bp);
             outcome.status = harvest.residual.empty() ? TimelineStatus::COMPLETE : TimelineStatus::TRUNCATED;
             outcome.harvest = std::move(harvest);
+            // §2.6's tally still comes from the decode, not from the residual: the residual is what
+            // this branch checks the status *against*, so deriving both from it would make the
+            // check vacuous.
+            if (bp != nullptr) {
+                outcome.components_total = ball_profile.components_total;
+                outcome.components_truncated = ball_profile.components_truncated;
+                assert(
+                    (outcome.status == TimelineStatus::TRUNCATED) == (ball_profile.any_component_truncated != 0) &&
+                    "the full harvest's residual and §2.6's escalation predicate disagree");
+            }
         } else {
             outcome = need_pairs ? ball->decode_phase1_production_to_match_edges(dets, committed_pairs, bp)
                                  : ball->decode_phase1_production(dets, bp);
@@ -204,6 +215,11 @@ Phase1Outcome SpecMatchingDecoder::run_phase1(const std::vector<uint64_t>& dets,
         prof->harvest_ns = step.elapsed_ns();
 
     assert((outcome.status == TimelineStatus::TRUNCATED) == !outcome.harvest.residual.empty());
+    // The oracle front end solves `G` as one problem, so §2.6's tally reads it as the one component
+    // it is. There is no `H` here and nothing to decompose; reporting zero components would make
+    // the profile's `components_truncated > 0 <=> escalated` invariant false on this path alone.
+    outcome.components_total = 1;
+    outcome.components_truncated = outcome.status == TimelineStatus::TRUNCATED ? 1 : 0;
     return outcome;
 }
 
@@ -211,9 +227,15 @@ void SpecMatchingDecoder::copy_phase1_stats(const Phase1Outcome& outcome, SpecMa
     if (prof == nullptr)
         return;
     prof->fill_from(outcome.harvest);
-    // On the production path a truncated shot never built a residual, so `fill_from` reads zero.
-    // `truncated` is the branch itself, which is the thing invariant 12 is about.
-    prof->truncated = outcome.status == TimelineStatus::TRUNCATED;
+    // §2.6's one predicate, carried out of Phase 1 rather than re-derived from a residual: on the
+    // production path an escalating shot never builds one, so reading it here would report every
+    // shot as complete. This is the thing invariant 12 is about.
+    prof->any_component_truncated = outcome.status == TimelineStatus::TRUNCATED;
+    prof->components_total = outcome.components_total;
+    prof->components_truncated = outcome.components_truncated;
+    assert(
+        prof->any_component_truncated == (outcome.components_truncated > 0) &&
+        "§2.6: Phase 1's status and its component tally disagree");
     if (ball != nullptr) {
         prof->blossom_formations = ball_profile.blossom_formations;
         prof->solve_dependent_depth = ball_profile.solve_dependent_depth;
@@ -223,11 +245,14 @@ void SpecMatchingDecoder::copy_phase1_stats(const Phase1Outcome& outcome, SpecMa
         prof->certified = ball_profile.certified;
         prof->h_no_perfect_matching = ball_profile.h_no_perfect_matching;
         prof->max_dual_at_completion = ball_profile.max_dual_at_completion;
-        // §A's run label. Not a latency: the resolve is a serial pre-pass excluded from the stages
-        // above by measurement scope.
-        prof->prune_component_max_size = ball_profile.prune_component_max_size;
-        prof->defects_resolved_small = ball_profile.defects_resolved_small;
     }
+}
+
+void SpecMatchingDecoder::configure_component_tables(size_t size_cap, size_t degree_cap) {
+    component_histograms.configure(size_cap, degree_cap);
+    component_size_x_status.configure(size_cap + 1);
+    component_hop_diameter_x_status.configure(size_cap + 1);
+    stats.configure_component_tables(size_cap, degree_cap);
 }
 
 void SpecMatchingDecoder::record_component_stats(SpecMatchingProfile* prof) {
@@ -237,8 +262,12 @@ void SpecMatchingDecoder::record_component_stats(SpecMatchingProfile* prof) {
     // this feeds assumes the component work is free, so charging it to a latency number here would
     // be measuring a stage that is not meant to run on this critical path. It also has to come
     // before `record_truncated_reference`, which rebuilds `H` in the same arena.
-    ball->analyze_last_shot_components(ball_profile, component_histograms);
+    ball->analyze_last_shot_components(
+        ball_profile, component_histograms, component_size_x_status, component_hop_diameter_x_status);
     prof->components = ball_profile.components;
+    assert(
+        prof->components.components_truncated == prof->components_truncated &&
+        "§2.6: the post-shot analysis and the decode disagree on how many components truncated");
 }
 
 void SpecMatchingDecoder::record_truncated_reference(const std::vector<uint64_t>& dets, SpecMatchingProfile* prof) {
@@ -317,9 +346,11 @@ void SpecMatchingDecoder::decode_to_obs(
             after.sample();
             prof->contaminated = after.switched_since(before);
         }
+        // Invariant 12, and §2.6's "one escalation predicate, in one place": the branch that was
+        // taken and the predicate it was taken on are the same fact under two names.
         assert(
-            prof->escalated == prof->truncated &&
-            "invariant 12: escalation fires iff Phase 1 has no usable answer, and nothing else");
+            prof->escalated == prof->any_component_truncated &&
+            "invariant 12: escalation fires iff some component of H did not resolve within T, and nothing else");
         record_component_stats(prof);
         record_truncated_reference(dets, prof);
     }
@@ -416,9 +447,11 @@ void SpecMatchingDecoder::decode_to_edges(
             after.sample();
             prof->contaminated = after.switched_since(before);
         }
+        // Invariant 12, and §2.6's "one escalation predicate, in one place": the branch that was
+        // taken and the predicate it was taken on are the same fact under two names.
         assert(
-            prof->escalated == prof->truncated &&
-            "invariant 12: escalation fires iff Phase 1 has no usable answer, and nothing else");
+            prof->escalated == prof->any_component_truncated &&
+            "invariant 12: escalation fires iff some component of H did not resolve within T, and nothing else");
         record_component_stats(prof);
         record_truncated_reference(dets, prof);
     }
@@ -455,10 +488,13 @@ void SpecMatchingDecoder::decode_batch(
                 local.exact_reference_ns = exact_timer.elapsed_ns();
             }
             stats.accumulate(local);
-            // §C.3. The scalars ride in on the profile; the distributions are per component and per
-            // edge, so they are folded in from the decoder's own per-shot buffer instead.
-            if (config.collect_component_stats && local.components.measured)
+            // §3.5.2. The scalars ride in on the profile; the distributions and the joint tables are
+            // per component and per edge, so they are folded in from the decoder's own per-shot
+            // buffers instead.
+            if (config.collect_component_stats && local.components.measured) {
                 stats.accumulate_component_histograms(component_histograms);
+                stats.accumulate_component_status_tables(component_size_x_status, component_hop_diameter_x_status);
+            }
             if (profiles_out != nullptr)
                 profiles_out->push_back(local);
         }

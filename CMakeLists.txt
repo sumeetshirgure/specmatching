@@ -27,9 +27,12 @@ FetchContent_Declare(
 
 FetchContent_MakeAvailable(googletest)
 
+# One source of truth for the stim revision: the fetch below pins it, and `sparse_graph_stats`
+# stamps the same string into its `run.log` so a campaign artifact records which stim produced it.
+set(SPECMATCHING_STIM_VERSION "v1.16.0")
 FetchContent_Declare(stim
         GIT_REPOSITORY https://github.com/quantumlib/Stim.git 
-        GIT_TAG v1.16.0
+        GIT_TAG ${SPECMATCHING_STIM_VERSION}
       )
 FetchContent_MakeAvailable(stim)
 if (NOT (MSVC))
@@ -164,6 +167,40 @@ if (NOT (MSVC))
     target_link_options(profiler_driver PRIVATE -pthread -O3)
 endif ()
 target_link_libraries(profiler_driver libstim)
+
+# sparse_graph_stats: the §3 H-structure profiler. Measures the structure of the sparsified graph H
+# and its matchability at horizon T — the escalation rate q, the connected components, their sizes,
+# degrees and diameters, and each component's own COMPLETE/TRUNCATED status. No latency, no timers,
+# no decoder output kept; `grep -c chrono benchmarks/spec_matching/sparse_graph_stats.cc` is 0.
+# Not in the python wheel.
+#
+# The three defines below go into `run.log` so a campaign's artifact records what produced it.
+# `git rev-parse` is run at configure time and left as "unknown" outside a git checkout, rather than
+# failing the build for a provenance line.
+execute_process(
+        COMMAND git rev-parse HEAD
+        WORKING_DIRECTORY ${CMAKE_CURRENT_LIST_DIR}
+        OUTPUT_VARIABLE SPECMATCHING_GIT_HASH
+        OUTPUT_STRIP_TRAILING_WHITESPACE
+        ERROR_QUIET)
+if (NOT SPECMATCHING_GIT_HASH)
+    set(SPECMATCHING_GIT_HASH "unknown")
+endif ()
+string(REPLACE ";" " " SPECMATCHING_BUILD_FLAGS "${ARCH_OPT}")
+# `SPECMATCHING_STIM_VERSION` is the tag `FetchContent_Declare(stim ...)` above pins, so the two
+# cannot drift apart.
+
+add_executable(sparse_graph_stats benchmarks/spec_matching/sparse_graph_stats.cc ${SOURCE_FILES_NO_MAIN})
+target_include_directories(sparse_graph_stats PRIVATE ${CMAKE_CURRENT_LIST_DIR})
+target_compile_options(sparse_graph_stats PRIVATE ${ARCH_OPT})
+target_compile_definitions(sparse_graph_stats PRIVATE
+        SPECMATCHING_GIT_HASH="${SPECMATCHING_GIT_HASH}"
+        SPECMATCHING_BUILD_FLAGS="${SPECMATCHING_BUILD_FLAGS}"
+        SPECMATCHING_STIM_VERSION="${SPECMATCHING_STIM_VERSION}")
+if (NOT (MSVC))
+    target_link_options(sparse_graph_stats PRIVATE -pthread -O3)
+endif ()
+target_link_libraries(sparse_graph_stats libstim)
 
 add_library(libspecmatching ${SOURCE_FILES_NO_MAIN})
 set_target_properties(libspecmatching PROPERTIES PREFIX "")

@@ -194,6 +194,11 @@ TEST(ManifoldBallGraph, B7ArenaReuse) {
 
     uint64_t arena_grows = warm.arena.grow_events;
     uint64_t mwpm_grows = warm.h_mwpm.grow_events;
+    // §2's component split and §3.5.2's analysis are on the same reset discipline: the split runs
+    // inside the decode, the analysis after it, and neither may allocate in steady state
+    // (invariant 11, and hard constraint 5).
+    uint64_t split_grows = warm.arena.split.grow_events;
+    uint64_t component_grows = warm.arena.components.grow_events;
 
     auto fresh_mwpm = corpus.to_mwpm();
     BallDecoder fresh = BallDecoder::from_mwpm(std::move(fresh_mwpm), config);
@@ -211,6 +216,46 @@ TEST(ManifoldBallGraph, B7ArenaReuse) {
     // Debug invariant 11: nothing grew on the second pass.
     ASSERT_EQ(warm.arena.grow_events, arena_grows) << "the ball graph arena kept allocating after warmup";
     ASSERT_EQ(warm.h_mwpm.grow_events, mwpm_grows) << "the H-side Mwpm kept allocating after warmup";
+    ASSERT_EQ(warm.arena.split.grow_events, split_grows) << "the component split kept allocating after warmup";
+    ASSERT_EQ(warm.arena.components.grow_events, component_grows)
+        << "the component analysis kept allocating after warmup";
+}
+
+// §2. The per-component decode agrees with the monolithic solve on the same `H`, on every shot: the
+// escalation predicate, the committed weight and observables, and — with the full harvest on — the
+// residual set and `num_trees`.
+//
+// This is §1's independence property checked rather than argued, and it is the gate §2.7 names.
+// `verify_component_decomposition` runs the monolithic solve on its own instance and throws on a
+// disagreement, so the test's job is to drive enough shots through it at horizons that both
+// complete and truncate.
+TEST(ManifoldBallGraph, PerComponentDecodeMatchesTheMonolithicSolve) {
+    Corpus corpus = small_corpus();
+    for (double horizon : {0.5, 1.0, 2.0}) {
+        auto mwpm = corpus.to_mwpm();
+        BallConfig config = config_for(mwpm.flooder.graph, horizon);
+        config.verify_component_decomposition = true;
+        BallDecoder decoder = BallDecoder::from_mwpm(std::move(mwpm), config);
+
+        size_t escalated = 0;
+        size_t multi_component = 0;
+        std::vector<CommittedPair> pairs;
+        for (const auto& shot : corpus.shots) {
+            BallProfile profile;
+            // The full-harvest entry point, so the residual and `num_trees` are part of what the
+            // check compares — that is the half of §2.5 the production path cannot exercise.
+            decoder.decode_phase1_to_match_edges(shot, pairs, &profile);
+            escalated += profile.any_component_truncated ? 1 : 0;
+            multi_component += profile.components_total > 1 ? 1 : 0;
+            ASSERT_EQ(profile.any_component_truncated, profile.components_truncated > 0)
+                << "§2.6: the escalation predicate and the component tally disagree";
+        }
+        // A horizon that never truncates, or an `H` that never splits, would let the check pass
+        // without ever having compared anything interesting.
+        ASSERT_GT(multi_component, 0u) << "no shot's H split at T = " << horizon;
+        if (horizon <= 1.0)
+            ASSERT_GT(escalated, 0u) << "no shot truncated at T = " << horizon;
+    }
 }
 
 // B8. Degenerate shots.

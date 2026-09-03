@@ -137,7 +137,7 @@ TEST(SpecMatchingDriver, UnboundedHorizonIsIdenticalToStock) {
             Answer expected = stock_decode(reference_mwpm, shot, decoder.num_observables);
             ASSERT_EQ(actual.obs, expected.obs) << corpus.name;
             ASSERT_EQ(actual.weight, expected.weight) << corpus.name;
-            ASSERT_FALSE(profile.truncated) << "an unbounded horizon cannot truncate";
+            ASSERT_FALSE(profile.any_component_truncated) << "an unbounded horizon cannot truncate";
             ASSERT_FALSE(profile.escalated);
         }
     }

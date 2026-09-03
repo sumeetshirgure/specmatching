@@ -77,7 +77,15 @@ py::dict summary_to_dict(const SpecMatchingSummary& summary) {
     out["mean_residual_density"] = summary.mean_residual_density;
     out["exposed_root_blossom_rate"] = summary.exposed_root_blossom_rate;
 
-    // §C/§D's component structure. Always beside `shots_with_component_stats`, for the same reason
+    // §2.6/§3.5.1's per-component escalation reading, over every shot: `q` says how often a shot
+    // escalates, these say how much of `H` was responsible.
+    out["components_total"] = summary.components_total;
+    out["components_truncated"] = summary.components_truncated;
+    out["truncated_component_rate"] = summary.truncated_component_rate;
+    out["mean_components_per_shot"] = summary.mean_components_per_shot;
+    out["truncated_components_per_escalated_shot"] = summary.truncated_components_per_escalated_shot;
+
+    // §3.5.2's component structure. Always beside `shots_with_component_stats`, for the same reason
     // `q` is always beside `shots`: zero analysed shots means the campaign did not measure this,
     // which is not the same claim as "it measured zero".
     out["shots_with_component_stats"] = summary.shots_with_component_stats;
@@ -85,39 +93,42 @@ py::dict summary_to_dict(const SpecMatchingSummary& summary) {
     out["mean_components"] = summary.mean_components;
     out["mean_singleton_components"] = summary.mean_singleton_components;
     out["mean_pair_components"] = summary.mean_pair_components;
-    out["mean_nontrivial_components"] = summary.mean_nontrivial_components;
+    out["mean_components_size_ge3"] = summary.mean_components_size_ge3;
     out["mean_largest_component_size"] = summary.mean_largest_component_size;
     out["max_component_size"] = summary.max_component_size;
     out["mean_max_component_diameter_wint"] = summary.mean_max_component_diameter_wint;
     out["max_component_diameter_wint"] = summary.max_component_diameter_wint;
+    out["mean_max_component_hop_diameter"] = summary.mean_max_component_hop_diameter;
+    out["max_component_hop_diameter"] = summary.max_component_hop_diameter;
     out["boundary_touching_component_fraction"] = summary.boundary_touching_component_fraction;
     out["diameter_uncomputed_component_fraction"] = summary.diameter_uncomputed_component_fraction;
+    // §3.5.2's certain-truncation class: odd, and no member with a legal boundary. A lower bound on
+    // the escalating set read off `H`'s structure alone.
+    out["odd_components_without_boundary_fraction"] = summary.odd_components_without_boundary_fraction;
+    out["odd_component_without_boundary_rate"] = summary.odd_component_without_boundary_rate;
+    out["mean_nodes_with_boundary_edge"] = summary.mean_nodes_with_boundary_edge;
     out["frac_defects_in_trivial_components"] = summary.frac_defects_in_trivial_components;
-    out["frac_defects_to_solver"] = summary.frac_defects_to_solver;
-    out["frac_defects_committed_trivially"] = summary.frac_defects_committed_trivially;
-    out["frac_defects_residual_trivially"] = summary.frac_defects_residual_trivially;
     out["solver_set_empty_rate"] = summary.solver_set_empty_rate;
-    out["trivial_residual_rate"] = summary.trivial_residual_rate;
-    // §A's run label: the `k` the campaign decoded at, and the resolver's per-shot load at it.
-    // Neither is a latency — the resolve is a serial pre-pass excluded from the reported stages by
-    // measurement scope — and `k = -1` means no shot was accumulated rather than `k = 0`.
-    out["prune_component_max_size"] = summary.prune_component_max_size;
-    out["mean_defects_resolved_small"] = summary.mean_defects_resolved_small;
     // The three weight histograms share one axis: bin `k` is `[k * T / bins_per_T, ...)`, last bin
     // overflowing. Carried so a plot can label it without restating the convention.
     out["weight_hist_bins_per_T"] = summary.weight_hist_bins_per_T;
     out["component_size_hist"] = summary.component_size_hist;
     out["component_diameter_hist"] = summary.component_diameter_hist;
+    out["component_hop_diameter_hist"] = summary.component_hop_diameter_hist;
     out["h_degree_hist"] = summary.h_degree_hist;
     out["h_edge_weight_hist"] = summary.h_edge_weight_hist;
     out["boundary_cost_hist"] = summary.boundary_cost_hist;
+    // §2.6's joint tables, flattened row-major `[bin][status]` with status 0 = COMPLETE,
+    // 1 = TRUNCATED. The bin count travels with them so a reader never has to infer the shape.
+    out["status_table_bins"] = (uint64_t)summary.size_x_status.bins;
+    out["size_x_status"] = summary.size_x_status.counts;
+    out["hop_diameter_x_status"] = summary.hop_diameter_x_status.counts;
     return out;
 }
 
 py::dict stats_to_dict(const SpecMatchingAggregateStats& stats) {
     py::dict out;
     out["shots"] = stats.shots;
-    out["shots_truncated"] = stats.shots_truncated;
     out["shots_escalated"] = stats.shots_escalated;
     out["shots_zero_defects"] = stats.shots_zero_defects;
     out["shots_contaminated"] = stats.shots_contaminated;
@@ -130,7 +141,7 @@ py::dict stats_to_dict(const SpecMatchingAggregateStats& stats) {
     out["sum_dual_scan_ns"] = stats.sum_dual_scan_ns;
     out["sum_escalation_ns"] = stats.sum_escalation_ns;
     out["sum_total_ns"] = stats.sum_total_ns;
-    out["sum_total_ns_truncated"] = stats.sum_total_ns_truncated;
+    out["sum_total_ns_escalated"] = stats.sum_total_ns_escalated;
     out["sum_exact_reference_ns"] = stats.sum_exact_reference_ns;
     out["sum_stock_ns_on_escalated"] = stats.sum_stock_ns_on_escalated;
     out["max_total_ns"] = stats.max_total_ns;
@@ -141,36 +152,44 @@ py::dict stats_to_dict(const SpecMatchingAggregateStats& stats) {
     out["sum_num_defects"] = stats.sum_num_defects;
     out["residual_size_hist"] = stats.residual_size_hist;
 
-    // §C.3's raw accumulators, so a consumer can re-derive `summarize`'s fractions or pool two
+    // §2.6's per-component tally, over every shot rather than only the analysed ones.
+    out["components_total"] = stats.components_total;
+    out["components_truncated"] = stats.components_truncated;
+    out["sum_truncated_components_on_escalated"] = stats.sum_truncated_components_on_escalated;
+
+    // §3.5.2's raw accumulators, so a consumer can re-derive `summarize`'s fractions or pool two
     // campaigns without going back to the per-shot rows.
     out["shots_with_component_stats"] = stats.shots_with_component_stats;
     out["shots_with_component_defects"] = stats.shots_with_component_defects;
     out["shots_solver_set_empty"] = stats.shots_solver_set_empty;
-    out["shots_with_trivial_residual"] = stats.shots_with_trivial_residual;
+    out["shots_with_odd_component_without_boundary"] = stats.shots_with_odd_component_without_boundary;
     out["sum_num_components"] = stats.sum_num_components;
     out["sum_trivial_components"] = stats.sum_trivial_components;
     out["sum_singleton_components"] = stats.sum_singleton_components;
     out["sum_pair_components"] = stats.sum_pair_components;
-    out["sum_nontrivial_components"] = stats.sum_nontrivial_components;
+    out["sum_components_size_ge3"] = stats.sum_components_size_ge3;
     out["sum_boundary_touching_components"] = stats.sum_boundary_touching_components;
+    out["sum_odd_components_without_boundary"] = stats.sum_odd_components_without_boundary;
+    out["sum_nodes_with_boundary_edge"] = stats.sum_nodes_with_boundary_edge;
     out["sum_diameter_uncomputed_components"] = stats.sum_diameter_uncomputed_components;
     out["sum_component_defects"] = stats.sum_component_defects;
     out["sum_defects_in_trivial_components"] = stats.sum_defects_in_trivial_components;
-    out["sum_defects_committed_trivially"] = stats.sum_defects_committed_trivially;
-    out["sum_defects_residual_trivially"] = stats.sum_defects_residual_trivially;
-    out["sum_defects_to_solver"] = stats.sum_defects_to_solver;
     out["sum_largest_component_size"] = stats.sum_largest_component_size;
     out["max_component_size"] = stats.max_component_size;
     out["sum_max_component_diameter_wint"] = stats.sum_max_component_diameter_wint;
     out["max_component_diameter_wint"] = stats.max_component_diameter_wint;
-    out["prune_component_max_size"] = stats.prune_component_max_size;
-    out["sum_defects_resolved_small"] = stats.sum_defects_resolved_small;
+    out["sum_max_component_hop_diameter"] = stats.sum_max_component_hop_diameter;
+    out["max_component_hop_diameter"] = stats.max_component_hop_diameter;
     out["weight_hist_bins_per_T"] = (uint64_t)ComponentHistograms::BINS_PER_T;
     out["component_size_hist"] = stats.component_hist.size_hist;
     out["component_diameter_hist"] = stats.component_hist.diameter_hist;
+    out["component_hop_diameter_hist"] = stats.component_hist.hop_diameter_hist;
     out["h_degree_hist"] = stats.component_hist.degree_hist;
     out["h_edge_weight_hist"] = stats.component_hist.edge_weight_hist;
     out["boundary_cost_hist"] = stats.component_hist.bcost_hist;
+    out["status_table_bins"] = (uint64_t)stats.size_x_status.bins;
+    out["size_x_status"] = stats.size_x_status.counts;
+    out["hop_diameter_x_status"] = stats.hop_diameter_x_status.counts;
     return out;
 }
 
@@ -249,13 +268,17 @@ py::dict profiles_to_dict(const std::vector<SpecMatchingProfile>& profiles) {
     out["exposed_root_blossoms"] = column_int(&SpecMatchingProfile::exposed_root_blossoms);
     out["certified"] = column_int(&SpecMatchingProfile::certified);
     out["h_no_perfect_matching"] = column_int(&SpecMatchingProfile::h_no_perfect_matching);
-    out["truncated"] = column_bool(&SpecMatchingProfile::truncated);
+    // §2.6's one escalation predicate, under the name it now has: `H` is never solved as one
+    // problem, so "the shot truncated" would describe a solve that does not happen.
+    out["any_component_truncated"] = column_bool(&SpecMatchingProfile::any_component_truncated);
     out["escalated"] = column_bool(&SpecMatchingProfile::escalated);
+    out["components_total"] = column_int(&SpecMatchingProfile::components_total);
+    out["components_truncated"] = column_int(&SpecMatchingProfile::components_truncated);
     out["contaminated"] = column_bool(&SpecMatchingProfile::contaminated);
     out["truncated_reference_escalates"] = column_bool(&SpecMatchingProfile::truncated_reference_escalates);
     out["truncated_reference_measured"] = column_bool(&SpecMatchingProfile::truncated_reference_measured);
 
-    // §C.1, row-aligned with the shots like everything else here. `components_measured` is 0 on
+    // §3.5.2, row-aligned with the shots like everything else here. `components_measured` is 0 on
     // every row unless `collect_component_stats` was on, which is how a reader tells "not
     // collected" from "collected, and this shot had no defects".
     out["components_measured"] = column_component(&ComponentStats::measured);
@@ -263,22 +286,17 @@ py::dict profiles_to_dict(const std::vector<SpecMatchingProfile>& profiles) {
     out["num_trivial_components"] = column_component(&ComponentStats::num_trivial_components);
     out["num_singleton_components"] = column_component(&ComponentStats::num_singleton_components);
     out["num_pair_components"] = column_component(&ComponentStats::num_pair_components);
-    out["num_nontrivial_components"] = column_component(&ComponentStats::num_nontrivial_components);
+    out["num_components_size_ge3"] = column_component(&ComponentStats::num_components_size_ge3);
     out["defects_in_trivial_components"] = column_component(&ComponentStats::defects_in_trivial_components);
     out["largest_component_size"] = column_component(&ComponentStats::largest_component_size);
     out["max_component_diameter_wint"] = column_component(&ComponentStats::max_component_diameter_wint);
+    out["max_component_hop_diameter"] = column_component(&ComponentStats::max_component_hop_diameter);
     out["diameter_uncomputed_components"] = column_component(&ComponentStats::diameter_uncomputed_components);
     out["num_boundary_touching_components"] = column_component(&ComponentStats::num_boundary_touching_components);
-    out["defects_committed_trivially"] = column_component(&ComponentStats::defects_committed_trivially);
-    out["defects_residual_trivially"] = column_component(&ComponentStats::defects_residual_trivially);
-    out["defects_to_solver"] = column_component(&ComponentStats::defects_to_solver);
-
-    // §A's run label, row-aligned like the rest. `prune_component_max_size` is the `k` the shot
-    // decoded at and `defects_resolved_small` what the resolver settled off the solver at it;
-    // neither is a latency column, because the resolve is a serial pre-pass excluded from the timed
-    // stages by measurement scope.
-    out["prune_component_max_size"] = column_int(&SpecMatchingProfile::prune_component_max_size);
-    out["defects_resolved_small"] = column_int(&SpecMatchingProfile::defects_resolved_small);
+    out["num_odd_components_without_boundary"] =
+        column_component(&ComponentStats::num_odd_components_without_boundary);
+    out["nodes_with_boundary_edge"] = column_component(&ComponentStats::nodes_with_boundary_edge);
+    out["component_defects"] = column_component(&ComponentStats::component_defects);
 
     py::array_t<double> dual_sum((py::ssize_t)n);
     py::array_t<double> weight_out((py::ssize_t)n);
@@ -360,7 +378,8 @@ compiled ball tables and must satisfy `ball_R >= 2 * ball_T_max` (§M2.0). `T` m
     config.def_readwrite("collect_harvest_diagnostics", &SpecMatchingConfig::collect_harvest_diagnostics);
     config.def_readwrite("collect_structural_counters", &SpecMatchingConfig::collect_structural_counters);
     config.def_readwrite("collect_component_stats", &SpecMatchingConfig::collect_component_stats);
-    config.def_readwrite("prune_component_max_size", &SpecMatchingConfig::prune_component_max_size);
+    config.def_readwrite("diameter_cap", &SpecMatchingConfig::diameter_cap);
+    config.def_readwrite("verify_component_decomposition", &SpecMatchingConfig::verify_component_decomposition);
     config.def_readwrite(
         "skip_negative_weight_preamble_when_positive", &SpecMatchingConfig::skip_negative_weight_preamble_when_positive);
     config.def_readwrite("measure_exact_reference", &SpecMatchingConfig::measure_exact_reference);
@@ -398,12 +417,19 @@ campaign, not a measurement. `amortisation_gap` is the reconciliation the M6 exi
 for — `|amortised_mean - measured_mean| / measured_mean`, which a gap in unattributed cost shows up
 in directly.
 
+`components_total` / `components_truncated` are the per-component reading of the same escalation:
+every connected component of `H` is decided by its own truncated sparse blossom solve, and a shot
+escalates iff at least one of them did not finish by `T`. `truncated_component_rate` is over the
+components, `q` over the shots, and `truncated_components_per_escalated_shot` relates the two.
+
 With `collect_component_stats`, the result also carries the component structure of `H`: the size,
-weighted-diameter, degree, `H` edge-weight and boundary-cost histograms, and the fractions of the
-defect set that sit in a trivial (size <= 2) component and that the solver would still have to
-take. The three weight histograms share one axis — bin `k` counts `[k * T / weight_hist_bins_per_T,
-(k + 1) * T / weight_hist_bins_per_T)`, last bin overflowing — and `shots_with_component_stats` is
-0 when the campaign did not collect any of it, which is a different statement from a zero mean.
+weighted-diameter, hop-diameter, degree, `H` edge-weight and boundary-cost histograms, the fraction
+of the defect set that sits in a trivial (size <= 2) component, and `size_x_status` /
+`hop_diameter_x_status` — flattened row-major `[bin][status]`, status 0 = COMPLETE, 1 = TRUNCATED,
+`status_table_bins` rows. The three weight histograms share one axis — bin `k` counts
+`[k * T / weight_hist_bins_per_T, (k + 1) * T / weight_hist_bins_per_T)`, last bin overflowing —
+and `shots_with_component_stats` is 0 when the campaign did not collect any of it, which is a
+different statement from a zero mean.
 )pbdoc");
 
     auto decoder = py::class_<SpecMatchingDecoder>(m, "SpecMatchingDecoder", R"pbdoc(

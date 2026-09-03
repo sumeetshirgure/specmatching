@@ -90,17 +90,16 @@ uint64_t component_capacity(const BallComponents& c) {
     return c.component_of.capacity() + c.component_index.capacity() + c.roots.capacity() + c.sizes.capacity() +
            c.member_offsets.capacity() + c.members.capacity() + c.local_index.capacity() + c.adj_offsets.capacity() +
            c.adj_target.capacity() + c.adj_weight.capacity() + c.dijkstra_dist.capacity() + c.dijkstra_done.capacity() +
-           c.fill_cursor.capacity();
+           c.bfs_dist.capacity() + c.bfs_queue.capacity() + c.fill_cursor.capacity();
 }
 
-/// The prune buffers' total capacity, used exactly as the two above are: compared before and after
-/// a prune to notice that it had to allocate.
-uint64_t prune_capacity(const BallPrune& p) {
-    return p.component_of.capacity() + p.component_size.capacity() + p.small_members.capacity() +
-           p.small_member_count.capacity() + p.small_edges.capacity() + p.small_edge_count.capacity() +
-           p.verdict.capacity() + p.node_to_solver.capacity() + p.h_to_solver.capacity() +
-           p.solver_graph.h_to_det.capacity() + p.solver_graph.edges.capacity() +
-           p.solver_graph.boundary_edges.capacity();
+/// The split buffers' total capacity, used exactly as the two above are: compared before and after
+/// a decomposition to notice that it had to allocate.
+uint64_t split_capacity(const BallComponentSplit& s) {
+    return s.component_of.capacity() + s.component_index.capacity() + s.roots.capacity() + s.sizes.capacity() +
+           s.member_offsets.capacity() + s.members.capacity() + s.local_index.capacity() + s.edge_offsets.capacity() +
+           s.edge_index.capacity() + s.node_boundary.capacity() + s.status.capacity() + s.fill_cursor.capacity() +
+           s.sub.h_to_det.capacity() + s.sub.edges.capacity() + s.sub.boundary_edges.capacity();
 }
 
 }  // namespace
@@ -119,17 +118,20 @@ void BallComponents::clear() {
     fill_cursor.clear();
 }
 
-void BallPrune::clear() {
+void BallComponentSplit::clear() {
     component_of.clear();
-    component_size.clear();
-    small_members.clear();
-    small_member_count.clear();
-    small_edges.clear();
-    small_edge_count.clear();
-    verdict.clear();
-    node_to_solver.clear();
-    h_to_solver.clear();
-    solver_graph.clear();
+    component_index.clear();
+    roots.clear();
+    sizes.clear();
+    member_offsets.clear();
+    members.clear();
+    local_index.clear();
+    edge_offsets.clear();
+    edge_index.clear();
+    node_boundary.clear();
+    status.clear();
+    fill_cursor.clear();
+    sub.clear();
 }
 
 void BallGraphArena::reset_for_graph(size_t num_detector_nodes) {
@@ -139,8 +141,8 @@ void BallGraphArena::reset_for_graph(size_t num_detector_nodes) {
     touched_words.clear();
     components.clear();
     components.grow_events = 0;
-    prune.clear();
-    prune.grow_events = 0;
+    split.clear();
+    split.grow_events = 0;
     grow_events = 0;
 }
 
@@ -327,113 +329,141 @@ void build_ball_graph(
         timing->finalize_ns = timer.elapsed_ns();
 }
 
-void compute_prune_components(const BallGraph& graph, BallPrune& p) {
-    // No timer here, and none may be added (hard constraint 1). The union-find runs in series on
-    // the shot's critical path; it is outside this branch's reported latency by measurement scope,
-    // which is the solver and the harvest on the size-`> k` graph, and not because it is free.
-    uint64_t capacity_before = prune_capacity(p);
+void decompose_ball_components(const BallGraph& graph, BallComponentSplit& s) {
+    uint64_t capacity_before = split_capacity(s);
     uint32_t n = (uint32_t)graph.num_nodes();
 
-    p.component_of.resize(n);
+    // ---- Union-find over the defect-defect edges, and only those. A boundary edge joins nothing:
+    // the boundary is not a node of `H`, so two defects that both reach it are not thereby
+    // connected, and treating them as connected would merge components that never interact.
+    s.component_of.resize(n);
     for (uint32_t i = 0; i < n; i++)
-        p.component_of[i] = i;
+        s.component_of[i] = i;
     for (const BallGraphEdge& edge : graph.edges) {
-        uint32_t a = find_root(p.component_of, edge.i);
-        uint32_t b = find_root(p.component_of, edge.j);
+        uint32_t a = find_root(s.component_of, edge.i);
+        uint32_t b = find_root(s.component_of, edge.j);
         if (a == b)
             continue;
         // Always link the larger root under the smaller, so a set's root is its minimum member.
         if (a < b)
-            p.component_of[b] = a;
+            s.component_of[b] = a;
         else
-            p.component_of[a] = b;
+            s.component_of[a] = b;
     }
     // Every non-root points at a strictly smaller index, so one ascending pass leaves every entry
     // pointing straight at its root — no second `find` walk, and no recursion.
     for (uint32_t i = 0; i < n; i++) {
-        uint32_t parent = p.component_of[i];
-        p.component_of[i] = parent == i ? i : p.component_of[parent];
+        uint32_t parent = s.component_of[i];
+        s.component_of[i] = parent == i ? i : s.component_of[parent];
     }
 
-    p.component_size.assign(n, 0);
-    for (uint32_t i = 0; i < n; i++)
-        p.component_size[p.component_of[i]]++;
-
-    // The members and the internal edges of every component the resolver can attempt, gathered at
-    // its root. Both blocks are fixed-width — a component of at most `MAX_SMALL_COMPONENT_SIZE`
-    // members holds at most `C(4, 2)` edges — so this is two passes and no sizing pass, and the
-    // adjacency the §C statistics build is not needed on the decode path at all.
-    //
-    // `i` and `e` ascend, so each block is filled in ascending `H`-node and ascending edge order
-    // for free, which is what makes the resolver's enumeration a function of `H` alone (§0).
-    p.small_members.assign(n, {});
-    p.small_member_count.assign(n, 0);
-    p.small_edges.assign(n, {});
-    p.small_edge_count.assign(n, 0);
+    // ---- Components, in ascending root order, and their sizes.
+    s.component_index.resize(n);
+    s.roots.clear();
+    s.sizes.clear();
     for (uint32_t i = 0; i < n; i++) {
-        uint32_t root = p.component_of[i];
-        if (p.component_size[root] > BallPrune::MAX_SMALL_COMPONENT_SIZE)
-            continue;
-        p.small_members[root][p.small_member_count[root]++] = i;
+        if (s.component_of[i] == i) {
+            s.component_index[i] = (uint32_t)s.roots.size();
+            s.roots.push_back(i);
+            s.sizes.push_back(0);
+        }
     }
+    for (uint32_t i = 0; i < n; i++)
+        s.sizes[s.component_index[s.component_of[i]]]++;
+
+    // ---- Members, grouped by component and ascending within each. `i` ascends, so the block of a
+    // component is filled in ascending `H`-node order for free — which is §1's bit-exactness
+    // clause: the sub-`H` relabelling preserves the order the nodes have in the full `H`, so
+    // blossom's equal-time tie-break inside the component is unchanged.
+    size_t num_components = s.roots.size();
+    s.member_offsets.assign(num_components + 1, 0);
+    for (size_t c = 0; c < num_components; c++)
+        s.member_offsets[c + 1] = s.member_offsets[c] + s.sizes[c];
+    s.members.resize(n);
+    s.local_index.resize(n);
+    s.fill_cursor.assign(s.member_offsets.begin(), s.member_offsets.end());
+    for (uint32_t i = 0; i < n; i++) {
+        uint32_t index = s.component_index[s.component_of[i]];
+        uint32_t slot = s.fill_cursor[index]++;
+        s.members[slot] = i;
+        s.local_index[i] = slot - s.member_offsets[index];
+    }
+
+    // ---- Internal edges, grouped the same way. Both endpoints of an `H` edge share a component,
+    // so every edge lands in exactly one block, and `e` ascends so each block is ascending in the
+    // global edge order — which `graph.edges` holds sorted by `(i, j)`.
+    s.edge_offsets.assign(num_components + 1, 0);
+    for (const BallGraphEdge& edge : graph.edges)
+        s.edge_offsets[s.component_index[s.component_of[edge.i]] + 1]++;
+    for (size_t c = 0; c < num_components; c++)
+        s.edge_offsets[c + 1] += s.edge_offsets[c];
+    s.edge_index.resize(graph.edges.size());
+    s.fill_cursor.assign(s.edge_offsets.begin(), s.edge_offsets.end());
     for (uint32_t e = 0; e < (uint32_t)graph.edges.size(); e++) {
-        uint32_t root = p.component_of[graph.edges[e].i];
-        if (p.component_size[root] > BallPrune::MAX_SMALL_COMPONENT_SIZE)
-            continue;
+        const BallGraphEdge& edge = graph.edges[e];
         assert(
-            p.small_edge_count[root] < BallPrune::MAX_SMALL_COMPONENT_EDGES &&
-            "a small component holds more edges than a complete graph on its members has");
-        p.small_edges[root][p.small_edge_count[root]++] = e;
+            s.component_of[edge.i] == s.component_of[edge.j] &&
+            "an H edge joins two nodes the union-find left in different components");
+        s.edge_index[s.fill_cursor[s.component_index[s.component_of[edge.i]]]++] = e;
     }
 
-    p.verdict.assign(n, 0);
-    p.node_to_solver.assign(n, 0);
+    // ---- Where each node's boundary edge is, if it has one. `H` gives a node at most one, so this
+    // is a single slot; §2.4 copies `H`'s own boundary edges rather than re-testing `bcost <= T`.
+    s.node_boundary.assign(n, BallComponentSplit::NO_BOUNDARY);
+    for (uint32_t b = 0; b < (uint32_t)graph.boundary_edges.size(); b++) {
+        uint32_t node = graph.boundary_edges[b].i;
+        assert(s.node_boundary[node] == BallComponentSplit::NO_BOUNDARY && "H gave a node two boundary edges");
+        s.node_boundary[node] = b;
+    }
 
-    if (prune_capacity(p) != capacity_before)
-        p.grow_events++;
+    s.status.assign(num_components, BallComponentSplit::COMPONENT_COMPLETE);
+
+    if (split_capacity(s) != capacity_before)
+        s.grow_events++;
 }
 
-void build_solver_subgraph(const BallGraph& graph, BallPrune& p) {
-    uint64_t capacity_before = prune_capacity(p);
-    uint32_t n = (uint32_t)graph.num_nodes();
-    BallGraph& sub = p.solver_graph;
+void build_component_subgraph(const BallGraph& graph, BallComponentSplit& s, size_t index) {
+    uint64_t capacity_before = split_capacity(s);
+    BallGraph& sub = s.sub;
     sub.clear();
 
-    // Ascending `H`-node order, so `sub.h_to_det` is a subsequence of `graph.h_to_det` and stays
-    // strictly ascending: a residual sorted in the sub-graph is sorted in `G`, exactly as it is
-    // when the solver runs on the whole of `H`.
-    p.h_to_solver.assign(n, BallPrune::NOT_IN_SOLVER);
-    for (uint32_t i = 0; i < n; i++) {
-        if (p.node_to_solver[i] == 0)
-            continue;
-        p.h_to_solver[i] = (uint32_t)sub.h_to_det.size();
-        sub.h_to_det.push_back(graph.h_to_det[i]);
+    uint32_t begin = s.member_offsets[index];
+    uint32_t size = s.sizes[index];
+
+    // Local node `j` <-> `members[begin + j]`, and the members are ascending, so `sub.h_to_det` is a
+    // strictly ascending subsequence of `graph.h_to_det`: a residual sorted here is sorted in `G`,
+    // exactly as it is when the solve runs on the whole of `H`.
+    sub.h_to_det.reserve(size);
+    for (uint32_t j = 0; j < size; j++)
+        sub.h_to_det.push_back(graph.h_to_det[s.members[begin + j]]);
+
+    // Weights and observable entries are **copied** from `H`, so extraction is bit-identical: the
+    // same integers and the same canonical ball entries the monolithic instance would have used.
+    // The block is ascending in the global edge order and `local_index` is monotone within a
+    // component, so `sub.edges` inherits `H`'s `(i, j)` sort with `i < j` — which
+    // `BallMwpm::rebuild` relies on for its ascending-neighbour adjacency.
+    for (uint32_t k = s.edge_offsets[index]; k < s.edge_offsets[index + 1]; k++) {
+        const BallGraphEdge& edge = graph.edges[s.edge_index[k]];
+        sub.edges.push_back(
+            BallGraphEdge{s.local_index[edge.i], s.local_index[edge.j], edge.w_int, edge.entry});
     }
 
-    // `graph.edges` is sorted by `(i, j)` with `i < j` and the renumbering is monotone, so the
-    // sub-graph inherits both without a sort — which `BallMwpm::rebuild` relies on for its
-    // ascending-neighbour adjacency, and `map_match_edges_to_committed_pairs` for its binary search.
-    for (const BallGraphEdge& edge : graph.edges) {
-        uint32_t i = p.h_to_solver[edge.i];
-        if (i == BallPrune::NOT_IN_SOLVER)
+    // Exactly the boundary edges `H` already has for these nodes — the cutoff is not re-derived
+    // (§2.4). Members ascend, so the list comes out sorted by local index, which is what
+    // `BallMwpm::rebuild` requires of `boundary_edges`.
+    for (uint32_t j = 0; j < size; j++) {
+        uint32_t b = s.node_boundary[s.members[begin + j]];
+        if (b == BallComponentSplit::NO_BOUNDARY)
             continue;
-        // Both endpoints of an edge are in one component and so share its verdict; checking one is
-        // checking both.
-        assert(p.h_to_solver[edge.j] != BallPrune::NOT_IN_SOLVER && "an H edge crossed the prune boundary");
-        sub.edges.push_back(BallGraphEdge{i, p.h_to_solver[edge.j], edge.w_int, edge.entry});
-    }
-    for (const BallBoundaryEdge& edge : graph.boundary_edges) {
-        uint32_t i = p.h_to_solver[edge.i];
-        if (i == BallPrune::NOT_IN_SOLVER)
-            continue;
-        sub.boundary_edges.push_back(BallBoundaryEdge{i, edge.w_int, edge.det});
+        const BallBoundaryEdge& edge = graph.boundary_edges[b];
+        sub.boundary_edges.push_back(BallBoundaryEdge{j, edge.w_int, edge.det});
     }
 
-    if (prune_capacity(p) != capacity_before)
-        p.grow_events++;
+    if (split_capacity(s) != capacity_before)
+        s.grow_events++;
 }
 
-void analyze_ball_components(const BallGraph& graph, BallComponents& c) {
+void analyze_ball_components(const BallGraph& graph, BallComponents& c, uint32_t diameter_cap) {
     uint64_t capacity_before = component_capacity(c);
     uint32_t n = (uint32_t)graph.num_nodes();
 
@@ -511,16 +541,18 @@ void analyze_ball_components(const BallGraph& graph, BallComponents& c) {
         c.adj_weight[slot] = edge.w_int;
     }
 
-    c.dijkstra_dist.resize(MAX_DIAMETER_COMPONENT_SIZE);
-    c.dijkstra_done.resize(MAX_DIAMETER_COMPONENT_SIZE);
+    c.dijkstra_dist.resize(diameter_cap);
+    c.dijkstra_done.resize(diameter_cap);
+    c.bfs_dist.resize(diameter_cap);
+    c.bfs_queue.resize(diameter_cap);
 
     if (component_capacity(c) != capacity_before)
         c.grow_events++;
 }
 
-pm::cumulative_time_int component_diameter(BallComponents& c, size_t index) {
+pm::cumulative_time_int component_diameter(BallComponents& c, size_t index, uint32_t diameter_cap) {
     uint32_t size = c.sizes[index];
-    if (size > MAX_DIAMETER_COMPONENT_SIZE)
+    if (size > diameter_cap || size > c.dijkstra_dist.size())
         return -1;
     if (size <= 1)
         return 0;
@@ -562,6 +594,38 @@ pm::cumulative_time_int component_diameter(BallComponents& c, size_t index) {
         for (uint32_t k = 0; k < size; k++) {
             if (c.dijkstra_dist[k] != UNREACHED)
                 diameter = std::max(diameter, c.dijkstra_dist[k]);
+        }
+    }
+    return diameter;
+}
+
+int32_t component_hop_diameter(BallComponents& c, size_t index, uint32_t diameter_cap) {
+    uint32_t size = c.sizes[index];
+    if (size > diameter_cap || size > c.bfs_dist.size())
+        return -1;
+    if (size <= 1)
+        return 0;
+
+    uint32_t begin = c.member_offsets[index];
+    int32_t diameter = 0;
+    for (uint32_t source = 0; source < size; source++) {
+        for (uint32_t k = 0; k < size; k++)
+            c.bfs_dist[k] = -1;
+        c.bfs_dist[source] = 0;
+        c.bfs_queue[0] = source;
+        uint32_t head = 0;
+        uint32_t tail = 1;
+        while (head < tail) {
+            uint32_t local = c.bfs_queue[head++];
+            uint32_t node = c.members[begin + local];
+            for (uint32_t e = c.adj_offsets[node]; e < c.adj_offsets[node + 1]; e++) {
+                uint32_t neighbour = c.local_index[c.adj_target[e]];
+                if (c.bfs_dist[neighbour] >= 0)
+                    continue;
+                c.bfs_dist[neighbour] = c.bfs_dist[local] + 1;
+                diameter = std::max(diameter, c.bfs_dist[neighbour]);
+                c.bfs_queue[tail++] = neighbour;
+            }
         }
     }
     return diameter;

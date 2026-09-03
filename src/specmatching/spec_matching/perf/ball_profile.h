@@ -143,20 +143,18 @@ struct BallProfile {
     int solve_dependent_depth{0};
     int solve_events{0};
 
-    /// §A's run label: the `k` this shot decoded at — the solver saw only components of size
-    /// `> k` — and how many of `H`'s defects the small-component resolver settled off the solver.
+    /// §2. The components `H` decomposed into this shot, and how many of their own truncated solves
+    /// did not finish by `T`.
     ///
-    /// Both are labels on the latency fields above and neither is one: the resolve is a serial
-    /// pre-pass on the critical path, excluded from `blossom_on_h_ns`, `harvest_ns` and `total_ns`
-    /// by measurement scope, to be measured and optimised separately.
-    ///
-    /// `defects_resolved_small` counts the members of every committed component over **all** sizes
-    /// `1..k`, so it is the resolver's whole load and not the increment over some other `k`. It is
-    /// what the resolver settled, reported even on a shot that then escalated and discarded it.
-    int prune_component_max_size{0};
-    int defects_resolved_small{0};
+    /// `any_component_truncated` is §2.6's **one** escalation predicate, and it is a fact about the
+    /// solves rather than a reading of a residual: the production path never builds one. It is
+    /// filled on every profiled shot, including the ones that then escalate and discard everything
+    /// else Phase 1 produced.
+    int components_total{0};
+    int components_truncated{0};
+    int any_component_truncated{0};
 
-    /// §C.1's component structure of this shot's `H`. Filled by
+    /// §3.5.2's component structure of this shot's `H`. Filled by
     /// `BallDecoder::analyze_last_shot_components`, which runs **after** `total_ns` has been read
     /// and is timed by nothing: the component work is assumed free (hardware-offloadable), so it is
     /// never charged to `blossom_on_h_ns`, `harvest_ns`, `total_ns` or any other reported latency.
@@ -174,7 +172,11 @@ struct BallProfile {
 /// number of the M2 exit read.
 struct BallAggregateStats {
     uint64_t shots{0};
-    uint64_t shots_truncated{0};
+    /// §2.6's one predicate: shots with at least one `TRUNCATED` component. Read off the profile,
+    /// never off `harvest.residual.empty()` — the production path leaves that empty on every shot.
+    uint64_t shots_escalated{0};
+    uint64_t components_total{0};
+    uint64_t components_truncated{0};
     uint64_t shots_zero_defects{0};
     /// §M7.7. Zero on the truncated-`H` path; on §M7's path `shots_certified` and
     /// `shots - shots_certified` are the kept and the escalating shots respectively.
@@ -262,8 +264,10 @@ struct BallAggregateStats {
 
     void accumulate(const BallProfile& profile, const HarvestResult& harvest) {
         shots++;
-        if (!harvest.residual.empty())
-            shots_truncated++;
+        if (profile.any_component_truncated)
+            shots_escalated++;
+        components_total += (uint64_t)profile.components_total;
+        components_truncated += (uint64_t)profile.components_truncated;
         if (profile.n_defects == 0)
             shots_zero_defects++;
 
@@ -373,7 +377,15 @@ struct BallSummary {
     double mean_h_edges{0};
     double mean_residual_density{0};
     double mean_restarts{0};
+    /// §M3.0/§2.6's escalation rate. **Always report `shots` beside it** — a zero below `1 / shots`
+    /// is a resolution floor, not a measurement — which is why the two counts travel with it.
     double q{0};
+    uint64_t shots{0};
+    uint64_t shots_escalated{0};
+    /// §2.6's finer reading: how much of `H` was actually responsible for the escalations.
+    uint64_t components_total{0};
+    uint64_t components_truncated{0};
+    double truncated_component_rate{0};
     /// §M2.6 rates, recorded in the exit artifact.
     double residual_tie_rate{0};
     double pairing_tie_rate{0};
@@ -467,7 +479,13 @@ inline BallSummary summarize_ball(const BallAggregateStats& stats) {
     if (stats.sum_n_defects)
         summary.mean_residual_density = (double)stats.sum_residual_size / (double)stats.sum_n_defects;
     summary.mean_restarts = (double)stats.sum_restarts / shots;
-    summary.q = (double)stats.shots_truncated / shots;
+    summary.q = (double)stats.shots_escalated / shots;
+    summary.shots = stats.shots;
+    summary.shots_escalated = stats.shots_escalated;
+    summary.components_total = stats.components_total;
+    summary.components_truncated = stats.components_truncated;
+    if (stats.components_total)
+        summary.truncated_component_rate = (double)stats.components_truncated / (double)stats.components_total;
     summary.residual_tie_rate = (double)stats.residual_ties / shots;
     summary.pairing_tie_rate = (double)stats.pairing_ties / shots;
     summary.boundary_tie_rate = (double)stats.boundary_ties / shots;

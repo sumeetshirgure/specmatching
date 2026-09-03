@@ -88,19 +88,19 @@ struct SpecMatchingConfig {
     bool verify_against_g{false};
     bool collect_harvest_diagnostics{false};
     bool collect_structural_counters{false};
-    /// §C — the component structure of every shot's `H`, and §A.3's classification of it. Profiling
-    /// only, computed after the shot's timed window has closed, and charged to no latency number:
-    /// see `BallConfig::collect_component_stats`. Ignored without `phase1_on_ball_graph`, where
-    /// there is no `H` to decompose.
-    bool collect_component_stats{false};
+    /// §3.5.2 — the component structure of every shot's `H`, with each component's own
+    /// `COMPLETE`/`TRUNCATED` status. Profiling only, computed after the shot's timed window has
+    /// closed, and charged to no latency number: see `BallConfig::collect_component_stats`. Ignored
+    /// without `phase1_on_ball_graph`, where there is no `H` to decompose.
+    bool collect_component_stats{true};
+    /// §3.3's `--diameter-cap`: components above this size are counted rather than measured. See
+    /// `BallConfig::diameter_cap`.
+    uint32_t diameter_cap{MAX_DIAMETER_COMPONENT_SIZE};
 
-    /// §A — `k`: resolve `H`'s connected components of size `<= k` exactly, directly off the ball
-    /// tables, and run the solver on the size-`> k` remainder only. Capped at 4 and rejected above
-    /// it; `k = 0` is the un-pruned path. See `BallConfig::prune_component_max_size`.
-    ///
-    /// Ignored without `phase1_on_ball_graph` (there is no `H` to decompose) and on the
-    /// verification path, which always solves the whole of `H`.
-    int prune_component_max_size{2};
+    /// §2.5 — debug/bench: also run the monolithic solve on the whole of `H` and assert it agrees
+    /// with the per-component one. Off by default. See `BallConfig::verify_component_decomposition`.
+    bool verify_component_decomposition{false};
+
     /// §B — skip the §M2.1 negative-weight preamble on an all-positive DEM, where it is provably a
     /// no-op. See `BallConfig::skip_negative_weight_preamble_when_positive`.
     bool skip_negative_weight_preamble_when_positive{true};
@@ -209,10 +209,20 @@ struct SpecMatchingDecoder {
     /// a weight. Discarded; the caller already has the observables by another route.
     std::vector<uint8_t> obs_sink;
     BallProfile ball_profile;
-    /// §C.2's distributions for the shot just decoded. Refilled per shot and folded into `stats` by
-    /// `decode_batch`; a driver that decodes shot by shot instead reads it here and calls
-    /// `SpecMatchingAggregateStats::accumulate_component_histograms` itself.
+    /// §3.5.2's distributions for the shot just decoded, and §2.6's joint tables. Refilled per shot
+    /// and folded into `stats` by `decode_batch`; a driver that decodes shot by shot instead reads
+    /// them here and calls `SpecMatchingAggregateStats::accumulate_component_histograms` and
+    /// `accumulate_component_status_tables` itself.
     ComponentHistograms component_histograms;
+    ComponentStatusTable component_size_x_status =
+        ComponentStatusTable::with_bins(ComponentHistograms::SIZE_HIST_BINS);
+    ComponentStatusTable component_hop_diameter_x_status =
+        ComponentStatusTable::with_bins(ComponentHistograms::HOP_DIAMETER_HIST_BINS);
+
+    /// Moves §3.3's `--size-cap` / `--degree-cap` onto this decoder's per-shot buffers and onto
+    /// `stats` together, so a campaign cannot end up with the per-shot and campaign tables binned
+    /// differently.
+    void configure_component_tables(size_t size_cap, size_t degree_cap);
 
     /// The matching weight of a set of matched detection-event pairs: the sum of the shortest-path
     /// weights between them plus the graph's negative-weight offset.

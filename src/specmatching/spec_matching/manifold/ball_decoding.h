@@ -77,10 +77,9 @@ struct BallConfig {
     /// The counters are structural, so the separate pass costs nothing in fidelity: they are a
     /// function of the shot and the tables, not of when they were measured.
     bool collect_structural_counters{false};
-    /// §C — the component and structural statistics of the shot's `H`: the connected components,
-    /// their sizes, weighted diameters and boundary structure, the `H` edge-weight and boundary-cost
-    /// distributions, and §A.3's classification of each component into "the trivial resolver would
-    /// commit it", "it would leave a residual" and "it goes to the solver".
+    /// §3.5.2 — the component and structural statistics of the shot's `H`: the connected
+    /// components, their sizes, weighted and hop diameters, boundary structure and per-component
+    /// status, plus the `H` edge-weight and boundary-cost distributions.
     ///
     /// **Profiling only, and untimed.** The analysis runs after the shot's timed window has closed
     /// and is charged to no latency number at all: the component work is assumed free
@@ -89,35 +88,27 @@ struct BallConfig {
     /// the decode — with the flag on or off, every shot produces byte-identical output and the same
     /// set of shots escalates.
     ///
-    /// Off by default, for the same reason `collect_structural_counters` is: the exit artifact
-    /// collects it in its own pass rather than beside the timings it would otherwise perturb
-    /// through the cache.
-    bool collect_component_stats{false};
+    /// On by default on this branch: the component structure is a first-class output now that the
+    /// decode is per component, and `sparse_graph_stats` exists to collect it.
+    bool collect_component_stats{true};
 
-    /// §A — `k`: the largest connected component of `H` the small-component resolver takes. The
-    /// solver sees only components of size `> k`; components of size `<= k` are resolved exactly,
-    /// off the solver, before it runs.
+    /// Components above this size are counted rather than given a diameter (§3.3's
+    /// `--diameter-cap`). Both diameters are `O(s^2)` walks over the component, and at `p = 1e-3` a
+    /// component this large is already far outside the distribution the statistic is for. Read only
+    /// under `collect_component_stats`.
+    uint32_t diameter_cap{MAX_DIAMETER_COMPONENT_SIZE};
+
+    /// §2.5 — debug/bench: additionally run the **monolithic** solve on the whole of `H`, on a
+    /// separate instance, and assert that it agrees with the per-component one.
     ///
-    /// Components are disconnected by construction — no `H` edge crosses one, and the boundary is
-    /// not a node, so it joins nothing — which means the timeline on `H` factorises over them.
-    /// Removing a component the resolver has already settled therefore cannot change the solve on
-    /// what is left. The resolver is exact for weight and observable at every `k <= 4`: it
-    /// enumerates defect-pairings-with-boundary-fill under `H`'s own `<=` cutoffs and takes the
-    /// minimum, breaking ties deterministically. Nothing routes to the solver except by being size
-    /// `> k`; a component with no feasible matching becomes a residual and the shot escalates.
+    /// What is asserted: the escalation predicate (`any component TRUNCATED` against the monolithic
+    /// `TimelineStatus`), and on a completing shot the committed weight and the observable bytes.
+    /// With the full harvest on, also that the sorted residual set is the union of the
+    /// per-component residual sets and that `num_trees` is the sum.
     ///
-    /// `k = 0` resolves nothing and restores the un-pruned production path exactly, which is the
-    /// oracle the A/B is run against. `k = 2` is the previous branch's production behaviour.
-    /// **Capped at 4** — no resolver is defined above that — and rejected at construction above it.
-    ///
-    /// What moves with `k` is `blossom_on_h_ns` and `harvest_ns`, which run on a smaller node set —
-    /// and, when every component resolves, do not run at all (§A.4).
-    ///
-    /// **Production path only.** The two verification entry points (`decode_phase1`,
-    /// `decode_phase1_to_match_edges`) ignore this and always solve the whole of `H`: they are what
-    /// §M2.6 level 1 and §M3.3 X8 compare against, and pruning what the oracle sees would defeat
-    /// them.
-    int prune_component_max_size{2};
+    /// This is what §1's independence claim is checked as. Off by default and costing nothing on
+    /// the production path, exactly like `verify_against_g`.
+    bool verify_component_decomposition{false};
 
     /// §B — skip the §M2.1 negative-weight preamble on `G` when the DEM has no negative-weight
     /// edge, which is the overwhelmingly common case (`log((1-p)/p) > 0` for `p < 0.5`).
@@ -149,50 +140,64 @@ struct CommittedPair {
     static constexpr uint64_t NO_BALL_ENTRY = UINT64_MAX;
 };
 
-/// What the small-component resolver did with the shot, in counts. Not a latency measurement and
-/// not derived from one: these are the branch tallies the combine step of §A.5 needs, plus the two
-/// harvest counters the off-solver commits belong in.
-struct SmallCommitCounts {
-    /// Components of size `<= k` with no feasible pairing-with-boundary-fill at all — an odd
-    /// component with no legal boundary, or a "star" whose far members cannot pair. Non-zero forces
-    /// escalation (§A.5).
-    int residual{0};
-    /// Committed pairs and boundary matches, mirrored into `HarvestResult`'s own counters so that
-    /// the profile's commit tallies still add up to the shot's defect count.
-    int pairs{0};
-    int boundary{0};
-    /// Defects the resolver settled off the solver this shot: the members of every committed
-    /// component, over **all** sizes `1..k` and not merely the sizes above the previous branch's 2.
-    int defects_resolved{0};
-};
-
 /// What §M3.4's production Phase 1 yielded.
 ///
-/// `status` is the branch: `COMPLETE` means the harvest below is the answer, `TRUNCATED` means the
-/// shot escalates and `harvest` is empty because it was never run. Reading the status rather than
+/// `status` is the branch, and after §2 it is a **reduction over the components**: `TRUNCATED` iff
+/// some component's own truncated solve did not finish by `T`, in which case the shot escalates and
+/// whatever the other components produced is discarded. Reading the status rather than
 /// `harvest.residual.empty()` is what keeps the two from drifting apart when the bypass is on.
 struct Phase1Outcome {
     TimelineStatus status{TimelineStatus::COMPLETE};
     HarvestResult harvest;
+    /// §2.6's tally, so the one escalation predicate has a count behind it.
+    /// `status == TRUNCATED  <=>  components_truncated > 0`.
+    int components_total{0};
+    int components_truncated{0};
 };
 
-/// Phase 1 executed on the defect manifold (§M2.5).
+/// Phase 1 executed on the defect manifold (§M2.5), **one connected component at a time** (§2).
 ///
-/// Per shot: negative-weight preamble on `G` -> intersect balls -> build `H` -> rebuild `Mwpm(H)`
-/// -> `process_timeline_until_horizon(H, ..., T)` -> `harvest` (M1 code, unmodified) -> map `H`
-/// indices back to detector ids.
+/// Per shot:
+///
+/// ```
+/// negative-weight preamble on G -> intersect balls -> build H
+///   -> union-find over H's defect-defect edges -> components, roots ascending
+///   -> for each component C, in ascending-root order:
+///          build sub-H(C) on the component instance          (§2.3, §2.4)
+///          status_C = process_timeline_until_horizon(C, T)
+///          if COMPLETE: extract obs_C, w_C                    (§M3.4)
+///          reset the instance
+///   -> escalate iff some status_C is TRUNCATED
+///   -> otherwise obs = XOR_C obs_C, weight = SUM_C w_C
+/// ```
+///
+/// There is **one** question asked of a component, whatever its size, and it is asked of truncated
+/// sparse blossom: no lookup table, no closed-form rule and no static feasibility test decides a
+/// commit or a residual (§5.1). What licenses the split is §1's independence property — regions in
+/// different components cannot interact before `T`, because interaction needs `d_G <= 2T` and that
+/// is exactly the condition for an `H` edge — so the per-component event sequences are the disjoint
+/// union of the monolithic one, and the escalating set and the output are identical either way.
 ///
 /// Everything it emits is in `G`'s detector ids, so M3–M6 consume it unchanged: nothing downstream
-/// of harvest knows `H` exists.
+/// of harvest knows `H` exists, let alone that it was split.
 struct BallDecoder {
     BallConfig config;
     /// The detector graph. Kept because the negative-weight preamble, the boundary-node mask and
     /// the oracle path all live on it.
     pm::Mwpm g_mwpm;
     BallTables tables;
+    /// §2.3's component instance: one `pm::Mwpm`, built once with capacity for the largest
+    /// component seen and reused across components and shots — write the component's edges, solve,
+    /// extract, reset, next component. Zero per-shot allocation after a warm-up shot (invariant 11).
     BallMwpm h_mwpm;
     BallGraphArena arena;
     Harvester harvester;
+
+    /// §2.5. A **separate** instance for the monolithic cross-check, so the two solves share no
+    /// state, and its own harvester so the counters of one are not read as the other's. Both stay
+    /// empty unless `verify_component_decomposition` is set.
+    BallMwpm verify_mwpm;
+    Harvester verify_harvester;
 
     /// `T` in the flooder's time units, converted once from `config.T` (§0 unit rule).
     horizon_int horizon{0};
@@ -266,17 +271,37 @@ struct BallDecoder {
     /// across campaigns.
     bool truncated_scheme_escalates(const std::vector<uint64_t>& dets);
 
-    /// §C. Decomposes the `H` the arena is still holding — the one the shot just decoded on — into
-    /// connected components, and fills `prof.components` and `histograms` from it.
+    /// §3.5.2. Decomposes the `H` the arena is still holding — the one the shot just decoded on —
+    /// into connected components, and fills `prof.components`, `histograms` and the two joint
+    /// tables from it.
     ///
-    /// **Call it after the shot's timed window has closed, never inside one** (hard constraint 1).
-    /// It starts no timer of its own and must not be wrapped in one: this experiment's latency
-    /// account is the solver and the harvest, and the component work is assumed free.
+    /// **Call it after the shot's timed window has closed, never inside one.** It starts no timer
+    /// of its own and must not be wrapped in one: this experiment's latency account is the solver
+    /// and the harvest, and the component work is assumed free.
     ///
-    /// `histograms` is cleared and refilled with *this shot's* distributions; the campaign
-    /// accumulator adds them up. Valid until the next `build_ball_graph`, which is why the driver
-    /// calls this before anything that rebuilds `H` — `truncated_scheme_escalates`, in particular.
-    void analyze_last_shot_components(BallProfile& prof, ComponentHistograms& histograms);
+    /// The per-component `COMPLETE`/`TRUNCATED` statuses are **read off the decode**, not
+    /// recomputed: `arena.split` still holds them, and both decompositions enumerate in ascending
+    /// root order, so component `c` is the same component in both. That correspondence is asserted
+    /// rather than assumed.
+    ///
+    /// `histograms` and the tables are cleared and refilled with *this shot's* distributions; the
+    /// campaign accumulator adds them up. Valid until the next `build_ball_graph`, which is why the
+    /// driver calls this before anything that rebuilds `H` — `truncated_scheme_escalates`, in
+    /// particular.
+    void analyze_last_shot_components(
+        BallProfile& prof,
+        ComponentHistograms& histograms,
+        ComponentStatusTable& size_x_status,
+        ComponentStatusTable& hop_diameter_x_status);
+
+    /// Retargets an already-constructed decoder at a different horizon, **without** recompiling the
+    /// ball tables (§3.4 step 2: compile once at `T_max = max(T list)`, then sweep `T`).
+    ///
+    /// Legal exactly when the new `T` is within the compiled `T_max`, which is the same check
+    /// construction makes; `H`'s `2 * T_int` / `T_int` filter and the truncation horizon both read
+    /// `horizon`, so moving it is all a `T` sweep is. Rejected rather than clamped, so a run cannot
+    /// report a `T` it did not decode at.
+    void set_horizon(double T);
 
     void save_ball_artifact(const std::string& path) const;
 
@@ -284,43 +309,60 @@ struct BallDecoder {
     std::vector<uint64_t> seeded_scratch;
     std::vector<uint64_t> h_dets_scratch;
     mutable std::vector<uint64_t> sort_scratch;
+    /// The component instance's match edges for the component being solved right now. Drained into
+    /// `CommittedPair`s the moment that component's extraction returns, because the next component
+    /// rebuilds the instance underneath the `DetectorNode*`s these hold.
     std::vector<pm::CompressedEdge> match_edge_scratch;
-    /// §A's committed pairs, in `G`'s detector ids — the small-component resolver's contribution to
-    /// the match-edge flavours. Cleared every shot, and cleared again on an escalating one, where
-    /// §A.5 discards Phase 1 in full.
-    std::vector<CommittedPair> resolved_pairs;
-    /// The graph the last solve actually ran on: the whole of `H`, or §A.4's sub-`H`. Everything
-    /// that maps a solver index back to a detector id reads it, so that the two cases go through
-    /// one path.
-    const BallGraph* solved_graph{nullptr};
-    /// §M2.9.6 measurement 4, over `H`. Only touched when `collect_harvest_diagnostics` is set.
+    /// The shot's committed pairs, in `G`'s detector ids, accumulated across the components.
+    /// Cleared every shot, and cleared again on an escalating one, which discards Phase 1 in full.
+    std::vector<CommittedPair> committed_pair_scratch;
+    /// §2.5's scratch: the whole of `H`'s detection events, for the monolithic solve. Untouched
+    /// unless `verify_component_decomposition` is on.
+    std::vector<uint64_t> verify_dets;
+    /// §M2.9.6 measurement 4, over the component being solved. Only touched when
+    /// `collect_harvest_diagnostics` is set.
     TimelineDepthModel depth_model;
 
     void finish_construction(const char* ball_artifact_path);
-    /// `harvest_on_h(mwpm, h_dets, status)` decides what to do with the solved timeline: the
-    /// verification entry points always harvest in full, the production ones branch on the status.
+
+    /// `harvest_component(mwpm, dets, status)` decides what to do with one solved component: the
+    /// verification entry points always harvest it in full, the production ones extract a
+    /// `COMPLETE` component and abandon a `TRUNCATED` one.
     ///
-    /// `allow_prune` is what keeps §A off the verification path: only the production entry points
-    /// pass true, and even they defer to `BallConfig::prune_component_max_size`.
-    template <typename HarvestOnH>
+    /// `want_pairs` asks for the committed pairs in `G`'s ids; the caller's harvest lambda is the
+    /// one that fills `match_edge_scratch`, and this maps and drains it per component.
+    template <typename HarvestComponent>
     Phase1Outcome decode_impl(
-        const std::vector<uint64_t>& dets, BallProfile* prof, bool allow_prune, const HarvestOnH& harvest_on_h);
-    /// §A's small-component resolver, run over every component of `h` of size `<= k`, and §A.4's
-    /// induced sub-graph over what is left.
+        const std::vector<uint64_t>& dets,
+        BallProfile* prof,
+        bool want_pairs,
+        const HarvestComponent& harvest_component);
+
+    /// Solves the component sitting in `arena.split.sub` on `h_mwpm` and returns its status —
+    /// so the caller's `build_component_subgraph` is what selects which component this is. Fills
+    /// `harvest` through the caller's lambda; leaves the instance reset and ready for the next
+    /// component either way.
+    template <typename HarvestComponent>
+    TimelineStatus solve_component(
+        BallProfile* prof, const HarvestComponent& harvest_component, HarvestResult& harvest);
+
+    /// Turns the component instance's `CompressedEdge`s into `CommittedPair`s over `G` — ball entry
+    /// and all — and appends them to `committed_pair_scratch`. Called once per component, while
+    /// `arena.split.sub` is still that component's sub-`H`.
+    void drain_component_match_edges();
+
+    /// §2.5. The monolithic solve on the whole of `H`, on `verify_mwpm`, compared against what the
+    /// per-component path produced. Called only under `verify_component_decomposition`, and after
+    /// the per-component path has finished with its own instance.
     ///
-    /// Returns the graph the solver should be handed: the sub-`H` over the SOLVER set, or `h`
-    /// itself when nothing was resolved away (in which case no copy is made). Accumulates the
-    /// committed observables and weight into `resolved`, the committed pairs into `resolved_pairs`,
-    /// and counts the components with no feasible matching.
-    ///
-    /// **Untimed by construction** — no timer is started here and none may be added. It is a serial
-    /// pre-pass on the critical path, outside this branch's reported latency by scope.
-    const BallGraph& resolve_small_components(
-        const BallGraph& h, pm::MatchingResult& resolved, SmallCommitCounts& counts);
-    /// Turns harvest's `CompressedEdge`s over the solved graph into `CommittedPair`s over `G`, ball
-    /// entry and all, and merges in §A's trivially committed pairs. Shared by the verification and
-    /// production match-edge entry points.
-    void map_match_edges_to_committed_pairs(std::vector<CommittedPair>& committed_pairs) const;
+    /// `full_harvest` says whether the per-component side harvested every component in full, which
+    /// is what makes the residual set and `num_trees` comparable. `committed_comparable` says
+    /// whether it took the **obs** flavour: the match-edges flavour leaves
+    /// `HarvestResult::committed` untouched by design — the pairs go to the caller's vector instead
+    /// — so comparing it there would compare a real weight against an unfilled zero. On that
+    /// flavour the weight check falls back to `dual_sum_at_truncation`, which both flavours do
+    /// fill, and which is the same reduction over the same regions.
+    void verify_decomposition(const Phase1Outcome& outcome, bool full_harvest, bool committed_comparable);
     /// Asserts §M2.6 level 1 against M1 on `G`. `actual_pairs` may be null when the caller took the
     /// obs flavour, in which case the committed *pair set* is not part of the comparison.
     void verify_level1(

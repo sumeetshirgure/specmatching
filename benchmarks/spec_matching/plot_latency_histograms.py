@@ -88,6 +88,17 @@ one curve per `(k, T)`, which is what comparing `k` values means here. This scri
 and never was: it is a serial pre-pass on the critical path, outside the profiler's measurement
 scope by intent, which the caption states rather than leaves to be assumed.
 
+**The `k` experiment is over.** The lookup-table resolver `k` selected was deleted: it decided a
+component by a static primal question where the solver asks a dynamic dual-certified one, so the
+escalation rate depended on the threshold and the output was not exact MWPM. Every component is now
+decided by truncated sparse blossom run on it in isolation, whatever its size, and the profiler
+writes `k = 0` into every header. The `k` machinery below is therefore only good for **reading logs
+written before that change**, where the label is real; on a current log every curve is `k = 0` and
+the overlay degenerates to one curve per `T`. Nothing here was rewritten for the per-component
+decode — the latency profiler is deferred work — so treat this script as a reader for the old
+artifacts and take the escalation rate `q` and the structure of `H` from `sparse_graph_stats`
+instead, which measures them directly.
+
 The same numbers also go to a text table — `latency_speedups.txt`, written into the same directory as
 the figures — so the run is readable without opening an image, and diffable between runs. `--table`
 prints that table to the terminal too.
