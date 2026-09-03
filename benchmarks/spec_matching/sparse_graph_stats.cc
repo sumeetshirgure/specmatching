@@ -136,6 +136,73 @@ const char* mode_name(BallGraphBuildMode mode) {
     return mode == BallGraphBuildMode::BITSET ? "BITSET" : "SCAN";
 }
 
+/// How wide the bar is drawn, in characters. Fixed rather than read off the terminal: the width is
+/// the one thing about the line that must not change while it is being redrawn in place.
+constexpr size_t PROGRESS_BAR_WIDTH = 24;
+
+/// The campaign's progress: a bar over the current cell's shots, and the cell's place in the grid.
+///
+/// **No ETA, and no shots-per-second.** Both would need an elapsed-time measurement, and this is the
+/// file whose whole claim is that it contains none — §5.4, and the clock-header grep the header
+/// paragraph commits to. A bar is worth drawing; it is not worth weakening that. Every number on
+/// this line is a ratio of the shot counts the loop already keeps, so it costs a division and
+/// touches no clock.
+///
+/// The bar is ASCII. `TERM` says whether control codes are safe, but it says nothing about whether
+/// the font behind the terminal has box-drawing glyphs, and a bar that renders as replacement
+/// characters is worse than one made of hashes.
+void draw_progress(
+    bool interactive, const char* label, size_t cell_index, size_t total_cells, size_t decoded, size_t cell_shots) {
+    double fraction = cell_shots ? (double)decoded / (double)cell_shots : 1.0;
+    if (!interactive) {
+        // A redirected run gets the counts without the bar: the bar carries no information the
+        // percentage does not, and it is the part that only means anything when it is redrawn.
+        std::fprintf(
+            stderr,
+            "[%zu/%zu] %s  %5.1f%%  %zu/%zu shots\n",
+            cell_index,
+            total_cells,
+            label,
+            100.0 * fraction,
+            decoded,
+            cell_shots);
+        std::fflush(stderr);
+        return;
+    }
+    char bar[PROGRESS_BAR_WIDTH + 1];
+    size_t filled = (size_t)(fraction * (double)PROGRESS_BAR_WIDTH);
+    for (size_t i = 0; i < PROGRESS_BAR_WIDTH; i++)
+        bar[i] = i < filled ? '#' : '.';
+    bar[PROGRESS_BAR_WIDTH] = '\0';
+    std::fprintf(
+        stderr,
+        "\r[%zu/%zu] %s  [%s] %5.1f%%  %zu/%zu shots\x1b[K",
+        cell_index,
+        total_cells,
+        label,
+        bar,
+        100.0 * fraction,
+        decoded,
+        cell_shots);
+    std::fflush(stderr);
+}
+
+/// What stands in for the bar while a cell is being set up.
+///
+/// The DEM, the ball tables and the decoder are all built before the first shot is sampled, and at
+/// `d = 17` and up that is long enough to look like a hang. This says which cell is being built, so
+/// the silence before the first batch has a name on it.
+void draw_setup(bool interactive, const char* label, size_t cell_index, size_t total_cells) {
+    std::fprintf(
+        stderr,
+        interactive ? "\r[%zu/%zu] %s  building DEM and ball tables...\x1b[K"
+                    : "[%zu/%zu] %s  building DEM and ball tables...\n",
+        cell_index,
+        total_cells,
+        label);
+    std::fflush(stderr);
+}
+
 Options parse_options(int argc, char** argv) {
     Options options;
     for (int i = 1; i < argc; i++) {
@@ -633,6 +700,11 @@ int main(int argc, char** argv) {
 
     bool interactive = stderr_is_terminal();
     bool ok = true;
+    // The grid the progress line counts against. The file bypass decodes one corpus and stops after
+    // the first cell (see the `stop` flag below), so its grid is one cell however long the `--d` and
+    // `--p` lists are.
+    size_t total_cells = options.dem_path.empty() ? options.distances.size() * options.error_rates.size() : 1;
+    size_t cell_index = 0;
     // The file bypass reads one corpus, not one per `(d, p)`; sweeping the labels over it would
     // write the same numbers under different names, so the first cell ends the run.
     bool stop = false;
@@ -645,6 +717,17 @@ int main(int argc, char** argv) {
             ShotSampler sampler;
             FileCorpus file_corpus;
             bool from_file = !options.dem_path.empty();
+            // Named before the DEM is built rather than after, so the setup line below has a label
+            // to carry. On the file path `--d` and `--p` are labels the binary was handed, not
+            // facts about the corpus, which is why they are not in this one.
+            cell_index++;
+            char label[160];
+            if (from_file) {
+                std::snprintf(label, sizeof(label), "corpus=file");
+            } else {
+                std::snprintf(label, sizeof(label), "d=%zu p=%g", distance, noise);
+            }
+            draw_setup(interactive, label, cell_index, total_cells);
             if (from_file) {
                 try {
                     file_corpus = read_file_corpus(options.dem_path, options.dets_path, options.shots);
@@ -663,12 +746,6 @@ int main(int argc, char** argv) {
                 log << "  generator_call=" << generator_call(distance, distance, noise) << "\n";
             }
             size_t cell_shots = from_file ? file_corpus.shots.size() : options.shots;
-            char label[160];
-            if (from_file) {
-                std::snprintf(label, sizeof(label), "corpus=file");
-            } else {
-                std::snprintf(label, sizeof(label), "d=%zu p=%g", distance, noise);
-            }
 
             // ---- §3.4 step 2. Ball tables once, at `T_max = max(T list)` and `R = 2 * T_max`.
             pm::Mwpm probe = pm::detector_error_model_to_mwpm(dem, NUM_DISTINCT_WEIGHTS, false);
@@ -702,6 +779,9 @@ int main(int argc, char** argv) {
             // ---- §3.4 steps 3-4. One batch of shots at a time, decoded once per `T`, so shot `i`
             // of `(d, p)` is the identical shot at every horizon.
             size_t decoded = 0;
+            // An empty bar before the first batch, so the setup line is replaced the moment setup
+            // ends rather than one batch later.
+            draw_progress(interactive, label, cell_index, total_cells, decoded, cell_shots);
             try {
                 while (decoded < cell_shots) {
                     size_t batch = std::min(SHOT_BATCH, cell_shots - decoded);
@@ -726,13 +806,7 @@ int main(int argc, char** argv) {
                     decoded += batch;
                     // Between batches, and to stderr: it lands in no measurement — there are none —
                     // and it keeps stdout clean for the one line this binary prints.
-                    std::fprintf(
-                        stderr,
-                        interactive ? "\r%s  %zu/%zu shots\x1b[K" : "%s  %zu/%zu shots\n",
-                        label,
-                        decoded,
-                        cell_shots);
-                    std::fflush(stderr);
+                    draw_progress(interactive, label, cell_index, total_cells, decoded, cell_shots);
                 }
             } catch (const std::exception& error) {
                 std::fprintf(stderr, "\n");
