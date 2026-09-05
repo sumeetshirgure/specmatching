@@ -202,6 +202,25 @@ if (NOT (MSVC))
 endif ()
 target_link_libraries(sparse_graph_stats libstim)
 
+# component_profiler: the per-component run-time profiler. Logs the run time of truncated sparse
+# blossom on every connected component of H, keyed by component size and by the component's own
+# COMPLETE/TRUNCATED status — one row per component, raw uncorrected nanoseconds. It changes no
+# decoder code and runs no escalation; it stops at the trigger. Not in the python wheel.
+#
+# Same three provenance defines as `sparse_graph_stats`, and for the same reason: the campaign
+# artifact has to record what produced it.
+add_executable(component_profiler benchmarks/spec_matching/component_profiler.cc ${SOURCE_FILES_NO_MAIN})
+target_include_directories(component_profiler PRIVATE ${CMAKE_CURRENT_LIST_DIR})
+target_compile_options(component_profiler PRIVATE ${ARCH_OPT})
+target_compile_definitions(component_profiler PRIVATE
+        SPECMATCHING_GIT_HASH="${SPECMATCHING_GIT_HASH}"
+        SPECMATCHING_BUILD_FLAGS="${SPECMATCHING_BUILD_FLAGS}"
+        SPECMATCHING_STIM_VERSION="${SPECMATCHING_STIM_VERSION}")
+if (NOT (MSVC))
+    target_link_options(component_profiler PRIVATE -pthread -O3)
+endif ()
+target_link_libraries(component_profiler libstim)
+
 add_library(libspecmatching ${SOURCE_FILES_NO_MAIN})
 set_target_properties(libspecmatching PROPERTIES PREFIX "")
 target_include_directories(libspecmatching PUBLIC src)
