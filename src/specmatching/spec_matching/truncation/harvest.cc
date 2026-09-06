@@ -448,7 +448,8 @@ HarvestResult Harvester::harvest_impl(
 /// certificate is the cheap independent check on the primal that the design keeps precisely because
 /// the escalation path has removed every other one.
 template <typename ExtractMatched>
-HarvestResult Harvester::extract_only_impl(pm::Mwpm& mwpm, const ExtractMatched& extract_matched) {
+HarvestResult Harvester::extract_only_impl(
+    pm::Mwpm& mwpm, const ExtractMatched& extract_matched, ResetPolicy reset) {
     counters.extract_only_harvests++;
     HarvestResult result;
     scratch.clear();
@@ -518,7 +519,11 @@ HarvestResult Harvester::extract_only_impl(pm::Mwpm& mwpm, const ExtractMatched&
     }
 
     assert(result.residual.empty() && result.num_trees == 0);
-    reset_for_next_shot(mwpm);
+    // `CALLER_RESETS` hands the instance back with the shot's state still on it, for a caller that
+    // needs the extraction measured — or scheduled — apart from the teardown. The caller owes the
+    // `reset_for_next_shot`; see `ResetPolicy`.
+    if (reset == ResetPolicy::RESET_BEFORE_RETURN)
+        reset_for_next_shot(mwpm);
     return result;
 }
 
@@ -758,26 +763,32 @@ HarvestResult Harvester::harvest_to_match_edges(
         });
 }
 
-HarvestResult Harvester::extract_only_to_obs(pm::Mwpm& mwpm, const std::vector<uint64_t>& detection_events) {
+HarvestResult Harvester::extract_only_to_obs(
+    pm::Mwpm& mwpm, const std::vector<uint64_t>& detection_events, ResetPolicy reset) {
     (void)detection_events;
     // Debug invariant 13a's second half, checked where the decision is acted on rather than only
     // where it is taken: the O(1) branch and the full sweep must agree, on every shot (§M3.3 X9).
     assert(!any_alternating_tree_survives(mwpm) && !any_alternating_tree_survives_by_sweep(mwpm));
     pm::MatchingResult committed;
-    HarvestResult result = extract_only_impl(mwpm, [&](pm::GraphFillRegion* region) {
-        committed += mwpm.shatter_blossom_and_extract_matches(region);
-    });
+    HarvestResult result = extract_only_impl(
+        mwpm,
+        [&](pm::GraphFillRegion* region) { committed += mwpm.shatter_blossom_and_extract_matches(region); },
+        reset);
     result.committed = committed;
     return result;
 }
 
 HarvestResult Harvester::extract_only_to_match_edges(
-    pm::Mwpm& mwpm, const std::vector<uint64_t>& detection_events, std::vector<pm::CompressedEdge>& match_edges) {
+    pm::Mwpm& mwpm,
+    const std::vector<uint64_t>& detection_events,
+    std::vector<pm::CompressedEdge>& match_edges,
+    ResetPolicy reset) {
     (void)detection_events;
     assert(!any_alternating_tree_survives(mwpm) && !any_alternating_tree_survives_by_sweep(mwpm));
-    return extract_only_impl(mwpm, [&](pm::GraphFillRegion* region) {
-        mwpm.shatter_blossom_and_extract_match_edges(region, match_edges);
-    });
+    return extract_only_impl(
+        mwpm,
+        [&](pm::GraphFillRegion* region) { mwpm.shatter_blossom_and_extract_match_edges(region, match_edges); },
+        reset);
 }
 
 HarvestResult harvest_to_obs(pm::Mwpm& mwpm, const std::vector<uint64_t>& detection_events) {

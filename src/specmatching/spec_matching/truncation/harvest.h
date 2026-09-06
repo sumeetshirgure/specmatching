@@ -174,6 +174,28 @@ struct HarvestCounters {
 /// Owns the scratch buffers, so keep one alive across shots. `tight_pairs_out`, when non-null,
 /// collects a `TightPairRecord` per tree-committed pair; it is a diagnostic and costs nothing when
 /// left null.
+/// Who calls `reset_for_next_shot` after an extract-only harvest.
+///
+/// The extraction and the reset are two different quantities and one of them is not on the shot's
+/// critical path: extraction produces the observable mask and weight that *are* the decoder's answer,
+/// while the reset prepares the instance for the **next** shot and nothing about this shot's answer
+/// depends on it. A latency profiler that has to report the two together therefore reports a
+/// critical path that a pipelined decoder — one that double-buffers its instances — would not pay.
+///
+/// They used to be inseparable: `extract_only_impl` ended in the reset unconditionally, so a caller
+/// that wanted the extraction alone had no way to ask for it. This is that way. The default is the
+/// old behaviour exactly, so every production call site is unchanged and unaffected.
+enum class ResetPolicy {
+    /// Leave the instance ready for the next shot before returning. The default, and what every
+    /// production caller wants.
+    RESET_BEFORE_RETURN,
+    /// Return with the shot's state still on the instance. **The caller must call
+    /// `reset_for_next_shot` itself** before anything else touches that instance — the next
+    /// `process_timeline_until_horizon` on it is undefined otherwise, because the flooder's queue
+    /// still holds the shot's leftover events and the node trackers still believe in them.
+    CALLER_RESETS,
+};
+
 struct Harvester {
     HarvestScratch scratch;
     std::vector<TightPairRecord>* tight_pairs_out{nullptr};
@@ -216,13 +238,22 @@ struct Harvester {
     ///
     /// **The full harvest above stays compiled in and is the oracle** (§M3.3 X8, and §M2.6 level 1
     /// still runs against it): deleting it would delete what licenses this.
-    HarvestResult extract_only_to_obs(pm::Mwpm& mwpm, const std::vector<uint64_t>& detection_events);
+    ///
+    /// `reset` says who runs the trailing `reset_for_next_shot`; see `ResetPolicy`. The default
+    /// leaves the behaviour exactly as it was.
+    HarvestResult extract_only_to_obs(
+        pm::Mwpm& mwpm,
+        const std::vector<uint64_t>& detection_events,
+        ResetPolicy reset = ResetPolicy::RESET_BEFORE_RETURN);
     HarvestResult extract_only_to_match_edges(
-        pm::Mwpm& mwpm, const std::vector<uint64_t>& detection_events, std::vector<pm::CompressedEdge>& match_edges);
+        pm::Mwpm& mwpm,
+        const std::vector<uint64_t>& detection_events,
+        std::vector<pm::CompressedEdge>& match_edges,
+        ResetPolicy reset = ResetPolicy::RESET_BEFORE_RETURN);
 
    private:
     template <typename ExtractMatched>
-    HarvestResult extract_only_impl(pm::Mwpm& mwpm, const ExtractMatched& extract_matched);
+    HarvestResult extract_only_impl(pm::Mwpm& mwpm, const ExtractMatched& extract_matched, ResetPolicy reset);
     template <typename ExtractMatched, typename ExtractExposed>
     HarvestResult harvest_impl(
         pm::Mwpm& mwpm,

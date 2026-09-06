@@ -27,8 +27,12 @@
 /// `system` is defined by that and by nothing else (hard constraint 6), and every table derived
 /// from `shots.csv` computes it from those two lines.
 ///
-/// **Exactness is untouched** (hard constraint 1). Nothing under `src/specmatching/` is edited,
-/// read-only or otherwise. What changes between `k = 1` and `k = 8` is *which instance solves which
+/// **Exactness is untouched.** The one edit under `src/specmatching/` is the `ResetPolicy` parameter
+/// on `Harvester::extract_only_to_*` described below; it defaults to the previous behaviour, changes
+/// no production call site, and moves no work — it only lets a caller choose where the teardown
+/// runs. The solve, the extraction and the escalating set are exactly as they were.
+///
+/// What changes between `k = 1` and `k = 8` is *which instance solves which
 /// set of components*, and the escalation predicate is invariant under that: a core's timeline is
 /// the disjoint union of its components' timelines, so the core truncates at `T` iff at least one
 /// of its components does, and `any core TRUNCATED` is the same predicate as `any component
@@ -79,10 +83,15 @@
 ///    ball `entry`. And a core that did not rebuild has no instance to solve on, so leaving the
 ///    rebuild in no region at all would make the critical path omit work the core provably does.
 ///    The dets fill — `dets_c = 0..n_c-1` — is in `build_c` for the same reason.
-///  - **`extract_c` contains `reset_for_next_shot`.** `extract_only_to_obs` ends in it and the two
-///    cannot be separated without a decoder change, which hard constraint 1 forbids. So on a
-///    `COMPLETE` core the post-extraction reset is inside the region, and it is named here rather
-///    than netted out.
+///  - **`extract_c` is the extraction alone — `reset_for_next_shot` is outside it.** Extraction
+///    produces the observable mask and the weight, which are the decoder's answer; the reset
+///    prepares the instance for the *next* shot, and nothing about this shot's answer depends on it,
+///    so a pipelined decoder that double-buffered its instances would not pay it here. The two used
+///    to be inseparable — `extract_only_impl` ended in the reset unconditionally — so this is a
+///    **decoder change**: `Harvester::extract_only_to_*` now takes a `ResetPolicy`, defaulting to the
+///    old behaviour so every production call site is untouched, and this profiler passes
+///    `CALLER_RESETS` and runs the reset itself on the far side of the second clock read. The reset
+///    still happens, in the same place in the same order; it is charged to no column.
 ///  - **`abandon_shot` is outside every region**, on the `TRUNCATED` branch, as the design asks. It
 ///    is `Mwpm::reset`, which sweeps the instance's whole node vector — and these instances are
 ///    sized for the full `H` — so a region containing it would be priced by `n_max` rather than by
@@ -136,7 +145,7 @@
 ///
 /// ## Usage
 ///
-///   load_balancer_profiler [--d 5,7,9] [--p 1e-3,5e-4] [--T 1.5,2] [--k 1,2,4,8] [--alpha 1.1]
+///   load_balancer_profiler [--d 5,7,9] [--p 1e-3,5e-4] [--T 1.5,2] [--k 1,2,4,8] [--alpha 1]
 ///                          [--shots N] [--warmup 1000] [--seed S] [--verify]
 ///                          [--check-determinism] [--out DIR]
 ///
@@ -208,7 +217,10 @@ struct Options {
     std::vector<double> error_rates = {1e-3};
     std::vector<double> horizons = {1.5, 2.0};
     std::vector<size_t> core_counts = {1, 2, 4, 8};
-    double alpha = 1.1;
+    /// The balancer's cost exponent, `cost(s) = s^alpha`. The design's §3.2 specifies a default of
+    /// 1.1, fitted to per-component solve time; this tree defaults to **1.0** — a linear cost model —
+    /// on instruction. `run.log` records whichever value a run actually used.
+    double alpha = 1.0;
     size_t shots = 10000;
     size_t warmup = 1000;
     uint64_t seed = 20260906;
@@ -934,13 +946,21 @@ struct CellRunner {
             TimelineStatus status = process_timeline_until_horizon(load.instance.mwpm, load.dets, decoder->horizon);
             uint64_t solve_ended = tick();
 
-            // ---- `extract_c`, on a completed core only. This region contains
-            // `reset_for_next_shot`, which `extract_only_to_obs` ends in and which cannot be split
-            // off without a decoder change.
+            // ---- `extract_c`, on a completed core only, and **the extraction alone**: the
+            // observable mask and the weight, which are the decoder's answer for this core.
+            //
+            // `ResetPolicy::CALLER_RESETS` keeps `reset_for_next_shot` out of the region. That reset
+            // prepares the instance for the *next* shot and nothing about this shot's answer depends
+            // on it, so a pipelined decoder that double-buffered its instances would not pay it on
+            // this critical path. It still runs, in the same place in the same order, immediately
+            // below — it is simply on the far side of the second clock read.
             uint64_t extract_ended = solve_ended;
             if (status == TimelineStatus::COMPLETE) {
-                load.part = load.harvester.extract_only_to_obs(load.instance.mwpm, load.dets);
+                load.part = load.harvester.extract_only_to_obs(
+                    load.instance.mwpm, load.dets, ResetPolicy::CALLER_RESETS);
                 extract_ended = tick();
+                // The debt `CALLER_RESETS` incurs, paid before anything else touches the instance.
+                reset_for_next_shot(load.instance.mwpm);
             } else {
                 // Outside every region, as the design asks: `abandon_shot` is `Mwpm::reset`, which
                 // sweeps the instance's entire node vector, and these instances are sized for the
@@ -1505,15 +1525,25 @@ int main(int argc, char** argv) {
            " then BallMwpm::rebuild (which is where H's observable masks are written), then the"
            " detection-event fill dets_c = 0..n_c-1\n";
     log << "timed_region_solve_c=process_timeline_until_horizon(instance_c, dets_c, T_int) ONLY\n";
-    log << "timed_region_extract_c=extract_only_to_obs(instance_c, dets_c) on a COMPLETE core only."
-           " It ends in reset_for_next_shot, which cannot be separated from it without a decoder"
-           " change, so that reset is INSIDE this region and is named here rather than netted out.\n";
+    log << "timed_region_extract_c=extract_only_to_obs(instance_c, dets_c, CALLER_RESETS) on a"
+           " COMPLETE core only - the EXTRACTION ALONE (the observable mask and the weight)."
+           " reset_for_next_shot is OUTSIDE this region: it prepares the instance for the next shot"
+           " and this shot's answer does not depend on it, so a pipelined decoder that"
+           " double-buffered its instances would not pay it on this critical path. It still runs, in"
+           " the same place in the same order, immediately after the region closes.\n";
     log << "timed_region_combine=XOR of the k partial observable masks, sum of the k partial"
            " weights, OR of the k truncation flags\n";
     log << "timed_region_fallback=pm::decode_detection_events on G from the FULL syndrome, on its"
            " own instance, run on every shot (not only escalating ones)\n";
-    log << "untimed=abandon_shot (Mwpm::reset) on a TRUNCATED core; the fallback's obs buffer fill"
-           " and weight reset; the --verify cross-check\n";
+    log << "untimed=reset_for_next_shot after extraction on a COMPLETE core; abandon_shot"
+           " (Mwpm::reset) on a TRUNCATED core; the fallback's obs buffer fill and weight reset; the"
+           " --verify cross-check\n";
+    log << "decoder_change=Harvester::extract_only_to_obs / extract_only_to_match_edges take a"
+           " ResetPolicy, defaulting to RESET_BEFORE_RETURN (the previous behaviour, so every"
+           " production call site is unchanged). This binary passes CALLER_RESETS and runs"
+           " reset_for_next_shot itself, outside the timed region. Nothing else under"
+           " src/specmatching/ is edited; the solve, the extraction and the escalating set are"
+           " unchanged.\n";
     log << "empty_core_policy=a core with no components assigned does no work and opens no timer;"
            " its build/solve/extract ticks are 0 and it contributes nothing to the makespan\n";
     log << "timer_reads_per_measured_shot=2 (uf) + 2 (balance) + 4 per non-empty core + 2 (combine)"
@@ -1552,8 +1582,9 @@ int main(int argc, char** argv) {
     log << "warmup_shots_per_cell=" << options.warmup << " (run and discarded)\n";
     log << "T_unit=one lattice edge weight (the median discretised edge of G, in DEM float units);"
            " each cell below records T, T_weight_units and T_int\n";
-    log << "decoder_unchanged=1 (nothing under src/specmatching/ is edited; the vendored solver, "
-           "escalate.{h,cc} and the sub-H construction are used as they are)\n";
+    log << "decoder_otherwise_unchanged=1 (apart from the ResetPolicy parameter recorded above,"
+           " nothing under src/specmatching/ is edited; the vendored solver, escalate.{h,cc} and the"
+           " sub-H construction are used as they are)\n";
 
     if (!thread_scoped) {
         log << "WARNING: no thread-scoped clock was available, so every tick on this run includes"
