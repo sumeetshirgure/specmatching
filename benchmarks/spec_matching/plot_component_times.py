@@ -919,8 +919,10 @@ class Panel:
         parts.append(
             f"{self.rows:,} component solves over {len(self.pooled_agg):,} distinct component "
             f"sizes, {self.pooled_agg['comp_size'].min()} to {self.pooled_agg['comp_size'].max()}. "
-            f"One raw row is one connected component of H, timed around sub-H construction, the "
-            f"truncated solve to the horizon, and the harvest; escalation is neither run nor timed."
+            f"One raw row is one connected component of H, timed around the truncated solve to the "
+            f"horizon alone -- the sub-H construction ahead of it and the teardown behind it run on "
+            f"the production path but are outside the region and in no column. Escalation is "
+            f"neither run nor timed."
         )
         if args.overhead_used:
             parts.append(

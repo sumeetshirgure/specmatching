@@ -24,17 +24,48 @@
 ///
 /// ## What is timed (§1)
 ///
-/// One timer pair per component, around the existing per-component path and nothing else:
+/// One timer pair per component, around **the solve and nothing else**:
 ///
 /// ```
+///     build_component_subgraph(H, split, c)          // sub-H(C)           §2.4    NOT timed
+///     h_mwpm.rebuild(tables, sub, arena)             // the instance on it §2.3    NOT timed
+///     fill h_dets_scratch                            // the defect list            NOT timed
 ///   t0 = hires_now_ns()
-///     build_component_subgraph(H, split, c)          // sub-H(C)              §2.4
-///     h_mwpm.rebuild(tables, sub, arena)             // the instance on it    §2.3
 ///     process_timeline_until_horizon(instance, dets_C, T_int)
-///     if COMPLETE: extract_only_to_obs(...)          // extract obs and weight
 ///   t1 = hires_now_ns()
-///   if TRUNCATED: abandon_shot(instance)             // instance.reset(), NOT timed
+///     if COMPLETE:  extract_only_to_obs(...)         // extract obs and weight   NOT timed
+///     if TRUNCATED: abandon_shot(instance)           // instance.reset()         NOT timed
 /// ```
+///
+/// The construction ahead of the region runs exactly as before and in the same order — the workload
+/// a row sits in the middle of is the production one — but it is not charged to the row, because it
+/// is not the solve and at the sizes this table is about it dominates the solve.
+/// `build_component_subgraph` and `BallMwpm::rebuild` are graph *construction*: `rebuild` clears
+/// four vectors per node, appends `2|E|` directed adjacency records — each one XOR-ing an observable
+/// mask out of a scattered CSR slice of the ball tables — and resizes a fourth parallel array per
+/// node. Stock builds its matching graph once, ever; this path rebuilds one per component per shot,
+/// so a region containing it reports the cost of *preparing* a component rather than of solving one.
+///
+/// The teardown is **outside**, on both branches, and it appears in no column of `components.csv`.
+/// It is not a property of the component. `abandon_shot` is `Mwpm::reset`, which sweeps the
+/// flooder's entire node vector and destroys both arenas; that vector is `BallMwpm::capacity` long,
+/// and `capacity` is a **high-water mark over the whole `(d, p)` pair** — `BallMwpm::rebuild` only
+/// ever grows it, and one `BallDecoder` serves every component of every shot of both horizons. So a
+/// row that included the teardown would be priced by the largest component the cell ever saw rather
+/// than by its own, and where `H` percolates — high `p`, large `T` — that term is the same size at
+/// `comp_size = 3` as at `comp_size = 1500` and buries the solve at every size. Two components of
+/// equal size sampled at different `p` would then differ by an order of magnitude for a reason that
+/// has nothing to do with either of them.
+///
+/// `extract_only_to_obs` ends in `reset_for_next_shot` and cannot be separated from it without a
+/// decoder change (§6.1), so it goes out with the teardown rather than being charged to the
+/// `COMPLETE` branch alone. That is also what keeps the two statuses comparable: both now report
+/// exactly `process_timeline_until_horizon` on the component, and a `COMPLETE` row and a
+/// `TRUNCATED` row at equal `comp_size` are the same measurement of two different outcomes.
+///
+/// The excluded work is real and the next component does wait for it. It is simply not this table's
+/// quantity, and it is not recoverable from this table — nothing here records it, per component or
+/// in aggregate. A reader who wants it has to measure it, not subtract it.
 ///
 /// Recorded with `t1 - t0`: `comp_size = |C|` and `status`. **Status is kept** because a truncated
 /// component runs to the horizon and its cost at a given size is a different quantity from a
@@ -45,6 +76,11 @@
 /// bracketing it, so the row would report the timer rather than the component. `run.log` records the
 /// cut as `min_logged_comp_size`; `components.csv` therefore holds no `comp_size` below it, and a
 /// consumer counting components per shot must not read it off this table.
+///
+/// A region this narrow — construction out in front of it, teardown out behind it — makes
+/// `timer_overhead_ns` a larger share of a small row than either of the wider ones would, so the
+/// correction the analysis applies matters more here, not less. `run.log` states the region verbatim
+/// as `timed_region=`, so a table cannot be read under the wrong one.
 ///
 /// The stock escalation is not run and not timed — `escalate_to_stock` is never called and this
 /// file does not include it. The profiler stops at the trigger. Observables and weights are
@@ -379,7 +415,9 @@ struct GrowEvents {
 ///
 /// Everything before the loop is `decode_impl`'s untimed preamble: the negative-weight preamble on
 /// `G`, the ball intersection that builds `H`, and the union-find that splits it. None of it is in
-/// any row — §1's region starts at sub-`H` construction for a component.
+/// any row, and neither is the per-component construction at the top of the loop body, nor the
+/// teardown at the bottom of it — §1's region opens and closes around
+/// `process_timeline_until_horizon` alone.
 ///
 /// `record` says whether the shot's rows are kept; a warm-up shot runs the identical path and
 /// throws them away, so it costs the same and touches the same buffers as a measured one.
@@ -403,8 +441,9 @@ void profile_shot(
 
     // A zero-defect shot decomposes into no components and therefore produces no rows (§4).
     for (size_t c = 0; c < split.num_components(); c++) {
-        // ---- §1. Two reads, and nothing between them but the per-component path.
-        uint64_t started = hires_now_ns();
+        // ---- Before the region. §1 puts the construction of sub-`H(C)` and of the instance on it
+        // outside the timed window: they run on the production path, in the production order, but a
+        // row is about the solve, not about the graph build that has to precede it.
         build_component_subgraph(h, split, c);
         decoder.h_mwpm.rebuild(decoder.tables, split.sub, decoder.arena, nullptr);
         // The component's nodes are `0..s-1` by construction, so its detection events are every
@@ -413,19 +452,23 @@ void profile_shot(
         decoder.h_dets_scratch.reserve(split.sub.num_nodes());
         for (size_t i = 0; i < split.sub.num_nodes(); i++)
             decoder.h_dets_scratch.push_back(i);
+
+        // ---- §1. Two reads, and nothing between them but the timeline. Both statuses therefore
+        // report the same function of the same component, and neither reports the instance.
+        uint64_t started = hires_now_ns();
         TimelineStatus status =
             process_timeline_until_horizon(decoder.h_mwpm.mwpm, decoder.h_dets_scratch, decoder.horizon);
+        uint64_t ended = hires_now_ns();
+
+        // ---- After the region, and unchanged: the instance still has to come back to a state the
+        // next component can rebuild onto, so the workload the next row sits in is the production
+        // one. It is simply not charged to any row — see §1 for why it cannot be.
         if (status == TimelineStatus::COMPLETE) {
             // §M3.4's production extraction: the observables and the weight, no harvest.
             part = decoder.harvester.extract_only_to_obs(decoder.h_mwpm.mwpm, decoder.h_dets_scratch);
-        }
-        uint64_t ended = hires_now_ns();
-
-        // ---- Outside the region. `abandon_shot` is `Mwpm::reset`, which §1 puts outside the timed
-        // window; a `COMPLETE` component was already left clean by the extraction's own
-        // `reset_for_next_shot`.
-        if (status == TimelineStatus::TRUNCATED)
+        } else {
             abandon_shot(decoder.h_mwpm.mwpm);
+        }
 
         split.status[c] = status == TimelineStatus::TRUNCATED ? BallComponentSplit::COMPONENT_TRUNCATED
                                                               : BallComponentSplit::COMPONENT_COMPLETE;
@@ -606,6 +649,12 @@ int main(int argc, char** argv) {
     log << "timer_is_thread_scoped=" << (thread_scoped ? 1 : 0) << "\n";
     log << "timer_overhead_ns=" << overhead_ns << " (10^6 back-to-back hires_now_ns() calls)\n";
     log << "rows_are_uncorrected=1 (ns is the raw delta; the analysis subtracts timer_overhead_ns)\n";
+    // Stated verbatim because it changed: rows once covered the per-component construction, and
+    // once the teardown as well, and the three tables are otherwise indistinguishable.
+    log << "timed_region=process_timeline_until_horizon ONLY; build_component_subgraph,"
+           " BallMwpm::rebuild, the detection-event fill and the teardown on both branches"
+           " (COMPLETE ? extract_only_to_obs : abandon_shot) run on the production path but are"
+           " OUTSIDE the region and are reported in no column of components.csv\n";
     log << "min_logged_comp_size=" << MIN_LOGGED_COMP_SIZE
         << " (components of size <= 2 are solved and timed as before but get no row: the timer overhead is of"
            " their own order, so their times are overhead rather than measurement)\n";
