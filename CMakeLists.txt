@@ -221,6 +221,27 @@ if (NOT (MSVC))
 endif ()
 target_link_libraries(component_profiler libstim)
 
+# load_balancer_profiler: the k-core critical-path latency of the decomposed H solve. Per shot it
+# unions H into components, spreads them over k solver cores by LPT under a size-only s^alpha cost
+# model, and logs uf + balance + max_c(build_c + solve_c + extract_c) + combine against the stock
+# decode on G. Single thread — no thread is ever spawned; the k-core figure is the max over serially
+# executed loads. It changes no decoder code and the escalating set is the same for every k, which
+# `--verify` checks shot by shot against the monolithic per-component path. Not in the python wheel.
+#
+# Same three provenance defines as its two companions, and for the same reason: the campaign
+# artifact has to record what produced it.
+add_executable(load_balancer_profiler benchmarks/spec_matching/load_balancer_profiler.cc ${SOURCE_FILES_NO_MAIN})
+target_include_directories(load_balancer_profiler PRIVATE ${CMAKE_CURRENT_LIST_DIR})
+target_compile_options(load_balancer_profiler PRIVATE ${ARCH_OPT})
+target_compile_definitions(load_balancer_profiler PRIVATE
+        SPECMATCHING_GIT_HASH="${SPECMATCHING_GIT_HASH}"
+        SPECMATCHING_BUILD_FLAGS="${SPECMATCHING_BUILD_FLAGS}"
+        SPECMATCHING_STIM_VERSION="${SPECMATCHING_STIM_VERSION}")
+if (NOT (MSVC))
+    target_link_options(load_balancer_profiler PRIVATE -pthread -O3)
+endif ()
+target_link_libraries(load_balancer_profiler libstim)
+
 add_library(libspecmatching ${SOURCE_FILES_NO_MAIN})
 set_target_properties(libspecmatching PROPERTIES PREFIX "")
 target_include_directories(libspecmatching PUBLIC src)
