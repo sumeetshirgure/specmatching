@@ -192,59 +192,84 @@ struct PreemptionProbe {
 /// and these are folded straight into the campaign accumulator instead. One instance is reused
 /// across shots, so a profiled shot allocates nothing for them either.
 ///
-/// **Unit.** The three weight histograms are binned in *sixteenths of the horizon* — bin `k` counts
-/// values in `[k * T / 16, (k + 1) * T / 16)`, and the last bin overflows — so all three share one
-/// axis and a plot can label it without knowing the normalising constant. `H`'s defect-defect edges
-/// are `<= 2T` by construction, which is exactly the last bin of `edge_weight_hist`.
+/// **Component size is the only per-component distribution.** The degree histogram and the two
+/// `H`-subgraph diameter histograms are gone, along with the adjacency and the all-pairs walks that
+/// filled them.
+///
+/// **Unit.** The two weight histograms are binned in *sixteenths of the horizon* — bin `k` counts
+/// values in `[k * T / 16, (k + 1) * T / 16)`, and the last bin overflows — so both share one axis
+/// and a plot can label it without knowing the normalising constant. `H`'s defect-defect edges are
+/// `<= 2T` by construction, which is exactly the last bin of `edge_weight_hist`.
 ///
 /// `edge_weight_hist` and `bcost_hist` are the two §C.2 accumulators `sparse_graph_stats`
-/// deliberately does not write (§3.5.2, "Not collected"). They stay here and stay filled, because
-/// the latency profiler still writes them; the `H`-structure profiler simply does not read them.
+/// deliberately does not write (§3.5.2, "Not collected"). They survived the cut to size-only
+/// component statistics because neither is keyed by component — one is per `H` edge, the other per
+/// defect — and the latency profiler still writes them.
 ///
 /// Filled outside every timed region, and never counted toward any reported latency.
 struct ComponentHistograms {
     static constexpr size_t BINS_PER_T = 16;
     /// Component sizes `0..31`, last bin overflowing. Bin 0 is always empty: a component has at
-    /// least one member. `--size-cap` moves this through `configure`.
+    /// least one member. `configure` moves this; `configure_uncapped` removes it.
     static constexpr size_t SIZE_HIST_BINS = 33;
-    /// `H`-node degrees, in the defect-defect adjacency alone. `--degree-cap` moves this.
-    static constexpr size_t DEGREE_HIST_BINS = 33;
     /// `w_int` over `H`'s defect-defect edges: `0 .. 2T`, which is the whole range.
     static constexpr size_t WEIGHT_HIST_BINS = 33;
     /// `bcost_int` over defects that have a boundary entry within `R`. Values past `2T` — legal,
     /// since `R >= 2 * T_max` — land in the overflow bin.
     static constexpr size_t BCOST_HIST_BINS = 33;
-    /// Weighted `H`-subgraph diameters: `0 .. 4T`, then overflow.
-    static constexpr size_t DIAMETER_HIST_BINS = 65;
-    /// Unweighted (hop) `H`-subgraph diameters, binned by count with the last bin overflowing. A
-    /// hop diameter is bounded by the component size, so this shares `--size-cap`'s scale.
-    static constexpr size_t HOP_DIAMETER_HIST_BINS = 33;
 
     std::vector<uint64_t> size_hist = std::vector<uint64_t>(SIZE_HIST_BINS, 0);
-    std::vector<uint64_t> degree_hist = std::vector<uint64_t>(DEGREE_HIST_BINS, 0);
     std::vector<uint64_t> edge_weight_hist = std::vector<uint64_t>(WEIGHT_HIST_BINS, 0);
     std::vector<uint64_t> bcost_hist = std::vector<uint64_t>(BCOST_HIST_BINS, 0);
-    std::vector<uint64_t> diameter_hist = std::vector<uint64_t>(DIAMETER_HIST_BINS, 0);
-    std::vector<uint64_t> hop_diameter_hist = std::vector<uint64_t>(HOP_DIAMETER_HIST_BINS, 0);
 
-    /// Moves the two count-binned caps of §3.3 (`--size-cap`, `--degree-cap`). The cap is the
-    /// **overflow bin**, so a cap of `c` gives `c + 1` bins and everything at or above `c` lands in
-    /// the last one — the `residual_size_hist` convention. Resizes and zeroes; two histogram sets
-    /// that are added together must have been configured the same way.
-    void configure(size_t size_cap, size_t degree_cap) {
+    /// Whether `size_hist` has an overflow bin at all.
+    ///
+    /// Set by `configure_uncapped`, and false everywhere else. It governs `size_hist` alone; the two
+    /// weight-binned histograms are ranged in multiples of the horizon, which is not a
+    /// component-size cap, and their last bin still overflows either way.
+    bool uncapped{false};
+
+    /// Moves the component-size cap. The cap is the **overflow bin**, so a cap of `c` gives `c + 1`
+    /// bins and everything at or above `c` lands in the last one — the `residual_size_hist`
+    /// convention. Resizes and zeroes; two histogram sets that are added together must have been
+    /// configured the same way.
+    void configure(size_t size_cap) {
+        uncapped = false;
         size_hist.assign(size_cap + 1, 0);
-        hop_diameter_hist.assign(size_cap + 1, 0);
-        degree_hist.assign(degree_cap + 1, 0);
+    }
+
+    /// Removes the component-size cap: `size_hist` grows to fit whatever it is handed, so bin `k`
+    /// counts exactly the size `k` at every `k` and there is no overflow bin to read past.
+    ///
+    /// This is what `sparse_graph_stats` configures. That binary's entire output is the component
+    /// size distribution, and a size above which components silently pile into one terminal bin is a
+    /// distribution with its tail cut off — the part the escalation rate is actually about.
+    /// Everything on a decode path keeps `configure`'s fixed bins, where the array is sized once and
+    /// never reallocates.
+    void configure_uncapped() {
+        uncapped = true;
+        // One bin, not none: an empty array would make `add` on an all-empty cell a special case
+        // for no gain.
+        size_hist.assign(1, 0);
+    }
+
+    /// Counts one component into `size_hist`: clamped into the overflow bin when capped, growing the
+    /// array when not.
+    inline void add_component_size(uint64_t size) {
+        if (uncapped) {
+            if (size >= size_hist.size())
+                size_hist.resize((size_t)size + 1, 0);
+            size_hist[(size_t)size]++;
+            return;
+        }
+        size_hist[count_bin(size, size_hist.size())]++;
     }
 
     /// Zeroes every bin without touching the buffers, so the next shot reuses the same storage.
     void clear() {
         std::fill(size_hist.begin(), size_hist.end(), (uint64_t)0);
-        std::fill(degree_hist.begin(), degree_hist.end(), (uint64_t)0);
         std::fill(edge_weight_hist.begin(), edge_weight_hist.end(), (uint64_t)0);
         std::fill(bcost_hist.begin(), bcost_hist.end(), (uint64_t)0);
-        std::fill(diameter_hist.begin(), diameter_hist.end(), (uint64_t)0);
-        std::fill(hop_diameter_hist.begin(), hop_diameter_hist.end(), (uint64_t)0);
     }
 
     /// The bin a weight-like quantity falls in, in sixteenths of `horizon`. A non-positive horizon
@@ -263,39 +288,51 @@ struct ComponentHistograms {
 
     void add(const ComponentHistograms& other) {
         auto add_bins = [](std::vector<uint64_t>& into, const std::vector<uint64_t>& from) {
-            // Two sets configured differently would silently drop or misalign bins, and the caps
-            // are a run-level choice that cannot change mid-campaign.
-            assert(into.size() == from.size() && "histogram sets were configured with different caps");
+            // Two sets configured differently would silently drop or misalign bins, and the range is
+            // a run-level choice that cannot change mid-campaign.
+            assert(into.size() == from.size() && "histogram sets were configured with different ranges");
             for (size_t i = 0; i < into.size(); i++)
                 into[i] += from[i];
         };
-        add_bins(size_hist, other.size_hist);
-        add_bins(degree_hist, other.degree_hist);
+        // Uncapped, two size histograms may legitimately differ in length — the one that saw the
+        // larger component has the longer array, and the shorter one is that array's prefix, because
+        // bin `k` means the size `k` in both. Capped, they still have to agree bin for bin.
+        assert(uncapped == other.uncapped && "an uncapped histogram set was added to a capped one");
+        assert(
+            (uncapped || size_hist.size() == other.size_hist.size()) &&
+            "histogram sets were configured with different caps");
+        if (other.size_hist.size() > size_hist.size())
+            size_hist.resize(other.size_hist.size(), 0);
+        for (size_t i = 0; i < other.size_hist.size(); i++)
+            size_hist[i] += other.size_hist[i];
         add_bins(edge_weight_hist, other.edge_weight_hist);
         add_bins(bcost_hist, other.bcost_hist);
-        add_bins(diameter_hist, other.diameter_hist);
-        add_bins(hop_diameter_hist, other.hop_diameter_hist);
     }
 };
 
-/// §2.6/§3.5.2's joint tables: how a component's `COMPLETE`/`TRUNCATED` status is distributed over
-/// its size, and over its hop diameter.
+/// §2.6/§3.5.2's joint table: how a component's `COMPLETE`/`TRUNCATED` status is distributed over
+/// its size.
 ///
 /// This is the table the whole branch exists to make readable — the status is now a per-component
 /// fact rather than a per-shot one, because every component is decided by its own truncated solve
-/// (§2). `hop_diameter` covers only the components a diameter was computed for; the rest are
-/// counted in `ComponentStats::diameter_uncomputed_components`.
+/// (§2). Size is the only key it is ever built on; the hop-diameter twin went with the diameters.
 struct ComponentStatusTable {
     /// Column 0 is `COMPLETE`, column 1 is `TRUNCATED`.
     static constexpr size_t STATUSES = 2;
     static constexpr size_t COMPLETE = 0;
     static constexpr size_t TRUNCATED = 1;
 
-    /// Row-major `[bin][status]`, with the last bin overflowing.
+    /// Row-major `[bin][status]`, with the last bin overflowing unless `uncapped`.
     std::vector<uint64_t> counts;
     size_t bins{0};
+    /// Whether the table grows to fit its key instead of clamping into a last bin. See
+    /// `ComponentHistograms::uncapped`, which `sparse_graph_stats` sets alongside this one — the
+    /// table is keyed by component size, so an overflow bin here cuts the tail off the same
+    /// distribution the size histogram reports.
+    bool uncapped{false};
 
     void configure(size_t bin_count) {
+        uncapped = false;
         bins = bin_count;
         counts.assign(bin_count * STATUSES, 0);
     }
@@ -304,17 +341,42 @@ struct ComponentStatusTable {
         table.configure(bin_count);
         return table;
     }
+    /// Removes the cap: bin `k` is exactly the size `k`, and rows appear as sizes are seen.
+    void configure_uncapped() {
+        configure(1);
+        uncapped = true;
+    }
+    static ComponentStatusTable growing() {
+        ComponentStatusTable table;
+        table.configure_uncapped();
+        return table;
+    }
     inline void add(size_t bin, size_t status) {
-        if (bins == 0)
-            return;
-        counts[std::min(bin, bins - 1) * STATUSES + status]++;
+        if (uncapped) {
+            // Rows are appended and the array is row-major, so a resize leaves every existing
+            // `[bin][status]` at the index it already had.
+            if (bin >= bins) {
+                bins = bin + 1;
+                counts.resize(bins * STATUSES, 0);
+            }
+        } else {
+            if (bins == 0)
+                return;
+            bin = std::min(bin, bins - 1);
+        }
+        counts[bin * STATUSES + status]++;
     }
     inline uint64_t at(size_t bin, size_t status) const {
         return counts[bin * STATUSES + status];
     }
     void add(const ComponentStatusTable& other) {
-        assert(bins == other.bins && "status tables were configured with different caps");
-        for (size_t i = 0; i < counts.size(); i++)
+        assert(uncapped == other.uncapped && "an uncapped status table was added to a capped one");
+        assert((uncapped || bins == other.bins) && "status tables were configured with different caps");
+        if (other.bins > bins) {
+            bins = other.bins;
+            counts.resize(bins * STATUSES, 0);
+        }
+        for (size_t i = 0; i < other.counts.size(); i++)
             counts[i] += other.counts[i];
     }
     void clear() {
@@ -352,25 +414,6 @@ struct ComponentStats {
     int num_trivial_components{0};
     int defects_in_trivial_components{0};
     int largest_component_size{0};
-
-    /// Weighted `H`-subgraph diameter, in integer time units. See `component_diameter` for what
-    /// "confined to the component" means and why it is not a `G` distance.
-    int max_component_diameter_wint{0};
-    /// Unweighted (hop) `H`-subgraph diameter, same confinement.
-    int max_component_hop_diameter{0};
-    /// Components too large for a diameter to be computed (§3.3's `--diameter-cap`).
-    int diameter_uncomputed_components{0};
-
-    /// Components with at least one member whose `bcost_int <= T_int`, i.e. with a legal boundary
-    /// match somewhere in them.
-    int num_boundary_touching_components{0};
-    /// Odd size, and no member with a boundary edge. These cannot be perfectly matched inside `T`
-    /// at all, so they truncate with certainty and give a per-shot lower bound on escalation
-    /// (§3.5.2).
-    int num_odd_components_without_boundary{0};
-    /// `H` nodes carrying a boundary edge. Equal to `h_boundary_edges` by construction — `H` gives
-    /// a node at most one — and reported as the node-side reading of the same fact.
-    int nodes_with_boundary_edge{0};
 
     /// `H`'s node count, i.e. the post-preamble defects the components partition. The denominator
     /// of every per-shot fraction of them.
@@ -587,11 +630,9 @@ struct SpecMatchingAggregateStats {
     /// §3.5.1 has its own numerator rather than an identity a refactor could quietly break.
     uint64_t sum_truncated_components_on_escalated{0};
 
-    /// §2.6/§3.5.2's joint tables, over the components of every analysed shot. Configured once per
-    /// campaign, beside the histograms, and defaulted to the same bins the histograms default to.
+    /// §2.6/§3.5.2's joint table, over the components of every analysed shot. Configured once per
+    /// campaign, beside the histogram, and defaulted to the same bins the histogram defaults to.
     ComponentStatusTable size_x_status = ComponentStatusTable::with_bins(ComponentHistograms::SIZE_HIST_BINS);
-    ComponentStatusTable hop_diameter_x_status =
-        ComponentStatusTable::with_bins(ComponentHistograms::HOP_DIAMETER_HIST_BINS);
 
     /// §3.5.2. Running sums over the shots that were analysed, and the distributions.
     ///
@@ -610,38 +651,33 @@ struct SpecMatchingAggregateStats {
     uint64_t sum_trivial_components{0};
     uint64_t sum_singleton_components{0};
     uint64_t sum_pair_components{0};
-    uint64_t sum_boundary_touching_components{0};
-    uint64_t sum_diameter_uncomputed_components{0};
     /// `H`'s node count summed over the analysed shots — the post-preamble defects, which is what
     /// the components actually partition, and not the raw detection-event count `sum_num_defects`.
     uint64_t sum_component_defects{0};
     uint64_t sum_defects_in_trivial_components{0};
     uint64_t sum_components_size_ge3{0};
-    uint64_t sum_odd_components_without_boundary{0};
-    uint64_t sum_nodes_with_boundary_edge{0};
-    /// Shots with at least one odd, boundary-less component. Those truncate with certainty, so this
-    /// is a lower bound on the escalating set read straight off `H`'s structure (§3.5.2).
-    uint64_t shots_with_odd_component_without_boundary{0};
-    /// Per-shot maxima, summed and maximised: the mean says what a typical shot's worst component
-    /// looks like, the max says what the worst shot of the campaign held.
+    /// Per-shot maxima, summed and maximised: the mean says what a typical shot's largest component
+    /// looks like, the max says what the largest shot of the campaign held.
     uint64_t sum_largest_component_size{0};
     uint64_t max_component_size{0};
-    uint64_t sum_max_component_diameter_wint{0};
-    uint64_t max_component_diameter_wint{0};
-    uint64_t sum_max_component_hop_diameter{0};
-    uint64_t max_component_hop_diameter{0};
     ComponentHistograms component_hist;
 
     void reset() {
         *this = SpecMatchingAggregateStats();
     }
 
-    /// Moves the caps of §3.3 onto the histograms and the joint tables together, so a campaign
+    /// Moves the component-size cap onto the histogram and the joint table together, so a campaign
     /// cannot end up with a `size_hist` and a `size_x_status` binned differently.
-    void configure_component_tables(size_t size_cap, size_t degree_cap) {
-        component_hist.configure(size_cap, degree_cap);
+    void configure_component_tables(size_t size_cap) {
+        component_hist.configure(size_cap);
         size_x_status.configure(size_cap + 1);
-        hop_diameter_x_status.configure(size_cap + 1);
+    }
+
+    /// Removes it from both, the same way and for the same reason. See
+    /// `ComponentHistograms::configure_uncapped`.
+    void configure_component_tables_uncapped() {
+        component_hist.configure_uncapped();
+        size_x_status.configure_uncapped();
     }
 
     /// §3.5.2's distributions for one shot, folded in. Called beside `accumulate` from the profiling
@@ -650,10 +686,9 @@ struct SpecMatchingAggregateStats {
         component_hist.add(histograms);
     }
 
-    /// §2.6/§3.5.2's joint tables for one shot, folded in beside the histograms.
-    void accumulate_component_status_tables(const ComponentStatusTable& size, const ComponentStatusTable& hop) {
+    /// §2.6/§3.5.2's joint table for one shot, folded in beside the histograms.
+    void accumulate_component_status_table(const ComponentStatusTable& size) {
         size_x_status.add(size);
-        hop_diameter_x_status.add(hop);
     }
 
     void accumulate(const SpecMatchingProfile& profile) {
@@ -728,27 +763,15 @@ struct SpecMatchingAggregateStats {
                 shots_with_component_defects++;
             if (components.solver_set_empty())
                 shots_solver_set_empty++;
-            if (components.num_odd_components_without_boundary > 0)
-                shots_with_odd_component_without_boundary++;
             sum_num_components += (uint64_t)components.num_components;
             sum_trivial_components += (uint64_t)components.num_trivial_components;
             sum_singleton_components += (uint64_t)components.num_singleton_components;
             sum_pair_components += (uint64_t)components.num_pair_components;
             sum_components_size_ge3 += (uint64_t)components.num_components_size_ge3;
-            sum_boundary_touching_components += (uint64_t)components.num_boundary_touching_components;
-            sum_odd_components_without_boundary += (uint64_t)components.num_odd_components_without_boundary;
-            sum_nodes_with_boundary_edge += (uint64_t)components.nodes_with_boundary_edge;
-            sum_diameter_uncomputed_components += (uint64_t)components.diameter_uncomputed_components;
             sum_defects_in_trivial_components += (uint64_t)components.defects_in_trivial_components;
             sum_component_defects += (uint64_t)components.component_defects;
             sum_largest_component_size += (uint64_t)components.largest_component_size;
             max_component_size = std::max(max_component_size, (uint64_t)components.largest_component_size);
-            sum_max_component_diameter_wint += (uint64_t)components.max_component_diameter_wint;
-            max_component_diameter_wint =
-                std::max(max_component_diameter_wint, (uint64_t)components.max_component_diameter_wint);
-            sum_max_component_hop_diameter += (uint64_t)components.max_component_hop_diameter;
-            max_component_hop_diameter =
-                std::max(max_component_hop_diameter, (uint64_t)components.max_component_hop_diameter);
         }
     }
 };
@@ -832,19 +855,6 @@ struct SpecMatchingSummary {
     double mean_components_size_ge3{0};
     double mean_largest_component_size{0};
     double max_component_size{0};
-    double mean_max_component_diameter_wint{0};
-    double max_component_diameter_wint{0};
-    double mean_max_component_hop_diameter{0};
-    double max_component_hop_diameter{0};
-    double boundary_touching_component_fraction{0};
-    double diameter_uncomputed_component_fraction{0};
-    /// §3.5.2's certain-truncation lower bound: components that are odd and have no member with a
-    /// boundary edge cannot be perfectly matched within `T` at all. `odd_component_without_boundary_rate`
-    /// is over the analysed shots, and is a lower bound on `q` read off `H`'s structure alone.
-    double odd_components_without_boundary_fraction{0};
-    double odd_component_without_boundary_rate{0};
-    /// Mean `H` nodes carrying a boundary edge, per analysed shot.
-    double mean_nodes_with_boundary_edge{0};
     /// How much of the defect set sits in a component of size `<= 2`, over `H`'s nodes summed across
     /// the analysed shots. Purely structural: after §2 every defect goes to the solver, so there is
     /// no companion "fraction the solver would still have had to take" — it is 1 by construction.
@@ -859,15 +869,11 @@ struct SpecMatchingSummary {
     /// carried alongside so a plot can label the axis without restating the convention.
     uint64_t weight_hist_bins_per_T{ComponentHistograms::BINS_PER_T};
     std::vector<uint64_t> component_size_hist;
-    std::vector<uint64_t> component_diameter_hist;
-    std::vector<uint64_t> component_hop_diameter_hist;
-    std::vector<uint64_t> h_degree_hist;
     std::vector<uint64_t> h_edge_weight_hist;
     std::vector<uint64_t> boundary_cost_hist;
-    /// §2.6's `size x status` table, and its hop-diameter twin. Row-major `[bin][status]` with
-    /// `status` 0 = `COMPLETE`, 1 = `TRUNCATED`, last bin overflowing.
+    /// §2.6's `size x status` table. Row-major `[bin][status]` with `status` 0 = `COMPLETE`,
+    /// 1 = `TRUNCATED`, last bin overflowing unless the campaign configured it uncapped.
     ComponentStatusTable size_x_status;
-    ComponentStatusTable hop_diameter_x_status;
 };
 
 inline double percentile_of(std::vector<long long> values, double fraction) {
@@ -949,42 +955,24 @@ inline SpecMatchingSummary summarize(const SpecMatchingAggregateStats& stats) {
             (double)stats.shots_solver_set_empty / (double)stats.shots_with_component_defects;
     }
     summary.max_component_size = (double)stats.max_component_size;
-    summary.max_component_diameter_wint = (double)stats.max_component_diameter_wint;
-    summary.max_component_hop_diameter = (double)stats.max_component_hop_diameter;
     if (stats.shots_with_component_stats) {
         double analysed = (double)stats.shots_with_component_stats;
         summary.mean_components = (double)stats.sum_num_components / analysed;
         summary.mean_singleton_components = (double)stats.sum_singleton_components / analysed;
         summary.mean_pair_components = (double)stats.sum_pair_components / analysed;
         summary.mean_components_size_ge3 = (double)stats.sum_components_size_ge3 / analysed;
-        summary.mean_nodes_with_boundary_edge = (double)stats.sum_nodes_with_boundary_edge / analysed;
-        summary.odd_component_without_boundary_rate =
-            (double)stats.shots_with_odd_component_without_boundary / analysed;
-        // Both are per-shot maxima, so their means are "the typical shot's worst", not a mean over
-        // components — the histograms beside them are what describes the population.
+        // A per-shot maximum, so its mean is "the typical shot's largest", not a mean over
+        // components — the histogram beside it is what describes the population.
         summary.mean_largest_component_size = (double)stats.sum_largest_component_size / analysed;
-        summary.mean_max_component_diameter_wint = (double)stats.sum_max_component_diameter_wint / analysed;
-        summary.mean_max_component_hop_diameter = (double)stats.sum_max_component_hop_diameter / analysed;
-    }
-    if (stats.sum_num_components) {
-        double components = (double)stats.sum_num_components;
-        summary.boundary_touching_component_fraction = (double)stats.sum_boundary_touching_components / components;
-        summary.diameter_uncomputed_component_fraction = (double)stats.sum_diameter_uncomputed_components / components;
-        summary.odd_components_without_boundary_fraction =
-            (double)stats.sum_odd_components_without_boundary / components;
     }
     if (stats.sum_component_defects) {
         double defects = (double)stats.sum_component_defects;
         summary.frac_defects_in_trivial_components = (double)stats.sum_defects_in_trivial_components / defects;
     }
     summary.component_size_hist = stats.component_hist.size_hist;
-    summary.component_diameter_hist = stats.component_hist.diameter_hist;
-    summary.component_hop_diameter_hist = stats.component_hist.hop_diameter_hist;
-    summary.h_degree_hist = stats.component_hist.degree_hist;
     summary.h_edge_weight_hist = stats.component_hist.edge_weight_hist;
     summary.boundary_cost_hist = stats.component_hist.bcost_hist;
     summary.size_x_status = stats.size_x_status;
-    summary.hop_diameter_x_status = stats.hop_diameter_x_status;
     return summary;
 }
 

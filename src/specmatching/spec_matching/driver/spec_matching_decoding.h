@@ -93,9 +93,6 @@ struct SpecMatchingConfig {
     /// closed, and charged to no latency number: see `BallConfig::collect_component_stats`. Ignored
     /// without `phase1_on_ball_graph`, where there is no `H` to decompose.
     bool collect_component_stats{true};
-    /// §3.3's `--diameter-cap`: components above this size are counted rather than measured. See
-    /// `BallConfig::diameter_cap`.
-    uint32_t diameter_cap{MAX_DIAMETER_COMPONENT_SIZE};
 
     /// §2.5 — debug/bench: also run the monolithic solve on the whole of `H` and assert it agrees
     /// with the per-component one. Off by default. See `BallConfig::verify_component_decomposition`.
@@ -209,20 +206,18 @@ struct SpecMatchingDecoder {
     /// a weight. Discarded; the caller already has the observables by another route.
     std::vector<uint8_t> obs_sink;
     BallProfile ball_profile;
-    /// §3.5.2's distributions for the shot just decoded, and §2.6's joint tables. Refilled per shot
-    /// and folded into `stats` by `decode_batch`; a driver that decodes shot by shot instead reads
-    /// them here and calls `SpecMatchingAggregateStats::accumulate_component_histograms` and
-    /// `accumulate_component_status_tables` itself.
+    /// §3.5.2's distributions for the shot just decoded, and §2.6's size-by-status joint table.
+    /// Refilled per shot and folded into `stats` by `decode_batch`; a driver that decodes shot by
+    /// shot instead reads them here and calls
+    /// `SpecMatchingAggregateStats::accumulate_component_histograms` and
+    /// `accumulate_component_status_table` itself.
     ComponentHistograms component_histograms;
     ComponentStatusTable component_size_x_status =
         ComponentStatusTable::with_bins(ComponentHistograms::SIZE_HIST_BINS);
-    ComponentStatusTable component_hop_diameter_x_status =
-        ComponentStatusTable::with_bins(ComponentHistograms::HOP_DIAMETER_HIST_BINS);
 
-    /// Moves §3.3's `--size-cap` / `--degree-cap` onto this decoder's per-shot buffers and onto
-    /// `stats` together, so a campaign cannot end up with the per-shot and campaign tables binned
-    /// differently.
-    void configure_component_tables(size_t size_cap, size_t degree_cap);
+    /// Moves the component-size cap onto this decoder's per-shot buffers and onto `stats` together,
+    /// so a campaign cannot end up with the per-shot and campaign tables binned differently.
+    void configure_component_tables(size_t size_cap);
 
     /// The matching weight of a set of matched detection-event pairs: the sum of the shortest-path
     /// weights between them plus the graph's negative-weight offset.

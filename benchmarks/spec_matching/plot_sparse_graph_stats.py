@@ -36,8 +36,14 @@ Two notes on where the artifacts and the design doc differ, taken rather than pa
 
   * the doc says `benchmarks/two_phase/`; that directory is `benchmarks/spec_matching/` since the
     rename, and this file sits beside the binary that writes its inputs;
-  * `hists.json` nests the cells under a `"cells"` key beside a top-level `"caps"` block. Both the
-    nested and a bare `{"d=..,p=..,T=..": {...}}` mapping are accepted.
+  * `hists.json` nests the cells under a `"cells"` key beside top-level metadata. Both the nested
+    and a bare `{"d=..,p=..,T=..": {...}}` mapping are accepted.
+
+Component **size** is the only per-component statistic the binary writes, and nothing about it is
+capped: `component_size_hist` bin `k` counts the components of size exactly `k`, `size_x_status` row
+`k` is that same size, and neither has an overflow bin. The degree, hop-diameter and w_int-diameter
+figures are gone with the statistics behind them; an artifact written before that still carries
+those arrays and this script does not draw them.
 """
 
 from __future__ import annotations
@@ -69,12 +75,13 @@ from matplotlib.lines import Line2D  # noqa: E402
 matplotlib.rcParams["svg.hashsalt"] = "sparse_graph_stats"
 matplotlib.rcParams["figure.max_open_warning"] = 0
 
-#: The four histograms of §4.3, with the unit of one bin and what the bin counts are a fraction of.
+#: §4.3's histogram, with the unit of one bin and what the bin counts are a fraction of.
+#:
+#: One entry, because component size is the only per-component statistic the binary computes. The
+#: degree, hop-diameter and w_int-diameter panels went when those statistics were removed; an
+#: artifact written before that still carries the arrays and they are simply not drawn.
 HIST_KINDS = {
     "component_size_hist": ("component size", "count", "components"),
-    "degree_hist": ("H degree (defect-defect)", "count", "H nodes"),
-    "hop_diameter_hist": ("hop diameter", "count", "components"),
-    "wint_diameter_hist": ("w_int diameter", "T_int/16", "components"),
 }
 
 #: §4.2's scalars, as `(design name, csv mean column, csv max column)`.
@@ -82,13 +89,16 @@ STRUCTURE_SCALARS = [
     ("n_defects", "mean_n_defects", "max_n_defects"),
     ("h_edges", "mean_h_edges", "max_h_edges"),
     ("h_boundary_edges", "mean_h_boundary_edges", "max_h_boundary_edges"),
-    ("nodes_with_boundary_edge", "mean_nodes_with_boundary_edge", "max_nodes_with_boundary_edge"),
     ("num_components", "mean_num_components", "max_num_components"),
     ("largest_component_size", "mean_largest_component_size", "max_largest_component_size"),
 ]
 
-#: §4.4's grid summary reads `P(TRUNCATED | size)` at these bins. `-1` is the overflow bin.
-GRID_SIZE_BINS = [1, 2, 3, 4, -1]
+#: §4.4's grid summary reads `P(TRUNCATED | size)` at these sizes. `size_x_status` is uncapped, so
+#: there is no overflow row to read the tail off: the last panel sums every row from
+#: `GRID_TAIL_FROM` up instead, which is the same quantity the old overflow bin approximated and is
+#: exact rather than dependent on where a cap happened to sit.
+GRID_SIZE_BINS = [1, 2, 3, 4, "tail"]
+GRID_TAIL_FROM = 5
 
 MARKERS = ["o", "s", "^", "D", "v", "P", "X", "*"]
 
@@ -184,7 +194,6 @@ class Artifact:
 
     summary: pd.DataFrame
     cells: dict
-    caps: dict
     logs: list
     source_dirs: list
 
@@ -241,7 +250,6 @@ def load_artifacts(dirs) -> Artifact:
     """Reads every `--in` dir and concatenates them, asserting no `(d, p, T)` collision (§2)."""
     frames = []
     cells = {}
-    caps = {}
     logs = []
     owner = {}
     for directory in dirs:
@@ -268,17 +276,11 @@ def load_artifacts(dirs) -> Artifact:
         hists_path = directory / "hists.json"
         if hists_path.is_file():
             document = json.loads(hists_path.read_text())
-            # The binary nests the cells under "cells" beside a top-level "caps"; a bare mapping of
-            # cell keys is accepted too, since that is what §3 of the design describes.
+            # The binary nests the cells under "cells" beside top-level metadata; a bare mapping of
+            # cell keys is accepted too, since that is what §3 of the design describes. There is no
+            # cross-directory bin agreement to check: the size histogram is uncapped, so bin `k`
+            # means size `k` in every artifact whatever length the arrays happen to be.
             raw_cells = document.get("cells", document)
-            directory_caps = document.get("caps", {})
-            for name, value in directory_caps.items():
-                if name in caps and caps[name] != value:
-                    raise SystemExit(
-                        f"error: --in dirs disagree on {name} ({caps[name]} vs {value}); "
-                        "histograms binned differently cannot share an axis"
-                    )
-                caps[name] = value
             for raw_key, cell in raw_cells.items():
                 if not isinstance(cell, dict) or not raw_key.startswith("d="):
                     continue
@@ -295,7 +297,6 @@ def load_artifacts(dirs) -> Artifact:
     return Artifact(
         summary=summary,
         cells=cells,
-        caps=caps,
         logs=logs,
         source_dirs=[str(Path(directory)) for directory in dirs],
     )
@@ -318,7 +319,6 @@ def filter_artifact(artifact: Artifact, distances, rates, horizons) -> Artifact:
     return Artifact(
         summary=frame,
         cells={key: cell for key, cell in artifact.cells.items() if key in keys},
-        caps=artifact.caps,
         logs=artifact.logs,
         source_dirs=artifact.source_dirs,
     )
@@ -840,123 +840,6 @@ def figure_component_size_mix(artifact: Artifact, style: Style, horizon: float):
     )
 
 
-def figure_odd_component_lower_bound(artifact: Artifact, style: Style):
-    """§4.2 -- the odd-without-boundary rate on `q`'s own axes.
-
-    An odd component with no boundary edge cannot match within itself and has nowhere else to go, so
-    it truncates with certainty: the fraction of shots carrying one is a lower bound on `q`. Drawing
-    the two together is the whole point -- the gap between them is the escalation that structure
-    alone does not explain.
-    """
-    horizons = artifact.horizons()
-    figure, axes = panel_grid(len(horizons))
-    used_count_fallback = False
-    for axis, horizon in zip(axes, horizons):
-        panel = artifact.summary[artifact.summary["T"] == horizon]
-        for d in sorted(panel["d"].unique()):
-            series = panel[panel["d"] == d].sort_values("p")
-            colour = style.colour(d)
-            rates, denominators, is_rate = [], [], True
-            for _, row in series.iterrows():
-                value, denominator, kind = odd_component_measure(artifact, row)
-                rates.append(value)
-                denominators.append(denominator)
-                is_rate = is_rate and kind == "rate"
-            rates = np.asarray(rates, dtype=float)
-            denominators = np.asarray(denominators, dtype=float)
-            if is_rate:
-                lo, hi = wilson(np.round(rates * denominators), denominators)
-                plot_rate(
-                    axis,
-                    series["p"],
-                    rates,
-                    lo,
-                    hi,
-                    1.0 / np.where(denominators > 0, denominators, 1.0),
-                    colour,
-                    style.marker(horizon),
-                    f"d={fmt_d(d)} odd-no-boundary rate",
-                )
-            else:
-                used_count_fallback = True
-                axis.plot(
-                    series["p"],
-                    rates,
-                    marker=style.marker(horizon),
-                    color=colour,
-                    linewidth=1.2,
-                    label=f"d={fmt_d(d)} mean count",
-                )
-            # `q` beside it, in the same colour and dashed, so the bound and the thing it bounds are
-            # read off one axis.
-            plot_rate(
-                axis,
-                series["p"],
-                series["q"],
-                series["q_ci_lo"],
-                series["q_ci_hi"],
-                1.0 / series["shots"].astype(float),
-                colour,
-                style.marker(horizon),
-                f"d={fmt_d(d)} q",
-                linestyle="--",
-            )
-        axis.set_yscale("log")
-        log_x_rates(axis, sorted(panel["p"].unique()))
-        axis.set_xlabel("p")
-        axis.set_ylabel("rate" if not used_count_fallback else "rate / count")
-        axis.set_title(f"T = {fmt_t(horizon)}", fontsize=10)
-        axis.grid(True, which="major", alpha=0.25, linewidth=0.5)
-        axis.legend(fontsize=6, loc="best", ncol=2)
-        if used_count_fallback:
-            axis.text(
-                0.02,
-                0.98,
-                "no per-shot vector and no rate column:\nthe solid series is a mean COUNT, not a rate",
-                transform=axis.transAxes,
-                ha="left",
-                va="top",
-                fontsize=6,
-                color="0.35",
-            )
-        apply_floor_headroom(axis)
-    return finish(
-        figure,
-        "Shots with an odd component that has no boundary edge, and q",
-        "solid: fraction of defect-carrying shots with such a component (dashed: q, same colour); "
-        + FLOOR_SENTENCE,
-        footer_text(artifact),
-    )
-
-
-def odd_component_measure(artifact: Artifact, row):
-    """`(value, denominator, "rate"|"count")` for `num_odd_components_without_boundary`.
-
-    §4.2 asks for `mean(count > 0)` when the per-shot vector is in `hists.json`, and says to fall
-    back to the mean count otherwise. The binary also writes the same rate as a column, so that sits
-    between the two: it is the identical quantity over the identical denominator, read rather than
-    recomputed. Only when neither exists does the count get drawn, with the note §4.2 asks for.
-    """
-    cell = artifact.cell(row["d"], row["p"], row["T"])
-    per_shot = (cell or {}).get("per_shot")
-    if per_shot and "num_odd_components_without_boundary" in per_shot and "n_defects" in per_shot:
-        odd = np.asarray(per_shot["num_odd_components_without_boundary"], dtype=float)
-        defects = np.asarray(per_shot["n_defects"], dtype=float)
-        if odd.size == defects.size and odd.size:
-            # Restricted to shots with defects, which is the denominator the CSV's own means use.
-            non_empty = defects > 0
-            denominator = float(non_empty.sum())
-            if denominator > 0:
-                return float((odd[non_empty] > 0).sum()) / denominator, denominator, "rate"
-    if "odd_component_without_boundary_rate" in row.index and "shots_with_defects" in row.index:
-        return (
-            float(row["odd_component_without_boundary_rate"]),
-            float(row["shots_with_defects"]),
-            "rate",
-        )
-    return float(row.get("mean_odd_components_without_boundary", 0.0)), float(row.get("shots", 0)), "count"
-
-
 # ---------------------------------------------------------------------------------------------
 # §4.3 Histograms
 # ---------------------------------------------------------------------------------------------
@@ -965,33 +848,22 @@ def odd_component_measure(artifact: Artifact, row):
 def hist_bin_edges(kind: str, values, cell):
     """`(x centres, bar width, x label)` for one histogram.
 
-    Every kind but `wint_diameter_hist` is binned by count: bin `k` counts the value `k`, and the
-    last bin is the overflow. `wint_diameter_hist` is binned in sixteenths of `T_int`, so its axis is
-    put back into `w_int` units, which is what makes the `T_int` and `2*T_int` marks meaningful.
+    Binned by count with no overflow: bin `k` counts exactly the components of size `k`, and the
+    last bin is the largest size the cell saw rather than everything at or above a cap.
     """
-    n = len(values)
-    if kind == "wint_diameter_hist":
-        bins_per_t = 16
-        t_int = float(cell.get("T_int", 0) or 0)
-        if t_int > 0:
-            step = t_int / bins_per_t
-            centres = (np.arange(n, dtype=float) + 0.5) * step
-            return centres, step, "w_int diameter"
-        centres = np.arange(n, dtype=float)
-        return centres, 0.9, f"w_int diameter (T_int/{bins_per_t} bins; T_int unavailable)"
-    centres = np.arange(n, dtype=float)
+    centres = np.arange(len(values), dtype=float)
     return centres, 0.9, HIST_KINDS[kind][0]
 
 
-def draw_hist_panel(axis, kind: str, values, cell, cap_label: str, annotate_counts: bool = True):
+def draw_hist_panel(axis, kind: str, values, cell, annotate_counts: bool = True):
     values = np.asarray(values, dtype=float)
     total = values.sum()
     fraction = values / total if total > 0 else np.zeros_like(values)
     centres, width, xlabel = hist_bin_edges(kind, values, cell)
 
-    colours = ["#4c78a8"] * len(values)
-    colours[-1] = "#b279a2"  # the overflow bin, always the last bar
-    axis.bar(centres, fraction, width=width, color=colours, zorder=2)
+    # One colour: there is no overflow bar to mark any more, so every bar means the same kind of
+    # thing — the components of exactly that size.
+    axis.bar(centres, fraction, width=width, color="#4c78a8", zorder=2)
     axis.set_xlabel(xlabel)
     axis.set_ylabel(f"fraction of {HIST_KINDS[kind][2]}")
     axis.set_title(kind, fontsize=9)
@@ -1011,74 +883,15 @@ def draw_hist_panel(axis, kind: str, values, cell, cap_label: str, annotate_coun
                     color="0.3",
                 )
         axis.set_ylim(0, top * 1.28 if top > 0 else 1.0)
-    # Which bar the overflow is, said in the corner rather than under the bar: at the right-hand
-    # edge of the axes the label runs off the figure, and above the bar it lands on that bar's own
-    # count.
-    axis.text(
-        0.985,
-        0.985,
-        f"last bar (■) is the overflow bin: {cap_label}",
-        transform=axis.transAxes,
-        ha="right",
-        va="top",
-        fontsize=5.5,
-        color="#b279a2",
-    )
-
-    if kind == "wint_diameter_hist":
-        t_int = float(cell.get("T_int", 0) or 0)
-        if t_int > 0:
-            for multiple, style in ((1, "-"), (2, "--")):
-                axis.axvline(
-                    multiple * t_int,
-                    color="0.25",
-                    linewidth=0.9,
-                    linestyle=style,
-                    zorder=3,
-                )
-                axis.text(
-                    multiple * t_int,
-                    axis.get_ylim()[1] * 0.97,
-                    f" {'' if multiple == 1 else '2·'}T_int",
-                    ha="left",
-                    va="top",
-                    fontsize=6,
-                    color="0.25",
-                )
-    uncomputed = int(cell.get("diameter_uncomputed_components", 0) or 0)
-    if uncomputed and kind in ("hop_diameter_hist", "wint_diameter_hist"):
-        # §4.3: printed in the corner when non-zero. These components are above --diameter-cap and
-        # are in no bin of this panel, so the histogram is over fewer components than the cell has.
-        axis.text(
-            0.985,
-            0.925,
-            f"diameter_uncomputed_components = {uncomputed}",
-            transform=axis.transAxes,
-            ha="right",
-            va="top",
-            fontsize=6,
-            color="0.35",
-        )
-
-
-def cap_label_for(kind: str, caps: dict, length: int) -> str:
-    if kind == "degree_hist":
-        cap = caps.get("degree_cap", length - 1)
-    elif kind == "wint_diameter_hist":
-        return ">= 4·T_int"
-    else:
-        cap = caps.get("size_cap", length - 1)
-    return f">= {cap}"
 
 
 def figure_cell_hists(artifact: Artifact, d, p, t):
-    """§4.3 -- the four histograms of one `(d, p, T)`, normalised, raw counts above the bars."""
+    """§4.3 -- the size histogram of one `(d, p, T)`, normalised, raw counts above the bars."""
     cell = artifact.cell(d, p, t)
     kinds = [kind for kind in HIST_KINDS if kind in cell]
     figure, axes = panel_grid(len(kinds), width=5.2, height=3.4)
     for axis, kind in zip(axes, kinds):
-        values = cell[kind]
-        draw_hist_panel(axis, kind, values, cell, cap_label_for(kind, artifact.caps, len(values)))
+        draw_hist_panel(axis, kind, cell[kind], cell)
     subtitle = (
         f"components = {int(cell.get('components_total', 0)):,}; "
         f"shots = {int(cell.get('shots', 0)):,}; "
@@ -1095,15 +908,13 @@ def figure_cell_hists(artifact: Artifact, d, p, t):
 def figure_hist_overlay(artifact: Artifact, style: Style, kind: str, horizon: float):
     """§4.3's overlay -- every `(d, p)` at one `T`, normalised, as log-`y` step plots.
 
-    `wint_diameter_hist` is left on its `T_int/16` bin axis here rather than converted to `w_int`:
-    `T_int` moves with `(d, p)`, so a `w_int` axis would put bins that mean the same thing at
-    different places and the shapes would no longer be comparable, which is the only reason this
-    figure exists.
+    The histogram is uncapped, so two cells can legitimately end at different bins: the one that saw
+    the larger component has the longer array, and the shorter is that array's prefix. Each is drawn
+    to its own length and the axis takes the longest.
     """
     panel = artifact.summary[artifact.summary["T"] == horizon].sort_values(["d", "p"])
     figure, axes = panel_grid(1, width=8.0, height=4.6)
     axis = axes[0]
-    uncomputed_total = 0
     drawn = 0
     for _, row in panel.iterrows():
         cell = artifact.cell(row["d"], row["p"], row["T"])
@@ -1114,7 +925,6 @@ def figure_hist_overlay(artifact: Artifact, style: Style, kind: str, horizon: fl
         if total <= 0:
             continue
         drawn += 1
-        uncomputed_total += int(cell.get("diameter_uncomputed_components", 0) or 0)
         axis.step(
             np.arange(len(values), dtype=float),
             values / total,
@@ -1128,26 +938,10 @@ def figure_hist_overlay(artifact: Artifact, style: Style, kind: str, horizon: fl
         plt.close(figure)
         return None
     axis.set_yscale("log")
-    if kind == "wint_diameter_hist":
-        axis.set_xlabel("w_int diameter, in bins of T_int/16 (T_int at bin 16, 2·T_int at bin 32)")
-        for position in (16, 32):
-            axis.axvline(position, color="0.25", linewidth=0.9, linestyle="--", zorder=1)
-    else:
-        axis.set_xlabel(HIST_KINDS[kind][0] + "  (last bin is the overflow bin)")
+    axis.set_xlabel(HIST_KINDS[kind][0])
     axis.set_ylabel(f"fraction of {HIST_KINDS[kind][2]}")
     axis.grid(True, which="major", alpha=0.25, linewidth=0.5)
     axis.legend(fontsize=6, loc="best", ncol=2)
-    if uncomputed_total and kind in ("hop_diameter_hist", "wint_diameter_hist"):
-        axis.text(
-            0.98,
-            0.02,
-            f"diameter_uncomputed_components over the grid = {uncomputed_total}",
-            transform=axis.transAxes,
-            ha="right",
-            va="bottom",
-            fontsize=6,
-            color="0.35",
-        )
     return finish(
         figure,
         f"{kind} across the (d, p) grid, T = {fmt_t(horizon)}",
@@ -1209,31 +1003,10 @@ def figure_status_table(artifact: Artifact, d, p, t, table_name: str, bin_label:
     bottom.set_ylabel("P(TRUNCATED | bin)")
     bottom.set_title("truncation probability, 95% Wilson on the two counts", fontsize=9)
     bottom.grid(True, alpha=0.2, linewidth=0.5)
+    # No overflow marker: the table is uncapped, so the last row is the largest component the cell
+    # held rather than everything at or above a cap.
     for axis in (top, bottom):
         axis.set_xlim(-0.8, len(total) - 0.2)
-        axis.axvline(len(total) - 1.5, color="0.7", linewidth=0.8, linestyle=":", zorder=1)
-        axis.text(
-            0.985,
-            0.985,
-            f"right of the dotted line: the overflow bin ({len(total) - 1}+)",
-            transform=axis.transAxes,
-            ha="right",
-            va="top",
-            fontsize=5.5,
-            color="0.45",
-        )
-    uncomputed = int(cell.get("diameter_uncomputed_components", 0) or 0)
-    if uncomputed and table_name == "hop_diameter_x_status":
-        top.text(
-            0.985,
-            0.925,
-            f"diameter_uncomputed_components = {uncomputed} (not in this table)",
-            transform=top.transAxes,
-            ha="right",
-            va="top",
-            fontsize=6,
-            color="0.35",
-        )
     return finish(
         figure,
         f"{table_name}, d = {fmt_d(d)}, p = {fmt_p(p)}, T = {fmt_t(t)}",
@@ -1243,9 +1016,13 @@ def figure_status_table(artifact: Artifact, d, p, t, table_name: str, bin_label:
 
 
 def figure_truncation_grid(artifact: Artifact, style: Style, horizon: float):
-    """§4.4's grid summary -- `P(TRUNCATED | size)` at a few sizes, vs `p`, one line per `d`."""
+    """§4.4's grid summary -- `P(TRUNCATED | size)` at a few sizes, vs `p`, one line per `d`.
+
+    The last panel is the tail, summed over every size from `GRID_TAIL_FROM` up. It replaces the
+    overflow bin the capped table used to end in, and unlike that bin it means the same thing in
+    every cell however large the cell's largest component was.
+    """
     panel = artifact.summary[artifact.summary["T"] == horizon]
-    size_cap = artifact.caps.get("size_cap")
     figure, axes = panel_grid(len(GRID_SIZE_BINS), width=4.2, height=3.4)
     any_drawn = False
     for axis, size_bin in zip(axes, GRID_SIZE_BINS):
@@ -1257,9 +1034,14 @@ def figure_truncation_grid(artifact: Artifact, style: Style, horizon: float):
                 if cell is None or "size_x_status" not in cell:
                     continue
                 table = np.asarray(cell["size_x_status"], dtype=float)
-                if abs(size_bin) >= len(table):
-                    continue
-                complete, truncated = table[size_bin]
+                if size_bin == "tail":
+                    if GRID_TAIL_FROM >= len(table):
+                        continue
+                    complete, truncated = table[GRID_TAIL_FROM:].sum(axis=0)
+                else:
+                    if size_bin >= len(table):
+                        continue
+                    complete, truncated = table[size_bin]
                 total = complete + truncated
                 if total <= 0:
                     continue
@@ -1288,7 +1070,7 @@ def figure_truncation_grid(artifact: Artifact, style: Style, horizon: float):
         log_x_rates(axis, rates)
         axis.set_xlabel("p")
         axis.set_ylabel("P(TRUNCATED | size)")
-        name = f"size >= {size_cap}" if size_bin == -1 else f"size = {size_bin}"
+        name = f"size >= {GRID_TAIL_FROM}" if size_bin == "tail" else f"size = {size_bin}"
         axis.set_title(name, fontsize=10)
         axis.grid(True, which="major", alpha=0.25, linewidth=0.5)
         axis.legend(fontsize=6, loc="best")
@@ -1417,19 +1199,6 @@ def draw_structure(artifact: Artifact, style: Style, recorder: Recorder):
                 {"T": fmt_t(horizon)},
             )
 
-    if not artifact.has("mean_odd_components_without_boundary"):
-        recorder.skip(
-            "odd_component_lower_bound_vs_p",
-            "summary.csv is missing mean_odd_components_without_boundary",
-        )
-    else:
-        recorder.save(
-            figure_odd_component_lower_bound(artifact, style),
-            "odd_component_lower_bound_vs_p",
-            "structure",
-            "P(a shot has an odd component with no boundary edge), with q",
-            {"x": "p", "panels": "T"},
-        )
 
 
 def draw_hists(artifact: Artifact, style: Style, recorder: Recorder):
@@ -1455,7 +1224,7 @@ def draw_hists(artifact: Artifact, style: Style, recorder: Recorder):
             figure_cell_hists(artifact, d, p, t),
             f"component_hists__{label_of(d=d, p=p, T=t)}",
             "hists",
-            "component_size / degree / hop_diameter / wint_diameter",
+            "component_size",
             {"d": fmt_d(d), "p": fmt_p(p), "T": fmt_t(t)},
         )
 
@@ -1473,10 +1242,8 @@ def draw_joint(artifact: Artifact, style: Style, recorder: Recorder):
     if not artifact.cells:
         recorder.skip("joint (all figures)", "no hists.json found under any --in dir")
         return
-    tables = [
-        ("size_x_status", "component size (last bin overflows)"),
-        ("hop_diameter_x_status", "hop diameter (last bin overflows)"),
-    ]
+    # One table: size is the only key the binary joins the status against.
+    tables = [("size_x_status", "component size")]
     for _, row in artifact.summary.iterrows():
         d, p, t = row["d"], row["p"], row["T"]
         cell = artifact.cell(d, p, t)

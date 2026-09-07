@@ -316,10 +316,16 @@ build/sparse_graph_stats --d 17,21,25,31 --p 0.0005,0.001,0.003 --T 1.5,2 \
     --shots 1000000 --seed 20260907 --out results/sparse_graph_stats
 ```
 
-That writes `summary.csv` (one row per `(d, p, T)`), `hists.json` (the size, degree, hop-diameter
-and weighted-diameter distributions plus the `size x status` and `hop_diameter x status` tables) and
-`run.log` (git hash, build flags, stim version, the exact generator call). Add `--verify` on a
-smaller run to check the per-component decomposition against the monolithic solve on every shot.
+That writes `summary.csv` (one row per `(d, p, T)`), `hists.json` (the component size distribution
+and the `size x status` table) and `run.log` (git hash, build flags, stim version, the exact
+generator call). Add `--verify` on a smaller run to check the per-component decomposition against
+the monolithic solve on every shot.
+
+Component **size** is the only per-component statistic; the degree, hop-diameter and
+weighted-diameter distributions and the boundary-structure counts were removed, from this binary and
+from the library under it. Nothing about size is capped either — bin `k` counts the components of
+size exactly `k`, and there is no overflow bin, so the large-component tail the escalation rate is
+about is resolved rather than pooled.
 
 `profiler_driver` writes one CSV per `(d, p, T, mode)`, one row per shot, with no aggregation in
 the C++ at all — the reduction above is entirely in the reader. Draw the distributions with:

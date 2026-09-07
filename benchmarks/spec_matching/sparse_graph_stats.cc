@@ -20,8 +20,18 @@
 ///
 ///  - the **escalation rate** `q` — the fraction of shots on which some connected component of `H`
 ///    fails to resolve within `T`, which is a property of `(DEM, shot, T)` alone; and
-///  - the **connected-component statistics** of `H`: sizes, degrees, diameters, boundary structure,
-///    and each component's own `COMPLETE`/`TRUNCATED` status.
+///  - the **component size distribution** of `H`, and each component's own `COMPLETE`/`TRUNCATED`
+///    status jointly with that size.
+///
+/// Size is the only structural statistic. The degree histogram, the two `H`-subgraph diameters and
+/// the boundary-structure counts this used to report are gone — from this binary and from the
+/// library underneath it — along with the adjacency and the all-pairs walks that produced them.
+///
+/// **Nothing about size is capped.** `--size-cap`, `--degree-cap` and `--diameter-cap` are gone with
+/// them: `component_size_hist` and `size_x_status` grow to fit, so bin `k` counts exactly the size
+/// `k` and there is no overflow bin to read past. An overflow bin would pile the large components —
+/// the ones the escalation rate is about — into one terminal bucket, which is the tail this binary
+/// exists to measure.
 ///
 /// The second comes for free from the first. Every component is decided by truncated sparse blossom
 /// run on it in isolation (§2), so a per-component status is what the decode already computes; this
@@ -50,8 +60,7 @@
 /// ## Usage
 ///
 ///   sparse_graph_stats [--d 5,7,9] [--p 1e-3,5e-4] [--T 1.5,2,2.5] [--shots N] [--seed S]
-///                      [--build SCAN|BITSET] [--size-cap 32] [--degree-cap 32]
-///                      [--diameter-cap 64] [--verify] [--out DIR]
+///                      [--build SCAN|BITSET] [--verify] [--out DIR]
 ///                      [--dem FILE --dets FILE]
 ///
 /// Writes `summary.csv` (one row per `(d, p, T)`), `hists.json` (keyed `"d=..,p=..,T=.."`) and
@@ -107,11 +116,6 @@ struct Options {
     size_t shots = 10000;
     uint64_t seed = 20260903;
     BallGraphBuildMode mode{BallGraphBuildMode::SCAN};
-    size_t size_cap = 32;
-    size_t degree_cap = 32;
-    /// Components larger than this get no diameter and are counted instead. Note this is a
-    /// *component size*, not a diameter value: both diameter walks are `O(s^2)` over the component.
-    uint32_t diameter_cap = 64;
     bool verify = false;
     std::string out_dir = "benchmarks/spec_matching/results/sparse_graph_stats";
     /// The stim bypass of §3.3. Both or neither.
@@ -231,12 +235,6 @@ Options parse_options(int argc, char** argv) {
             } else {
                 throw std::invalid_argument("unrecognised --build " + value + " (want SCAN or BITSET)");
             }
-        } else if (flag == "--size-cap") {
-            options.size_cap = std::stoul(next());
-        } else if (flag == "--degree-cap") {
-            options.degree_cap = std::stoul(next());
-        } else if (flag == "--diameter-cap") {
-            options.diameter_cap = (uint32_t)std::stoul(next());
         } else if (flag == "--verify") {
             options.verify = true;
         } else if (flag == "--out" || flag == "--out-dir") {
@@ -253,8 +251,6 @@ Options parse_options(int argc, char** argv) {
         throw std::invalid_argument("--d, --p and --T each need at least one value");
     if (options.shots == 0)
         throw std::invalid_argument("--shots must be positive");
-    if (options.size_cap == 0 || options.degree_cap == 0 || options.diameter_cap == 0)
-        throw std::invalid_argument("the three caps must be positive");
     if (options.dem_path.empty() != options.dets_path.empty())
         throw std::invalid_argument("--dem and --dets go together: one without the other has nothing to read");
     for (double horizon : options.horizons) {
@@ -284,33 +280,24 @@ struct CellStats {
     uint64_t sum_h_nodes{0};
     uint64_t sum_h_edges{0};
     uint64_t sum_h_boundary_edges{0};
-    uint64_t sum_nodes_with_boundary_edge{0};
     uint64_t sum_num_components{0};
     uint64_t sum_largest_component_size{0};
     uint64_t sum_singleton_components{0};
     uint64_t sum_pair_components{0};
     uint64_t sum_components_size_ge3{0};
-    uint64_t sum_odd_components_without_boundary{0};
-    uint64_t sum_diameter_uncomputed_components{0};
-    uint64_t shots_with_odd_component_without_boundary{0};
 
     uint64_t max_n_defects{0};
     uint64_t max_h_nodes{0};
     uint64_t max_h_edges{0};
     uint64_t max_h_boundary_edges{0};
-    uint64_t max_nodes_with_boundary_edge{0};
     uint64_t max_num_components{0};
     uint64_t max_largest_component_size{0};
     uint64_t max_singleton_components{0};
     uint64_t max_pair_components{0};
     uint64_t max_components_size_ge3{0};
-    uint64_t max_odd_components_without_boundary{0};
-    uint64_t max_component_diameter_wint{0};
-    uint64_t max_component_hop_diameter{0};
 
     ComponentHistograms hist;
     ComponentStatusTable size_x_status;
-    ComponentStatusTable hop_diameter_x_status;
 
     /// §3.5.2's raw per-shot vectors, kept only when `shots <= PER_SHOT_VECTOR_LIMIT`.
     bool keep_per_shot{false};
@@ -322,7 +309,6 @@ struct CellStats {
     std::vector<int> per_shot_singleton_components;
     std::vector<int> per_shot_pair_components;
     std::vector<int> per_shot_components_size_ge3;
-    std::vector<int> per_shot_odd_components_without_boundary;
     std::vector<int> per_shot_components_truncated;
 
     /// The cell's labels, filled once at the end of the run.
@@ -330,17 +316,18 @@ struct CellStats {
     int64_t t_int{0};
 
     void configure(const Options& options) {
-        hist.configure(options.size_cap, options.degree_cap);
-        size_x_status.configure(options.size_cap + 1);
-        hop_diameter_x_status.configure(options.size_cap + 1);
+        // Uncapped, both of them, and together: the histogram and the joint table are keyed by the
+        // same component size, so capping one and not the other would put two different size axes
+        // in one file.
+        hist.configure_uncapped();
+        size_x_status.configure_uncapped();
         keep_per_shot = options.shots <= PER_SHOT_VECTOR_LIMIT;
     }
 
     void accumulate(
         const BallProfile& profile,
         const ComponentHistograms& shot_hist,
-        const ComponentStatusTable& shot_size_x_status,
-        const ComponentStatusTable& shot_hop_x_status) {
+        const ComponentStatusTable& shot_size_x_status) {
         shots++;
         if (profile.n_defects == 0)
             shots_zero_defects++;
@@ -364,17 +351,14 @@ struct CellStats {
             per_shot_singleton_components.push_back(profile.components.num_singleton_components);
             per_shot_pair_components.push_back(profile.components.num_pair_components);
             per_shot_components_size_ge3.push_back(profile.components.num_components_size_ge3);
-            per_shot_odd_components_without_boundary.push_back(
-                profile.components.num_odd_components_without_boundary);
             per_shot_components_truncated.push_back(profile.components_truncated);
         }
 
         const ComponentStats& components = profile.components;
-        // The distributions and the joint tables are over components and edges, so they are folded
-        // in whatever the shot's defect count — an empty shot contributes nothing to them anyway.
+        // The distribution and the joint table are over components, so they are folded in whatever
+        // the shot's defect count — an empty shot contributes nothing to them anyway.
         hist.add(shot_hist);
         size_x_status.add(shot_size_x_status);
-        hop_diameter_x_status.add(shot_hop_x_status);
 
         // §3.4: zero-defect shots count in `shots_zero_defects`, stay in `q`'s denominator, and are
         // excluded from the per-shot structural means.
@@ -385,34 +369,21 @@ struct CellStats {
         sum_h_nodes += (uint64_t)profile.h_nodes;
         sum_h_edges += (uint64_t)profile.h_edges;
         sum_h_boundary_edges += (uint64_t)profile.h_boundary_edges;
-        sum_nodes_with_boundary_edge += (uint64_t)components.nodes_with_boundary_edge;
         sum_num_components += (uint64_t)components.num_components;
         sum_largest_component_size += (uint64_t)components.largest_component_size;
         sum_singleton_components += (uint64_t)components.num_singleton_components;
         sum_pair_components += (uint64_t)components.num_pair_components;
         sum_components_size_ge3 += (uint64_t)components.num_components_size_ge3;
-        sum_odd_components_without_boundary += (uint64_t)components.num_odd_components_without_boundary;
-        sum_diameter_uncomputed_components += (uint64_t)components.diameter_uncomputed_components;
-        if (components.num_odd_components_without_boundary > 0)
-            shots_with_odd_component_without_boundary++;
 
         max_n_defects = std::max(max_n_defects, (uint64_t)profile.n_defects);
         max_h_nodes = std::max(max_h_nodes, (uint64_t)profile.h_nodes);
         max_h_edges = std::max(max_h_edges, (uint64_t)profile.h_edges);
         max_h_boundary_edges = std::max(max_h_boundary_edges, (uint64_t)profile.h_boundary_edges);
-        max_nodes_with_boundary_edge =
-            std::max(max_nodes_with_boundary_edge, (uint64_t)components.nodes_with_boundary_edge);
         max_num_components = std::max(max_num_components, (uint64_t)components.num_components);
         max_largest_component_size = std::max(max_largest_component_size, (uint64_t)components.largest_component_size);
         max_singleton_components = std::max(max_singleton_components, (uint64_t)components.num_singleton_components);
         max_pair_components = std::max(max_pair_components, (uint64_t)components.num_pair_components);
         max_components_size_ge3 = std::max(max_components_size_ge3, (uint64_t)components.num_components_size_ge3);
-        max_odd_components_without_boundary =
-            std::max(max_odd_components_without_boundary, (uint64_t)components.num_odd_components_without_boundary);
-        max_component_diameter_wint =
-            std::max(max_component_diameter_wint, (uint64_t)components.max_component_diameter_wint);
-        max_component_hop_diameter =
-            std::max(max_component_hop_diameter, (uint64_t)components.max_component_hop_diameter);
     }
 
     double q() const {
@@ -520,7 +491,6 @@ void decode_batch_into(
     const std::vector<std::vector<uint64_t>>& shots,
     ComponentHistograms& shot_hist,
     ComponentStatusTable& shot_size_x_status,
-    ComponentStatusTable& shot_hop_x_status,
     CellStats& cell) {
     BallProfile profile;
     for (const std::vector<uint64_t>& shot : shots) {
@@ -530,8 +500,8 @@ void decode_batch_into(
         decoder.decode_phase1_production(shot, &profile);
         // Untimed by construction, and after the decode rather than inside it. It reads the `H` the
         // arena is still holding and the statuses the decode just wrote.
-        decoder.analyze_last_shot_components(profile, shot_hist, shot_size_x_status, shot_hop_x_status);
-        cell.accumulate(profile, shot_hist, shot_size_x_status, shot_hop_x_status);
+        decoder.analyze_last_shot_components(profile, shot_hist, shot_size_x_status);
+        cell.accumulate(profile, shot_hist, shot_size_x_status);
     }
 }
 
@@ -545,14 +515,11 @@ void write_summary_header(std::ofstream& out) {
            "components_total,components_truncated,truncated_component_rate,"
            "truncated_components_per_escalated_shot,"
            "shots_with_defects,mean_n_defects,mean_h_nodes,mean_h_edges,mean_h_boundary_edges,"
-           "mean_nodes_with_boundary_edge,mean_num_components,mean_largest_component_size,"
+           "mean_num_components,mean_largest_component_size,"
            "mean_singleton_components,mean_pair_components,mean_components_size_ge3,"
-           "mean_odd_components_without_boundary,odd_component_without_boundary_rate,"
-           "max_n_defects,max_h_nodes,max_h_edges,max_h_boundary_edges,max_nodes_with_boundary_edge,"
+           "max_n_defects,max_h_nodes,max_h_edges,max_h_boundary_edges,"
            "max_num_components,max_largest_component_size,max_singleton_components,max_pair_components,"
-           "max_components_size_ge3,max_odd_components_without_boundary,"
-           "max_component_diameter_wint,max_component_hop_diameter,"
-           "diameter_uncomputed_components\n";
+           "max_components_size_ge3\n";
 }
 
 void write_summary_row(
@@ -579,27 +546,22 @@ void write_summary_row(
         << truncated_per_escalated << "," << cell.shots_with_defects << ","
         << cell.mean_over_non_empty(cell.sum_n_defects) << "," << cell.mean_over_non_empty(cell.sum_h_nodes) << ","
         << cell.mean_over_non_empty(cell.sum_h_edges) << "," << cell.mean_over_non_empty(cell.sum_h_boundary_edges)
-        << "," << cell.mean_over_non_empty(cell.sum_nodes_with_boundary_edge) << ","
-        << cell.mean_over_non_empty(cell.sum_num_components) << ","
+        << "," << cell.mean_over_non_empty(cell.sum_num_components) << ","
         << cell.mean_over_non_empty(cell.sum_largest_component_size) << ","
         << cell.mean_over_non_empty(cell.sum_singleton_components) << ","
         << cell.mean_over_non_empty(cell.sum_pair_components) << ","
-        << cell.mean_over_non_empty(cell.sum_components_size_ge3) << ","
-        << cell.mean_over_non_empty(cell.sum_odd_components_without_boundary) << ","
-        << (cell.shots_with_defects
-                ? (double)cell.shots_with_odd_component_without_boundary / (double)cell.shots_with_defects
-                : 0.0)
-        << "," << cell.max_n_defects << "," << cell.max_h_nodes << "," << cell.max_h_edges << ","
-        << cell.max_h_boundary_edges << "," << cell.max_nodes_with_boundary_edge << "," << cell.max_num_components
-        << "," << cell.max_largest_component_size << "," << cell.max_singleton_components << ","
-        << cell.max_pair_components << "," << cell.max_components_size_ge3 << ","
-        << cell.max_odd_components_without_boundary << "," << cell.max_component_diameter_wint << ","
-        << cell.max_component_hop_diameter << "," << cell.sum_diameter_uncomputed_components << "\n";
+        << cell.mean_over_non_empty(cell.sum_components_size_ge3) << "," << cell.max_n_defects << ","
+        << cell.max_h_nodes << "," << cell.max_h_edges << "," << cell.max_h_boundary_edges << ","
+        << cell.max_num_components << "," << cell.max_largest_component_size << ","
+        << cell.max_singleton_components << "," << cell.max_pair_components << ","
+        << cell.max_components_size_ge3 << "\n";
 }
 
-/// A JSON array of integers, with the last element understood as the overflow bin. Written by hand
-/// rather than through a library, because the whole file is arrays of integers and the shape is
-/// what a reader needs stated, not the encoder.
+/// A JSON array of integers. Written by hand rather than through a library, because the whole file
+/// is arrays of integers and the shape is what a reader needs stated, not the encoder.
+///
+/// There is no overflow element: the size histogram and the size-by-status table are uncapped, so
+/// index `k` is exactly the component size `k` and the last index is the largest size the cell saw.
 void write_json_array(std::ofstream& out, const std::vector<uint64_t>& values) {
     out << "[";
     for (size_t i = 0; i < values.size(); i++)
@@ -614,7 +576,8 @@ void write_json_array(std::ofstream& out, const std::vector<int>& values) {
     out << "]";
 }
 
-/// The joint tables, as `[[complete, truncated], ...]` — one row per bin, last row overflowing.
+/// The joint table, as `[[complete, truncated], ...]` — one row per component size, row `k` being
+/// size `k`. No row overflows; the last is the largest size the cell saw.
 void write_json_status_table(std::ofstream& out, const ComponentStatusTable& table) {
     out << "[";
     for (size_t bin = 0; bin < table.bins; bin++) {
@@ -668,9 +631,8 @@ int main(int argc, char** argv) {
     log << "seed=" << options.seed << "\n";
     log << "shots_per_cell=" << options.shots << "\n";
     log << "build_mode=" << mode_name(options.mode) << "\n";
-    log << "size_cap=" << options.size_cap << "\n";
-    log << "degree_cap=" << options.degree_cap << "\n";
-    log << "diameter_cap=" << options.diameter_cap << " (a component SIZE above which no diameter is computed)\n";
+    log << "component_stats=size only (degrees, diameters and boundary structure are not computed)\n";
+    log << "size_caps=none (component_size_hist and size_x_status grow to fit; no overflow bin)\n";
     log << "verify_component_decomposition=" << (options.verify ? 1 : 0) << "\n";
     log << "T_unit=one lattice edge weight (the median discretised edge of G, in DEM float units);"
            " summary.csv carries T, T_weight_units and T_int\n";
@@ -679,22 +641,15 @@ int main(int argc, char** argv) {
 
     write_summary_header(summary);
     hists << "{\n";
-    hists << "  \"caps\": {\"size_cap\": " << options.size_cap << ", \"degree_cap\": " << options.degree_cap
-          << ", \"diameter_cap\": " << options.diameter_cap
-          << ", \"weight_hist_bins_per_T\": " << ComponentHistograms::BINS_PER_T << "},\n";
-    hists << "  \"note\": \"every histogram's last bin is the overflow bin; the joint tables are"
-             " [[complete, truncated], ...] with one row per bin\",\n";
-    // What a bin *is*, stated in the file rather than left to the reader. `component_size_hist`,
-    // `degree_hist` and `hop_diameter_hist` are binned by count — bin `k` counts the value `k`.
-    // `wint_diameter_hist` is binned in sixteenths of `T_int`, the §C.2 convention every weight
-    // histogram in this project shares, so a consumer that wants coarser bins sums groups of
-    // `weight_hist_bins_per_T` and gets width-`T` bins exactly.
-    hists << "  \"bin_units\": {\"component_size_hist\": \"count\", \"degree_hist\": \"count\","
-             " \"hop_diameter_hist\": \"count (H edges on the longest shortest hop path)\","
-             " \"wint_diameter_hist\": \"T/16 in the flooder's integer time units; see T_int per cell\"},\n";
-    hists << "  \"diameter_note\": \"both diameters are confined to the component's own subgraph of"
-             " H. A pair whose G geodesic leaves the component is measured by the route that stays"
-             " inside it, so these are H diameters and must not be read as distances in G.\",\n";
+    // No `caps` block: there are none. A consumer that finds one is reading an artifact written
+    // before the caps were removed, where the last bin *is* an overflow bin.
+    hists << "  \"uncapped\": true,\n";
+    hists << "  \"note\": \"component size is the only per-component statistic; the degree,"
+             " diameter and boundary-structure arrays are not written and are no longer computed\",\n";
+    // What a bin *is*, stated in the file rather than left to the reader.
+    hists << "  \"bin_units\": {\"component_size_hist\": \"count: bin k counts the components of"
+             " size exactly k, with no overflow bin\", \"size_x_status\": \"count: row k is"
+             " component size k, as [complete, truncated]\"},\n";
     hists << "  \"cells\": {\n";
     bool first_cell = true;
 
@@ -758,7 +713,6 @@ int main(int argc, char** argv) {
             ball_config.ball.R = 2.0 * ball_config.ball.T_max;
             ball_config.mode = options.mode;
             ball_config.collect_component_stats = true;
-            ball_config.diameter_cap = options.diameter_cap;
             ball_config.verify_component_decomposition = options.verify;
 
             BallDecoder decoder = BallDecoder::from_detector_error_model(dem, ball_config, NUM_DISTINCT_WEIGHTS);
@@ -772,9 +726,8 @@ int main(int argc, char** argv) {
                 cell.configure(options);
 
             ComponentHistograms shot_hist;
-            shot_hist.configure(options.size_cap, options.degree_cap);
-            ComponentStatusTable shot_size_x_status = ComponentStatusTable::with_bins(options.size_cap + 1);
-            ComponentStatusTable shot_hop_x_status = ComponentStatusTable::with_bins(options.size_cap + 1);
+            shot_hist.configure_uncapped();
+            ComponentStatusTable shot_size_x_status = ComponentStatusTable::growing();
 
             // ---- §3.4 steps 3-4. One batch of shots at a time, decoded once per `T`, so shot `i`
             // of `(d, p)` is the identical shot at every horizon.
@@ -800,8 +753,7 @@ int main(int argc, char** argv) {
                         decoder.set_horizon(options.horizons[t] * unit);
                         cells[t].t_weight_units = options.horizons[t] * unit;
                         cells[t].t_int = (int64_t)decoder.horizon;
-                        decode_batch_into(
-                            decoder, *shots, shot_hist, shot_size_x_status, shot_hop_x_status, cells[t]);
+                        decode_batch_into(decoder, *shots, shot_hist, shot_size_x_status, cells[t]);
                     }
                     decoded += batch;
                     // Between batches, and to stderr: it lands in no measurement — there are none —
@@ -843,17 +795,8 @@ int main(int argc, char** argv) {
                 hists << "      \"T_int\": " << cell.t_int << ",\n";
                 hists << "      \"component_size_hist\": ";
                 write_json_array(hists, cell.hist.size_hist);
-                hists << ",\n      \"degree_hist\": ";
-                write_json_array(hists, cell.hist.degree_hist);
-                hists << ",\n      \"hop_diameter_hist\": ";
-                write_json_array(hists, cell.hist.hop_diameter_hist);
-                hists << ",\n      \"wint_diameter_hist\": ";
-                write_json_array(hists, cell.hist.diameter_hist);
-                hists << ",\n      \"diameter_uncomputed_components\": " << cell.sum_diameter_uncomputed_components;
                 hists << ",\n      \"size_x_status\": ";
                 write_json_status_table(hists, cell.size_x_status);
-                hists << ",\n      \"hop_diameter_x_status\": ";
-                write_json_status_table(hists, cell.hop_diameter_x_status);
                 if (cell.keep_per_shot) {
                     hists << ",\n      \"per_shot\": {\"n_defects\": ";
                     write_json_array(hists, cell.per_shot_n_defects);
@@ -871,8 +814,6 @@ int main(int argc, char** argv) {
                     write_json_array(hists, cell.per_shot_pair_components);
                     hists << ", \"num_components_size_ge3\": ";
                     write_json_array(hists, cell.per_shot_components_size_ge3);
-                    hists << ", \"num_odd_components_without_boundary\": ";
-                    write_json_array(hists, cell.per_shot_odd_components_without_boundary);
                     hists << ", \"components_truncated\": ";
                     write_json_array(hists, cell.per_shot_components_truncated);
                     hists << "}";

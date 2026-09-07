@@ -131,7 +131,6 @@ SpecMatchingDecoder SpecMatchingDecoder::from_detector_error_model(
         ball_config.collect_harvest_diagnostics = config.collect_harvest_diagnostics;
         ball_config.collect_structural_counters = config.collect_structural_counters;
         ball_config.collect_component_stats = config.collect_component_stats;
-        ball_config.diameter_cap = config.diameter_cap;
         ball_config.verify_component_decomposition = config.verify_component_decomposition;
         ball_config.skip_negative_weight_preamble_when_positive = config.skip_negative_weight_preamble_when_positive;
         decoder.ball =
@@ -248,11 +247,10 @@ void SpecMatchingDecoder::copy_phase1_stats(const Phase1Outcome& outcome, SpecMa
     }
 }
 
-void SpecMatchingDecoder::configure_component_tables(size_t size_cap, size_t degree_cap) {
-    component_histograms.configure(size_cap, degree_cap);
+void SpecMatchingDecoder::configure_component_tables(size_t size_cap) {
+    component_histograms.configure(size_cap);
     component_size_x_status.configure(size_cap + 1);
-    component_hop_diameter_x_status.configure(size_cap + 1);
-    stats.configure_component_tables(size_cap, degree_cap);
+    stats.configure_component_tables(size_cap);
 }
 
 void SpecMatchingDecoder::record_component_stats(SpecMatchingProfile* prof) {
@@ -262,8 +260,7 @@ void SpecMatchingDecoder::record_component_stats(SpecMatchingProfile* prof) {
     // this feeds assumes the component work is free, so charging it to a latency number here would
     // be measuring a stage that is not meant to run on this critical path. It also has to come
     // before `record_truncated_reference`, which rebuilds `H` in the same arena.
-    ball->analyze_last_shot_components(
-        ball_profile, component_histograms, component_size_x_status, component_hop_diameter_x_status);
+    ball->analyze_last_shot_components(ball_profile, component_histograms, component_size_x_status);
     prof->components = ball_profile.components;
     assert(
         prof->components.components_truncated == prof->components_truncated &&
@@ -488,12 +485,12 @@ void SpecMatchingDecoder::decode_batch(
                 local.exact_reference_ns = exact_timer.elapsed_ns();
             }
             stats.accumulate(local);
-            // §3.5.2. The scalars ride in on the profile; the distributions and the joint tables are
+            // §3.5.2. The scalars ride in on the profile; the distributions and the joint table are
             // per component and per edge, so they are folded in from the decoder's own per-shot
             // buffers instead.
             if (config.collect_component_stats && local.components.measured) {
                 stats.accumulate_component_histograms(component_histograms);
-                stats.accumulate_component_status_tables(component_size_x_status, component_hop_diameter_x_status);
+                stats.accumulate_component_status_table(component_size_x_status);
             }
             if (profiles_out != nullptr)
                 profiles_out->push_back(local);

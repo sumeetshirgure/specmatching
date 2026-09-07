@@ -87,10 +87,7 @@ uint32_t find_root(std::vector<uint32_t>& parent, uint32_t node) {
 /// The component buffers' total capacity, the twin of `total_capacity` above and used the same way:
 /// compared before and after an analysis to notice that it had to allocate.
 uint64_t component_capacity(const BallComponents& c) {
-    return c.component_of.capacity() + c.component_index.capacity() + c.roots.capacity() + c.sizes.capacity() +
-           c.member_offsets.capacity() + c.members.capacity() + c.local_index.capacity() + c.adj_offsets.capacity() +
-           c.adj_target.capacity() + c.adj_weight.capacity() + c.dijkstra_dist.capacity() + c.dijkstra_done.capacity() +
-           c.bfs_dist.capacity() + c.bfs_queue.capacity() + c.fill_cursor.capacity();
+    return c.component_of.capacity() + c.component_index.capacity() + c.roots.capacity() + c.sizes.capacity();
 }
 
 /// The split buffers' total capacity, used exactly as the two above are: compared before and after
@@ -109,13 +106,6 @@ void BallComponents::clear() {
     component_index.clear();
     roots.clear();
     sizes.clear();
-    member_offsets.clear();
-    members.clear();
-    local_index.clear();
-    adj_offsets.clear();
-    adj_target.clear();
-    adj_weight.clear();
-    fill_cursor.clear();
 }
 
 void BallComponentSplit::clear() {
@@ -463,7 +453,7 @@ void build_component_subgraph(const BallGraph& graph, BallComponentSplit& s, siz
         s.grow_events++;
 }
 
-void analyze_ball_components(const BallGraph& graph, BallComponents& c, uint32_t diameter_cap) {
+void analyze_ball_components(const BallGraph& graph, BallComponents& c) {
     uint64_t capacity_before = component_capacity(c);
     uint32_t n = (uint32_t)graph.num_nodes();
 
@@ -491,7 +481,9 @@ void analyze_ball_components(const BallGraph& graph, BallComponents& c, uint32_t
         c.component_of[i] = parent == i ? i : c.component_of[parent];
     }
 
-    // ---- Components, in ascending root order, and their sizes.
+    // ---- Components, in ascending root order, and their sizes. This is the end of it: the member
+    // blocks, the undirected adjacency and the Dijkstra/BFS scratch that used to follow existed for
+    // the degree and diameter statistics, and those are gone.
     c.component_index.resize(n);
     c.roots.clear();
     c.sizes.clear();
@@ -505,130 +497,8 @@ void analyze_ball_components(const BallGraph& graph, BallComponents& c, uint32_t
     for (uint32_t i = 0; i < n; i++)
         c.sizes[c.component_index[c.component_of[i]]]++;
 
-    // ---- Members, grouped by component and ascending within each. `i` ascends, so the block of a
-    // component is filled in ascending `H`-node order for free.
-    size_t num_components = c.roots.size();
-    c.member_offsets.assign(num_components + 1, 0);
-    for (size_t k = 0; k < num_components; k++)
-        c.member_offsets[k + 1] = c.member_offsets[k] + c.sizes[k];
-    c.members.resize(n);
-    c.local_index.resize(n);
-    c.fill_cursor.assign(c.member_offsets.begin(), c.member_offsets.end());
-    for (uint32_t i = 0; i < n; i++) {
-        uint32_t index = c.component_index[c.component_of[i]];
-        uint32_t slot = c.fill_cursor[index]++;
-        c.members[slot] = i;
-        c.local_index[i] = slot - c.member_offsets[index];
-    }
-
-    // ---- Undirected adjacency, both directions of every defect-defect edge.
-    c.adj_offsets.assign((size_t)n + 1, 0);
-    for (const BallGraphEdge& edge : graph.edges) {
-        c.adj_offsets[edge.i + 1]++;
-        c.adj_offsets[edge.j + 1]++;
-    }
-    for (uint32_t i = 0; i < n; i++)
-        c.adj_offsets[i + 1] += c.adj_offsets[i];
-    c.adj_target.resize(2 * graph.edges.size());
-    c.adj_weight.resize(2 * graph.edges.size());
-    c.fill_cursor.assign(c.adj_offsets.begin(), c.adj_offsets.end());
-    for (const BallGraphEdge& edge : graph.edges) {
-        uint32_t slot = c.fill_cursor[edge.i]++;
-        c.adj_target[slot] = edge.j;
-        c.adj_weight[slot] = edge.w_int;
-        slot = c.fill_cursor[edge.j]++;
-        c.adj_target[slot] = edge.i;
-        c.adj_weight[slot] = edge.w_int;
-    }
-
-    c.dijkstra_dist.resize(diameter_cap);
-    c.dijkstra_done.resize(diameter_cap);
-    c.bfs_dist.resize(diameter_cap);
-    c.bfs_queue.resize(diameter_cap);
-
     if (component_capacity(c) != capacity_before)
         c.grow_events++;
-}
-
-pm::cumulative_time_int component_diameter(BallComponents& c, size_t index, uint32_t diameter_cap) {
-    uint32_t size = c.sizes[index];
-    if (size > diameter_cap || size > c.dijkstra_dist.size())
-        return -1;
-    if (size <= 1)
-        return 0;
-
-    constexpr pm::cumulative_time_int UNREACHED = std::numeric_limits<pm::cumulative_time_int>::max();
-    uint32_t begin = c.member_offsets[index];
-    pm::cumulative_time_int diameter = 0;
-    for (uint32_t source = 0; source < size; source++) {
-        for (uint32_t k = 0; k < size; k++) {
-            c.dijkstra_dist[k] = UNREACHED;
-            c.dijkstra_done[k] = 0;
-        }
-        c.dijkstra_dist[source] = 0;
-        for (uint32_t settled = 0; settled < size; settled++) {
-            // A linear scan for the minimum rather than a heap: the component is capped at
-            // `MAX_DIAMETER_COMPONENT_SIZE` members, where the scan is faster and, unlike a
-            // priority queue, allocates nothing.
-            uint32_t best = size;
-            pm::cumulative_time_int best_dist = UNREACHED;
-            for (uint32_t k = 0; k < size; k++) {
-                if (!c.dijkstra_done[k] && c.dijkstra_dist[k] < best_dist) {
-                    best_dist = c.dijkstra_dist[k];
-                    best = k;
-                }
-            }
-            // Cannot happen — the members of a component are connected through it by definition —
-            // but stopping on it is cheaper than trusting it.
-            if (best == size)
-                break;
-            c.dijkstra_done[best] = 1;
-            uint32_t node = c.members[begin + best];
-            for (uint32_t e = c.adj_offsets[node]; e < c.adj_offsets[node + 1]; e++) {
-                uint32_t neighbour = c.local_index[c.adj_target[e]];
-                pm::cumulative_time_int candidate = best_dist + (pm::cumulative_time_int)c.adj_weight[e];
-                if (candidate < c.dijkstra_dist[neighbour])
-                    c.dijkstra_dist[neighbour] = candidate;
-            }
-        }
-        for (uint32_t k = 0; k < size; k++) {
-            if (c.dijkstra_dist[k] != UNREACHED)
-                diameter = std::max(diameter, c.dijkstra_dist[k]);
-        }
-    }
-    return diameter;
-}
-
-int32_t component_hop_diameter(BallComponents& c, size_t index, uint32_t diameter_cap) {
-    uint32_t size = c.sizes[index];
-    if (size > diameter_cap || size > c.bfs_dist.size())
-        return -1;
-    if (size <= 1)
-        return 0;
-
-    uint32_t begin = c.member_offsets[index];
-    int32_t diameter = 0;
-    for (uint32_t source = 0; source < size; source++) {
-        for (uint32_t k = 0; k < size; k++)
-            c.bfs_dist[k] = -1;
-        c.bfs_dist[source] = 0;
-        c.bfs_queue[0] = source;
-        uint32_t head = 0;
-        uint32_t tail = 1;
-        while (head < tail) {
-            uint32_t local = c.bfs_queue[head++];
-            uint32_t node = c.members[begin + local];
-            for (uint32_t e = c.adj_offsets[node]; e < c.adj_offsets[node + 1]; e++) {
-                uint32_t neighbour = c.local_index[c.adj_target[e]];
-                if (c.bfs_dist[neighbour] >= 0)
-                    continue;
-                c.bfs_dist[neighbour] = c.bfs_dist[local] + 1;
-                diameter = std::max(diameter, c.bfs_dist[neighbour]);
-                c.bfs_queue[tail++] = neighbour;
-            }
-        }
-    }
-    return diameter;
 }
 
 }  // namespace spec_matching

@@ -93,7 +93,7 @@
 /// warning banner and every number it produces is an upper bound with the scheduler inside it.
 ///
 /// Beside the latency series, every run also dumps the **component structure** of the sparsified
-/// graph `H`: its connected components, their sizes, weighted and hop diameters, boundary structure,
+/// graph `H`: its connected components and their sizes — the only per-component statistic there is —
 /// the `H` edge-weight and boundary-cost distributions, and how many components' own truncated
 /// solves did not finish by `T`. That is a structural measurement, not a timing one — it is computed
 /// after each shot's timed window has closed and is charged to nothing — and it goes to its own file
@@ -604,10 +604,10 @@ void write_header(
 /// §C.2/§C.3's distributions for one grid point, in long form so that one schema covers scalars and
 /// histograms alike: `kind` names the table, `key` the statistic or the bin, `value` the count.
 ///
-/// Bins of the three weight histograms are in sixteenths of `T` — bin `k` is
+/// Bins of the two weight histograms are in sixteenths of `T` — bin `k` is
 /// `[k * T / bins_per_T, (k + 1) * T / bins_per_T)`, last bin overflowing — which is recorded in the
-/// metadata rather than left to the reader to know. Sizes and degrees are binned by count, with the
-/// last bin overflowing the same way.
+/// metadata rather than left to the reader to know. Sizes are binned by count, with the last bin
+/// overflowing the same way.
 void write_component_file(
     std::ofstream& out,
     const Options& options,
@@ -647,10 +647,6 @@ void write_component_file(
     scalar("mean_components_size_ge3", summary.mean_components_size_ge3);
     scalar("mean_largest_component_size", summary.mean_largest_component_size);
     scalar("max_component_size", summary.max_component_size);
-    scalar("mean_max_component_diameter_wint", summary.mean_max_component_diameter_wint);
-    scalar("max_component_diameter_wint", summary.max_component_diameter_wint);
-    scalar("boundary_touching_component_fraction", summary.boundary_touching_component_fraction);
-    scalar("diameter_uncomputed_component_fraction", summary.diameter_uncomputed_component_fraction);
     scalar("frac_defects_in_trivial_components", summary.frac_defects_in_trivial_components);
     scalar("solver_set_empty_rate", summary.solver_set_empty_rate);
     // §2.6/§3.5.1's per-component escalation reading.
@@ -658,18 +654,12 @@ void write_component_file(
     scalar("components_truncated", (double)summary.components_truncated);
     scalar("truncated_component_rate", summary.truncated_component_rate);
     scalar("truncated_components_per_escalated_shot", summary.truncated_components_per_escalated_shot);
-    scalar("odd_components_without_boundary_fraction", summary.odd_components_without_boundary_fraction);
-    scalar("mean_max_component_hop_diameter", summary.mean_max_component_hop_diameter);
-    scalar("max_component_hop_diameter", summary.max_component_hop_diameter);
 
     auto histogram = [&](const char* kind, const std::vector<uint64_t>& bins) {
         for (size_t i = 0; i < bins.size(); i++)
             out << kind << "," << i << "," << bins[i] << "\n";
     };
     histogram("size_hist", summary.component_size_hist);
-    histogram("diameter_hist", summary.component_diameter_hist);
-    histogram("hop_diameter_hist", summary.component_hop_diameter_hist);
-    histogram("degree_hist", summary.h_degree_hist);
     histogram("edge_weight_hist", summary.h_edge_weight_hist);
     histogram("bcost_hist", summary.boundary_cost_hist);
 }

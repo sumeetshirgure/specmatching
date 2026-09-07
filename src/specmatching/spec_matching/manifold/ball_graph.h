@@ -73,8 +73,12 @@ struct BallGraph {
     }
 };
 
-/// The connected components of `H`, over its defect-defect edges only, and the undirected adjacency
-/// the structural statistics walk.
+/// The connected components of `H`, over its defect-defect edges only, and their sizes.
+///
+/// Size is the whole of it. The degrees, the two `H`-subgraph diameters and the boundary structure
+/// this used to carry are gone, and with them the undirected adjacency, the per-component member
+/// blocks and the Dijkstra/BFS scratch they were walked with — the only structural statistic the
+/// `H` profiler reports is the component size distribution, so nothing else is built.
 ///
 /// **Profiling state.** Nothing on the decode path reads any of this, no timer is ever started
 /// inside the routine that fills it, and it is never filled from inside a timed window: the
@@ -93,30 +97,6 @@ struct BallComponents {
     /// Roots, ascending. One entry per component.
     std::vector<uint32_t> roots;
     std::vector<uint32_t> sizes;
-    /// Members of component `c`, ascending: `[member_offsets[c], member_offsets[c + 1])` of
-    /// `members`.
-    std::vector<uint32_t> member_offsets;
-    std::vector<uint32_t> members;
-    /// Position of `H`-node `i` within its own component's block of `members`, so a per-component
-    /// scratch array can be indexed `0..size-1` without a map.
-    std::vector<uint32_t> local_index;
-
-    /// Undirected CSR adjacency over `H`'s defect-defect edges, both directions. Boundary edges are
-    /// not in it: the boundary is not a node, so it joins nothing (§2.2).
-    std::vector<uint32_t> adj_offsets;
-    std::vector<uint32_t> adj_target;
-    std::vector<pm::weight_int> adj_weight;
-
-    /// Per-component Dijkstra scratch for the weighted diameter, indexed by `local_index`. Sized to
-    /// the largest component a diameter is computed for, which `analyze_ball_components` is told.
-    std::vector<pm::cumulative_time_int> dijkstra_dist;
-    std::vector<uint8_t> dijkstra_done;
-    /// Per-component BFS scratch for the unweighted (hop) diameter, indexed the same way.
-    std::vector<int32_t> bfs_dist;
-    std::vector<uint32_t> bfs_queue;
-    /// Write cursors for the two counting-sort fills below (members, then adjacency). Reused rather
-    /// than declared locally, so neither fill allocates in steady state.
-    std::vector<uint32_t> fill_cursor;
 
     /// Analyses that had to grow a buffer, the component-side twin of `BallGraphArena::grow_events`.
     /// After a warmup shot this must stop increasing (invariant 7).
@@ -125,18 +105,9 @@ struct BallComponents {
     inline size_t num_components() const {
         return roots.size();
     }
-    inline uint32_t degree_of(uint32_t node) const {
-        return adj_offsets[node + 1] - adj_offsets[node];
-    }
 
     void clear();
 };
-
-/// Components larger than this are left without a diameter and counted instead (§3.5.2). The
-/// weighted diameter is `O(s^2)` Dijkstras over the component, and at `p = 1e-3` a component this
-/// large is already far outside the distribution the statistic is for. `sparse_graph_stats` can
-/// move the cap with `--diameter-cap`; this is the default and the sizing bound of the scratch.
-inline constexpr uint32_t MAX_DIAMETER_COMPONENT_SIZE = 32;
 
 /// §1/§2. The connected components of `H`, and the per-component sub-`H` each one is solved on.
 ///
@@ -147,10 +118,10 @@ inline constexpr uint32_t MAX_DIAMETER_COMPONENT_SIZE = 32;
 /// different components have no `H` edge and so never interact before `T`; the boundary is not a
 /// node, does not grow, and a boundary match in one component changes no state in any other.
 ///
-/// It is deliberately **not** `BallComponents`, which builds the full undirected adjacency and the
-/// Dijkstra scratch the §3.5.2 statistics walk. This builds only what the solve needs — member
-/// blocks, internal-edge blocks and the boundary lookup — and the statistics join to it by
-/// component index, which is well-defined because both enumerate in ascending root order.
+/// It is deliberately **not** `BallComponents`, which is the statistics' own decomposition and
+/// carries nothing but sizes. This builds what the solve needs — member blocks, internal-edge blocks
+/// and the boundary lookup — and the statistics join to it by component index, which is well-defined
+/// because both enumerate in ascending root order.
 struct BallComponentSplit {
     /// Union-find parent while the unions run; the root of each `H`-node afterwards. Every link
     /// points at a **smaller** index, so a set's root is its minimum member and components
@@ -338,38 +309,12 @@ void build_ball_graph(
     BallGraphTiming* timing = nullptr,
     BallGraphCounts* counts = nullptr);
 
-/// Union-find over `H`'s defect-defect edges, then the members, the adjacency and the per-component
-/// blocks the §3.5.2 statistics read.
+/// Union-find over `H`'s defect-defect edges, then the components in ascending root order and their
+/// sizes. That is the whole of §3.5.2 now: the size of each component, and nothing else about it.
 ///
 /// Takes no timer and is given none: the component work is untimed by construction, and calling it
 /// from inside a timed window would put it in a latency number it must never enter.
-///
-/// `diameter_cap` sizes the per-component diameter scratch — components above it are counted rather
-/// than measured (§3.5.2's `--diameter-cap`).
-void analyze_ball_components(
-    const BallGraph& graph, BallComponents& components, uint32_t diameter_cap = MAX_DIAMETER_COMPONENT_SIZE);
-
-/// The weighted diameter of component `index`: the largest shortest-path distance between two of its
-/// members, with paths confined to the component's own subgraph of `H` and weighted by `w_int`.
-///
-/// This is an `H`-subgraph diameter, **not** a `G` diameter: a pair whose `G` geodesic leaves the
-/// component is measured here by the route that stays inside it, and the two can differ. That is
-/// fine for a structural metric — the quantity of interest is how far apart the component holds its
-/// own members — but it is why the number must not be read as a distance in `G` (§3.5.2).
-///
-/// Returns `-1` for a component larger than `diameter_cap`, which the caller counts rather than
-/// computing. A singleton has diameter 0.
-///
-/// `components` is taken by mutable reference for its Dijkstra scratch alone; nothing it describes
-/// about `H` is modified.
-pm::cumulative_time_int component_diameter(
-    BallComponents& components, size_t index, uint32_t diameter_cap = MAX_DIAMETER_COMPONENT_SIZE);
-
-/// The **unweighted** diameter of component `index`: the largest number of `H` edges on a shortest
-/// hop path between two of its members, by BFS from every member. Same confinement caveat and the
-/// same `-1` over the cap as the weighted one; a singleton has hop diameter 0.
-int32_t component_hop_diameter(
-    BallComponents& components, size_t index, uint32_t diameter_cap = MAX_DIAMETER_COMPONENT_SIZE);
+void analyze_ball_components(const BallGraph& graph, BallComponents& components);
 
 }  // namespace spec_matching
 }  // namespace pm

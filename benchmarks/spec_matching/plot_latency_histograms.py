@@ -67,10 +67,10 @@ chooses where the x axis stops — a view control, not a statistic, and the capt
 how many shots fell past it.
 
 Logs written under the v3 schema also carry the **component structure** of `H` — its connected
-components, their sizes, weighted diameters, degrees, `H` edge weights and boundary costs — measured
-outside every timed window and charged to no latency number. Two things are drawn from it:
+components and their sizes, plus `H` edge weights and boundary costs — measured outside every timed
+window and charged to no latency number. Two things are drawn from it:
 
-  * a component figure per grid point, from the profiler's companion `components_*.csv`: the five
+  * a component figure per grid point, from the profiler's companion `components_*.csv`: the three
     distributions as small multiples, plus the headline "how much of the defect set never needs the
     solver at all" numbers. `--no-components` skips it;
   * a second table beside the latency one, from the per-shot rows, so both tables describe the same
@@ -651,15 +651,17 @@ def read_component_file(path):
     return {"path": path, "meta": meta, "scalars": scalars, "hists": histograms}
 
 
-# The five distributions the component file carries, in reading order, with the unit of their bins.
+# The three distributions the component file carries, in reading order, with the unit of their bins.
 # `T` means the bin index is in units of the horizon divided by `bins_per_T`; `count` means the bin
 # index *is* the value. The last bin of every one of them overflows, which the axis labels say.
+#
+# Size is the only per-component one: the degree and weighted-diameter panels went when the degree
+# and diameter statistics were removed from the decoder. A component file written before that still
+# carries them, and they are simply not drawn.
 COMPONENT_PANELS = (
     ("size_hist", "components", "component size (defects)", "count"),
-    ("degree_hist", "H nodes", "degree in H", "count"),
     ("edge_weight_hist", "H edges", "edge weight $d_G(u,v)$  (units of T)", "T"),
     ("bcost_hist", "defects", "boundary cost  (units of T)", "T"),
-    ("diameter_hist", "components", "weighted component diameter  (units of T)", "T"),
 )
 
 
@@ -784,7 +786,6 @@ def draw_components(log, component, args, theme):
         f"components per shot              {scalars.get('mean_components', 0):>6.2f}",
         f"largest, mean over shots         {scalars.get('mean_largest_component_size', 0):>6.2f}",
         f"largest, over the campaign       {scalars.get('max_component_size', 0):>6.0f}",
-        f"touching the boundary            {100 * scalars.get('boundary_touching_component_fraction', 0):>6.1f}%",
         "",
         f"{analysed:,.0f} shots analysed, {with_defects:,.0f} with a defect",
     ]
@@ -810,15 +811,10 @@ def draw_components(log, component, args, theme):
         x=0.012,
         ha="left",
     )
-    uncomputed = scalars.get("diameter_uncomputed_component_fraction", 0.0)
     clauses = [
         "Counts on a log axis; the last bin of every histogram is an overflow bin",
         f"weight bins are T/{bins_per_T:.0f}",
-        "diameters are shortest paths confined to the component, so they are H-subgraph distances"
-        " rather than distances in G",
     ]
-    if uncomputed:
-        clauses.append(f"{100 * uncomputed:.2f}% of components were too large to measure one")
     # Wrapped rather than left to run: at this width the clause list is longer than the figure, and
     # a caption that leaves the page is a caption that was not read.
     caption = textwrap.fill("  ·  ".join(clauses), width=170, break_long_words=False)

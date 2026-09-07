@@ -162,8 +162,6 @@ void BallDecoder::finish_construction(const char* ball_artifact_path) {
         throw std::invalid_argument(
             "verify_against_g compares H's truncated harvest against M1 on G; the stock-on-H path (§M7) has no "
             "truncated harvest. Its oracle is stock exact decode on G — see §M7.6 level 1.");
-    if (config.diameter_cap == 0)
-        throw std::invalid_argument("BallConfig::diameter_cap must be positive; 0 would measure no component at all.");
 
     const pm::MatchingGraph& graph = g_mwpm.flooder.graph;
     horizon = to_time_units(config.T, graph.normalising_constant);
@@ -212,23 +210,19 @@ void BallDecoder::save_ball_artifact(const std::string& path) const {
 }
 
 void BallDecoder::analyze_last_shot_components(
-    BallProfile& prof,
-    ComponentHistograms& histograms,
-    ComponentStatusTable& size_x_status,
-    ComponentStatusTable& hop_diameter_x_status) {
+    BallProfile& prof, ComponentHistograms& histograms, ComponentStatusTable& size_x_status) {
     // No timer is started anywhere in this function, and none may be added: §3.5.2 is untimed by
     // construction and the caller has already closed the shot's window.
     ComponentStats& stats = prof.components;
     stats = ComponentStats();
     histograms.clear();
     size_x_status.clear();
-    hop_diameter_x_status.clear();
 
     const BallGraph& h = arena.graph;
     BallComponents& components = arena.components;
-    analyze_ball_components(h, components, config.diameter_cap);
+    analyze_ball_components(h, components);
 
-    // The decode's own statuses, for the joint tables. Both decompositions are union-find over the
+    // The decode's own statuses, for the joint table. Both decompositions are union-find over the
     // same edge set enumerated in ascending root order, so component `c` is the same component in
     // both — asserted rather than assumed, because a joint table joined on the wrong key is a table
     // that looks right and says nothing.
@@ -248,71 +242,33 @@ void BallDecoder::analyze_last_shot_components(
     stats.component_defects = (int)num_nodes;
     stats.components_truncated = (int)split.num_truncated();
 
-    // ---- Per-edge and per-node distributions. Every `H` edge weight is an exact `d_G` between two
-    // defects, which is the path-length distribution §C.2 asks for. The two weight histograms are
-    // filled here and simply not written by `sparse_graph_stats` (§3.5.2, "Not collected").
+    // ---- Per-edge and per-defect distributions. Every `H` edge weight is an exact `d_G` between two
+    // defects, which is the path-length distribution §C.2 asks for. These two are the latency
+    // profiler's accumulators — they are keyed by edge and by defect, not by component, which is why
+    // they survived the cut to size-only component statistics. `sparse_graph_stats` does not write
+    // them (§3.5.2, "Not collected").
     for (const BallGraphEdge& edge : h.edges) {
         histograms.edge_weight_hist[ComponentHistograms::weight_bin(
             (pm::cumulative_time_int)edge.w_int, t_int, histograms.edge_weight_hist.size())]++;
     }
     for (uint32_t i = 0; i < num_nodes; i++) {
-        histograms.degree_hist[ComponentHistograms::count_bin(
-            components.degree_of(i), histograms.degree_hist.size())]++;
         BoundaryCost cost = boundary_cost(tables, h.h_to_det[i]);
         if (cost.exists) {
             histograms.bcost_hist[ComponentHistograms::weight_bin(
                 cost.w_int, t_int, histograms.bcost_hist.size())]++;
         }
     }
-    // `H` gives a node at most one boundary edge, so the edge count *is* the node count. Both are
-    // reported because §3.5.2 names both, and they are asserted equal rather than one derived from
-    // the other.
-    stats.nodes_with_boundary_edge = (int)h.boundary_edges.size();
 
-    // ---- Per component, in ascending root order (§0 determinism).
+    // ---- Per component, in ascending root order (§0 determinism). Size and status, and nothing
+    // else: no adjacency is built, no member block is walked, and no diameter is computed.
     for (size_t c = 0; c < components.num_components(); c++) {
         uint32_t size = components.sizes[c];
-        uint32_t begin = components.member_offsets[c];
         size_t status = split.status[c] == BallComponentSplit::COMPONENT_TRUNCATED ? ComponentStatusTable::TRUNCATED
                                                                                   : ComponentStatusTable::COMPLETE;
 
-        histograms.size_hist[ComponentHistograms::count_bin(size, histograms.size_hist.size())]++;
+        histograms.add_component_size(size);
         size_x_status.add(size, status);
         stats.largest_component_size = std::max(stats.largest_component_size, (int)size);
-
-        pm::cumulative_time_int diameter = component_diameter(components, c, config.diameter_cap);
-        int32_t hop_diameter = component_hop_diameter(components, c, config.diameter_cap);
-        if (diameter < 0) {
-            // One cap governs both walks, so a component either has both diameters or neither.
-            assert(hop_diameter < 0 && "the two diameter walks disagreed about the cap");
-            stats.diameter_uncomputed_components++;
-        } else {
-            histograms.diameter_hist[ComponentHistograms::weight_bin(
-                diameter, t_int, histograms.diameter_hist.size())]++;
-            stats.max_component_diameter_wint = std::max(stats.max_component_diameter_wint, (int)diameter);
-            histograms.hop_diameter_hist[ComponentHistograms::count_bin(
-                (uint64_t)hop_diameter, histograms.hop_diameter_hist.size())]++;
-            hop_diameter_x_status.add((size_t)hop_diameter, status);
-            stats.max_component_hop_diameter = std::max(stats.max_component_hop_diameter, (int)hop_diameter);
-        }
-
-        bool touches_boundary = false;
-        for (uint32_t k = 0; k < size; k++) {
-            BoundaryCost cost = boundary_cost(tables, h.h_to_det[components.members[begin + k]]);
-            if (cost.exists && cost.w_int <= t_int) {
-                touches_boundary = true;
-                break;
-            }
-        }
-        stats.num_boundary_touching_components += touches_boundary ? 1 : 0;
-        // §3.5.2's certain-truncation class: an odd component with nowhere legal to send its odd
-        // member cannot be perfectly matched inside `T` at all, so it truncates whatever blossom
-        // does with it. Counted, never acted on — the status beside it comes from the solve.
-        bool odd_without_boundary = (size % 2 == 1) && !touches_boundary;
-        stats.num_odd_components_without_boundary += odd_without_boundary ? 1 : 0;
-        assert(
-            (!odd_without_boundary || status == ComponentStatusTable::TRUNCATED) &&
-            "an odd component with no legal boundary completed, which no perfect matching allows");
 
         // The size classes, which are structural: "trivial" is size <= 2 whatever the solve does
         // with it, so the series stays comparable across runs and across branches.

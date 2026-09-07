@@ -92,12 +92,6 @@ struct BallConfig {
     /// decode is per component, and `sparse_graph_stats` exists to collect it.
     bool collect_component_stats{true};
 
-    /// Components above this size are counted rather than given a diameter (§3.3's
-    /// `--diameter-cap`). Both diameters are `O(s^2)` walks over the component, and at `p = 1e-3` a
-    /// component this large is already far outside the distribution the statistic is for. Read only
-    /// under `collect_component_stats`.
-    uint32_t diameter_cap{MAX_DIAMETER_COMPONENT_SIZE};
-
     /// §2.5 — debug/bench: additionally run the **monolithic** solve on the whole of `H`, on a
     /// separate instance, and assert that it agrees with the per-component one.
     ///
@@ -272,8 +266,12 @@ struct BallDecoder {
     bool truncated_scheme_escalates(const std::vector<uint64_t>& dets);
 
     /// §3.5.2. Decomposes the `H` the arena is still holding — the one the shot just decoded on —
-    /// into connected components, and fills `prof.components`, `histograms` and the two joint
-    /// tables from it.
+    /// into connected components, and fills `prof.components`, `histograms.size_hist` and the
+    /// size-by-status joint table from it.
+    ///
+    /// **Size is the only structural statistic.** The degree histogram, the two `H`-subgraph
+    /// diameters, the boundary-structure counts and the hop-diameter joint table are gone, along
+    /// with the adjacency and the all-pairs walks that produced them.
     ///
     /// **Call it after the shot's timed window has closed, never inside one.** It starts no timer
     /// of its own and must not be wrapped in one: this experiment's latency account is the solver
@@ -284,15 +282,12 @@ struct BallDecoder {
     /// root order, so component `c` is the same component in both. That correspondence is asserted
     /// rather than assumed.
     ///
-    /// `histograms` and the tables are cleared and refilled with *this shot's* distributions; the
+    /// `histograms` and the table are cleared and refilled with *this shot's* distributions; the
     /// campaign accumulator adds them up. Valid until the next `build_ball_graph`, which is why the
     /// driver calls this before anything that rebuilds `H` — `truncated_scheme_escalates`, in
     /// particular.
     void analyze_last_shot_components(
-        BallProfile& prof,
-        ComponentHistograms& histograms,
-        ComponentStatusTable& size_x_status,
-        ComponentStatusTable& hop_diameter_x_status);
+        BallProfile& prof, ComponentHistograms& histograms, ComponentStatusTable& size_x_status);
 
     /// Retargets an already-constructed decoder at a different horizon, **without** recompiling the
     /// ball tables (§3.4 step 2: compile once at `T_max = max(T list)`, then sweep `T`).
