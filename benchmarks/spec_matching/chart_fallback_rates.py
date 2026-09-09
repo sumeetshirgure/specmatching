@@ -16,18 +16,20 @@
 """Tabulates the fraction of shots escalated over the requested `(d, p, T)` settings.
 
     python benchmarks/spec_matching/chart_fallback_rates.py --in RESULTS_DIR [MORE_DIRS ...]
-        --cells d=17,p=1e-3,T=1.5 [d=21,p=1e-3,T=2 ...]
+        --d=17,21,25 --p=5e-4,1e-3 --T=1,1.5,2
         [--format text|markdown] [--out FILE]
 
-An input is a `sparse_graph_stats` output directory holding `summary.csv`. The fraction is that
-row's `shots_escalated / shots`, and both counts stand beside it. Rows are grouped by `p`, then by
-`d`, then by `T`, with each group's label written on its first row.
+Each axis takes a comma separated list, and every combination of the three is tabulated. An input is
+a `sparse_graph_stats` output directory holding `summary.csv`. The fraction is that row's
+`shots_escalated / shots`, and both counts stand beside it. Rows are grouped by `p`, then by `d`,
+then by `T`, with each group's label written on its first row.
 """
 
 from __future__ import annotations
 
 import argparse
 import csv
+import itertools
 import math
 import sys
 from pathlib import Path
@@ -59,26 +61,22 @@ def title_of(key):
     return f"d = {d}, p = {fmt_p(p)}, T = {t:g}"
 
 
-def parse_cell(text):
-    """`d=17,p=1e-3,T=1.5` into a canonical key."""
-    fields = {}
+def parse_axis(name, text):
+    """`17,21,25` into that axis' values, in the order given and without repeats."""
+    values = []
     for token in text.split(","):
-        if not token.strip():
+        token = token.strip()
+        if not token:
             continue
-        name, separator, value = token.partition("=")
-        if not separator:
-            raise SystemExit(f"error: '{token}' in '{text}' is not name=value")
-        fields[name.strip()] = value.strip()
-    missing = [name for name in ("d", "p", "T") if name not in fields]
-    if missing:
-        raise SystemExit(f"error: '{text}' has no {', '.join(missing)}")
-    unknown = sorted(set(fields) - {"d", "p", "T"})
-    if unknown:
-        raise SystemExit(f"error: '{text}' has unrecognised {', '.join(unknown)}")
-    try:
-        return cell_key(fields["d"], fields["p"], fields["T"])
-    except ValueError as error:
-        raise SystemExit(f"error: '{text}': {error}")
+        try:
+            value = int(token) if name == "d" else float(token)
+        except ValueError:
+            raise SystemExit(f"error: --{name}: '{token}' is not a number")
+        if value not in values:
+            values.append(value)
+    if not values:
+        raise SystemExit(f"error: --{name} names no values")
+    return values
 
 
 def load_rows(in_dirs):
@@ -160,25 +158,26 @@ def main(argv=None):
         metavar="DIR",
         help="one or more sparse_graph_stats output dirs, each holding a summary.csv",
     )
-    parser.add_argument(
-        "--cells",
-        nargs="+",
-        required=True,
-        metavar="d=..,p=..,T=..",
-        help="the (d, p, T) settings to tabulate",
-    )
+    parser.add_argument("--d", required=True, metavar="17,21,25", help="the code distances")
+    parser.add_argument("--p", required=True, metavar="5e-4,1e-3", help="the physical error rates")
+    parser.add_argument("--T", required=True, metavar="1,1.5,2", help="the thresholds")
     parser.add_argument("--format", choices=["text", "markdown"], default="text")
     parser.add_argument("--out", default=None, metavar="FILE", help="default: stdout")
     args = parser.parse_args(argv)
 
     rows = load_rows(args.in_dirs)
-    keys = []
-    for text in args.cells:
-        key = parse_cell(text)
-        if key not in rows:
-            raise SystemExit(f"error: no summary.csv row for {title_of(key)} under {', '.join(args.in_dirs)}")
-        if key not in keys:
-            keys.append(key)
+    distances = parse_axis("d", args.d)
+    error_rates = parse_axis("p", args.p)
+    thresholds = parse_axis("T", args.T)
+
+    keys = [cell_key(d, p, t) for d, p, t in itertools.product(distances, error_rates, thresholds)]
+    missing = [key for key in keys if key not in rows]
+    if missing:
+        raise SystemExit(
+            "error: no summary.csv row under {} for:\n{}".format(
+                ", ".join(args.in_dirs), "\n".join(f"  {title_of(key)}" for key in missing)
+            )
+        )
 
     body = table_cells(keys, rows)
     table = render_markdown(body) if args.format == "markdown" else render_text(body)
