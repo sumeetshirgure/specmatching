@@ -156,18 +156,6 @@ if (NOT (MSVC))
 endif ()
 target_link_libraries(specmatching_perf libstim)
 
-# Profiler driver: per-shot latency of stock exact decode on the original detector graph G against
-# the front end on the sparsified graph H, escalation included, logged shot by shot to one file per
-# (d, p, T, mode) for `plot_latency_histograms.py`, which draws the two distributions.
-# No aggregation — this is the distribution, not the mean.
-add_executable(profiler_driver benchmarks/spec_matching/profiler_driver.cc ${SOURCE_FILES_NO_MAIN})
-target_include_directories(profiler_driver PRIVATE ${CMAKE_CURRENT_LIST_DIR})
-target_compile_options(profiler_driver PRIVATE ${ARCH_OPT})
-if (NOT (MSVC))
-    target_link_options(profiler_driver PRIVATE -pthread -O3)
-endif ()
-target_link_libraries(profiler_driver libstim)
-
 # sparse_graph_stats: the §3 H-structure profiler. Measures the structure of the sparsified graph H
 # and its matchability at horizon T — the escalation rate q, the connected components, their sizes,
 # degrees and diameters, and each component's own COMPLETE/TRUNCATED status. No latency, no timers,

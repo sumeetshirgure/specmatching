@@ -29,9 +29,8 @@ Per shot the profiler logs three latencies, and `run.log` states the definitions
     system   = escalated ? fallback : min(fallback, sparse_k)
 
 The histograms draw **`fallback` and `sparse_k`** — the two inputs the model combines, and the pair
-whose separation is the whole point of a `k` sweep. `system` is not drawn, for the same reason
-`plot_latency_histograms.py` does not draw its serial series: it is a per-shot `min` of the two, so
-its bulk is a second tracing of whichever side is faster, and its curve would sit on top of
+whose separation is the whole point of a `k` sweep. `system` is not drawn: it is a per-shot `min` of
+the two, so its bulk is a second tracing of whichever side is faster, and its curve would sit on top of
 `sparse_k` everywhere except the escalating tail. Its mean is on the figure as a reference rule, and
 its mean, max and percentiles are in the table. Nothing about it is hidden; it is simply not a third
 body of ink over the two it is derived from.
@@ -110,8 +109,8 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt  # noqa: E402
 from matplotlib.ticker import FuncFormatter  # noqa: E402
 
-# The corpus palette, taken from `plot_latency_histograms.py` so a reader moving between the two
-# scripts' output sees one visual language.
+# The corpus palette, shared with the other plotters here so a reader moving between their output
+# sees one visual language.
 #
 # Only slots 0 and 1 are used for series, and that is a checked decision rather than a stylistic one:
 # `validate_palette.js` puts slot 1 against slot 2 at ΔE 4.4 under protanopia (below the ΔE 6 floor,

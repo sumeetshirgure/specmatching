@@ -64,9 +64,8 @@ Two decoders, both stock sparse blossom, timed on the same shot in a fixed order
 
 The **front end** is `blossom + dscan + hrvst`: the solve on the sparsified graph `H`, the terminal
 `max_u Y(u)` dual scan that is the certificate's own cost, and the harvest. Ball intersect, the `H`
-build and the `Mwpm(H)` build are **not** charged to it — they are pipelined out. The profiler logs
-their sum separately as `excluded_ns`, and `plot_latency_histograms.py --include-excluded` adds them
-back to both series.
+build and the `Mwpm(H)` build are **not** charged to it — they are pipelined out. The profiler
+logged their sum separately as `excluded_ns`, which its reader could add back to both series.
 
 `speedup` throughout is `mean(stock) / mean(system)`, taken over every uncontaminated shot
 **including the escalating ones**. Dropping escalating shots would price the front end at a rate no
@@ -295,10 +294,10 @@ every timed window — this is the explanation for the table above, not another 
 
 ## Reproducing
 
-The command below is the one that produced the rows above. **`--k` no longer exists** — the flag is
-rejected rather than ignored, for the reason at the top of this file — so the sweep as written will
-not run against the current tree, and a run without it is not a reproduction of these numbers. It is
-recorded as provenance, not as an instruction.
+The command below is the one that produced the rows above. **`profiler_driver` no longer exists** —
+the binary and its reader `plot_latency_histograms.py` have been removed from the tree — and **`--k`
+no longer exists** either, for the reason at the top of this file. The command is recorded as
+provenance, not as an instruction; nothing in the current tree will run it.
 
 ```
 cmake -B build -DCMAKE_BUILD_TYPE=Release && cmake --build build --target profiler_driver -j4
@@ -327,15 +326,17 @@ from the library under it. Nothing about size is capped either — bin `k` count
 size exactly `k`, and there is no overflow bin, so the large-component tail the escalation rate is
 about is resolved rather than pooled.
 
-`profiler_driver` writes one CSV per `(d, p, T, mode)`, one row per shot, with no aggregation in
-the C++ at all — the reduction above is entirely in the reader. Draw the distributions with:
+Two readers take that output:
 
 ```
-python benchmarks/spec_matching/plot_latency_histograms.py results/latency
+python benchmarks/spec_matching/plot_component_distributions.py --in results/sparse_graph_stats \
+    --cells d=17,p=0.001,T=1.5
+python benchmarks/spec_matching/chart_fallback_rates.py --in results/sparse_graph_stats \
+    --cells d=17,p=0.001,T=1.5 d=21,p=0.001,T=1.5
 ```
 
-Add `--include-excluded` to charge ball intersect, the `H` build and the `Mwpm(H)` build to both
-series and get the honest CPU number instead of the critical-path one.
+The first draws the component size distribution of each cell on log-log axes; the second tabulates
+the fraction of shots escalated, grouped by `p`, then `d`, then `T`.
 
 The logs and figures this report was written from are not in the repository — they are ~750 MB of
 per-shot CSV. They live outside the tree, alongside it, in `m1_logs_August/`.

@@ -12,9 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-/// Benchmark scaffolding for `profiler_driver`: the surface-code corpus generator, the argument
-/// parsing helpers and the CSV writer it shares nothing with any more, kept in their own header so
-/// that the driver reads as the measurement it is.
+/// Benchmark scaffolding for the profilers under this directory: the surface-code corpus generator,
+/// the argument parsing helpers and the CSV writer, kept in their own header so that each binary
+/// reads as the measurement it is.
 
 #ifndef SPECMATCHING_BENCHMARKS_SPEC_MATCHING_PROFILER_UTIL_H
 #define SPECMATCHING_BENCHMARKS_SPEC_MATCHING_PROFILER_UTIL_H
