@@ -14,6 +14,8 @@
 
 #include "specmatching/sparse_blossom/flooder/graph_flooder.h"
 
+#include <algorithm>
+
 #include "specmatching/sparse_blossom/flooder/graph.h"
 #include "specmatching/sparse_blossom/flooder/graph_fill_region.h"
 #include "specmatching/sparse_blossom/flooder_matcher_interop/varying.h"
@@ -34,7 +36,11 @@ GraphFlooder::GraphFlooder(GraphFlooder &&flooder) noexcept
       negative_weight_observables(std::move(flooder.negative_weight_observables)),
       negative_weight_obs_mask(flooder.negative_weight_obs_mask),
       negative_weight_sum(flooder.negative_weight_sum),
-      horizon(flooder.horizon) {
+      horizon(flooder.horizon),
+      edge_mask(flooder.edge_mask),
+      edge_mask_offsets(flooder.edge_mask_offsets),
+      dual_cap(flooder.dual_cap),
+      dual_cap_hit(flooder.dual_cap_hit) {
 }
 
 void GraphFlooder::do_region_created_at_empty_detector_node(GraphFillRegion &region, DetectorNode &detector_node) {
@@ -47,8 +53,12 @@ void GraphFlooder::do_region_created_at_empty_detector_node(GraphFillRegion &reg
     reschedule_events_at_detector_node(detector_node);
 }
 
+/// `Masked` selects between the stock scan and the §4.1 masked one. With `Masked == false` the
+/// compiler sees the original body verbatim — `mask` is never named — so an unmasked instance pays
+/// nothing per neighbour.
+template <bool Masked>
 std::pair<size_t, cumulative_time_int> find_next_event_at_node_not_occupied_by_growing_top_region(
-    const DetectorNode &detector_node, VaryingCT rad1) {
+    const DetectorNode &detector_node, VaryingCT rad1, const uint8_t *mask) {
     cumulative_time_int best_time = std::numeric_limits<cumulative_time_int>::max();
     size_t best_neighbor = SIZE_MAX;
 
@@ -58,6 +68,12 @@ std::pair<size_t, cumulative_time_int> find_next_event_at_node_not_occupied_by_g
 
     // Handle non-boundary neighbors.
     for (size_t i = start; i < detector_node.neighbors.size(); i++) {
+        if constexpr (Masked) {
+            // §4.1: a masked half-edge is invisible. No collision across it, and no growth through
+            // it, which is what makes a cut of `H` a virtual boundary rather than a real one.
+            if (mask[i])
+                continue;
+        }
         auto weight = detector_node.neighbor_weights[i];
 
         auto neighbor = detector_node.neighbors[i];
@@ -75,13 +91,16 @@ std::pair<size_t, cumulative_time_int> find_next_event_at_node_not_occupied_by_g
     return {best_neighbor, best_time};
 }
 
+template <bool Masked>
 std::pair<size_t, cumulative_time_int> find_next_event_at_node_occupied_by_growing_top_region(
-    const DetectorNode &detector_node, const VaryingCT &rad1) {
+    const DetectorNode &detector_node, const VaryingCT &rad1, const uint8_t *mask) {
     cumulative_time_int best_time = std::numeric_limits<cumulative_time_int>::max();
     size_t best_neighbor = SIZE_MAX;
     size_t start = 0;
     if (!detector_node.neighbors.empty() && detector_node.neighbors[0] == nullptr) {
-        // Growing towards boundary
+        // Growing towards boundary. The boundary half-edge is never masked: a piece's dummy
+        // boundary *is* a boundary edge, and the cut it stands for is carried by the masked
+        // defect-defect edges instead.
         auto weight = detector_node.neighbor_weights[0];
         auto collision_time = weight - rad1.y_intercept();
         if (collision_time < best_time) {
@@ -93,6 +112,10 @@ std::pair<size_t, cumulative_time_int> find_next_event_at_node_occupied_by_growi
 
     // Handle non-boundary neighbors.
     for (size_t i = start; i < detector_node.neighbors.size(); i++) {
+        if constexpr (Masked) {
+            if (mask[i])
+                continue;
+        }
         auto weight = detector_node.neighbor_weights[i];
 
         auto neighbor = detector_node.neighbors[i];
@@ -120,10 +143,20 @@ std::pair<size_t, cumulative_time_int> GraphFlooder::find_next_event_at_node_ret
     const DetectorNode &detector_node) const {
     auto rad1 = detector_node.local_radius();
 
+    // One branch per node event, taken on a field that is `nullptr` for the whole lifetime of every
+    // instance but the fusion driver's. See `GraphFlooder::edge_mask`.
+    if (edge_mask == nullptr) {
+        if (rad1.is_growing()) {
+            return find_next_event_at_node_occupied_by_growing_top_region<false>(detector_node, rad1, nullptr);
+        } else {
+            return find_next_event_at_node_not_occupied_by_growing_top_region<false>(detector_node, rad1, nullptr);
+        }
+    }
+    const uint8_t *mask = edge_mask + edge_mask_offsets[(size_t)(&detector_node - graph.nodes.data())];
     if (rad1.is_growing()) {
-        return find_next_event_at_node_occupied_by_growing_top_region(detector_node, rad1);
+        return find_next_event_at_node_occupied_by_growing_top_region<true>(detector_node, rad1, mask);
     } else {
-        return find_next_event_at_node_not_occupied_by_growing_top_region(detector_node, rad1);
+        return find_next_event_at_node_not_occupied_by_growing_top_region<true>(detector_node, rad1, mask);
     }
 }
 
@@ -162,6 +195,27 @@ void GraphFlooder::schedule_tentative_shrink_event(GraphFillRegion &region) {
         queue);
 }
 
+void GraphFlooder::schedule_dual_cap_event(GraphFillRegion &region, cumulative_time_int inner_max) {
+    // While growing, `radius(t) = t + y_intercept`, so the radius reaches its cap `dual_cap -
+    // inner_max` at `t_cap`. Reaching it is legal — a dual of exactly `T` is what makes a `2T` edge
+    // tight, and `H` has those — so the event goes one tick later, at the first instant the region
+    // would grow *past* the cap. Everything scheduled at `t_cap` therefore still runs.
+    cumulative_time_int t_cap = (dual_cap - inner_max) - region.radius.y_intercept() + 1;
+    // A region released at a radius already at its cap is capped immediately rather than in the
+    // past; the queue is monotone and will not take an event cycle-before the present.
+    if (t_cap < queue.cur_time)
+        t_cap = queue.cur_time;
+    // EXEMPT from the horizon gate, like the shrink event whose tracker slot this borrows: the cap
+    // *is* this instance's truncation test, and gating it against a horizon it replaces would be
+    // circular.
+    region.shrink_event_tracker.set_desired_event(
+        {
+            &region,
+            cyclic_time_int{t_cap},
+        },
+        queue);
+}
+
 void GraphFlooder::do_region_arriving_at_empty_detector_node(
     GraphFillRegion &region, DetectorNode &empty_node, const DetectorNode &from_node, size_t from_to_empty_index) {
     empty_node.observables_crossed_from_source =
@@ -176,6 +230,13 @@ void GraphFlooder::do_region_arriving_at_empty_detector_node(
 }
 
 MwpmEvent GraphFlooder::do_region_shrinking(GraphFillRegion &region) {
+    // §4.2. A region that is not shrinking has no business having a shrink event: while it grows,
+    // its tracker slot holds the dual-cap event instead. So this *is* the cap firing — one of its
+    // member defects would now have a dual past `dual_cap`. Stop, and let the driver escalate.
+    if (dual_cap != NO_HORIZON && !region.radius.is_shrinking()) {
+        dual_cap_hit = true;
+        return MwpmEvent::no_event();
+    }
     if (region.shell_area.empty()) {
         return do_blossom_shattering(region);
     } else if (region.shell_area.size() == 1 && region.blossom_children.empty()) {
@@ -253,9 +314,19 @@ GraphFillRegion *GraphFlooder::create_blossom(std::vector<RegionEdge> &contained
         region_edge.region->shrink_event_tracker.set_no_desired_event();
     }
 
-    blossom_region->do_op_for_each_node_in_total_area([this](DetectorNode *n) {
+    // §4.2: the blossom's cap needs the largest frozen part among its member defects, and that is
+    // exactly `max wrapped_radius_cached` over the defects of its area — the children's radii were
+    // just frozen into the wrapped radii above. The sweep the formation already does is where it is
+    // taken from, so the cap costs a comparison per node and no second traversal.
+    cumulative_time_int inner_max = 0;
+    bool capped = dual_cap != NO_HORIZON;
+    blossom_region->do_op_for_each_node_in_total_area([this, capped, &inner_max](DetectorNode *n) {
+        if (capped && n->reached_from_source == n)
+            inner_max = std::max(inner_max, (cumulative_time_int)n->wrapped_radius_cached);
         reschedule_events_at_detector_node(*n);
     });
+    if (capped)
+        schedule_dual_cap_event(*blossom_region, inner_max);
 
     return blossom_region;
 }
@@ -294,9 +365,18 @@ void GraphFlooder::set_region_growing(GraphFillRegion &region) {
 
     // Node events can occur while growing, and events in the queue may occur sooner than
     // previously scheduled. Therefore, we must reschedule all the nodes.
-    region.do_op_for_each_node_in_total_area([this](DetectorNode *n) {
+    //
+    // §4.2 rides along: a growing region's `shrink_event_tracker` slot, cleared just above, now
+    // carries its dual cap instead, and the cap's `inner_max` is read off the same sweep.
+    cumulative_time_int inner_max = 0;
+    bool capped = dual_cap != NO_HORIZON;
+    region.do_op_for_each_node_in_total_area([this, capped, &inner_max](DetectorNode *n) {
+        if (capped && n->reached_from_source == n)
+            inner_max = std::max(inner_max, (cumulative_time_int)n->wrapped_radius_cached);
         reschedule_events_at_detector_node(*n);
     });
+    if (capped)
+        schedule_dual_cap_event(region, inner_max);
 }
 
 void GraphFlooder::set_region_frozen(GraphFillRegion &region) {
@@ -396,6 +476,13 @@ MwpmEvent GraphFlooder::run_until_next_mwpm_notification() {
             return MwpmEvent::no_event();
         }
         MwpmEvent notification = process_tentative_event_returning_mwpm_event(tentative_event);
+        // §4.2's truncation stop. A fired dual cap means some defect's dual would pass `dual_cap`,
+        // so the timeline must not go on: report "nothing further happens" and let the driver
+        // read the flag. With `dual_cap == NO_HORIZON` this is never set and the stock path is
+        // unchanged.
+        if (dual_cap_hit) {
+            return MwpmEvent::no_event();
+        }
         if (notification.event_type != NO_EVENT) {
             return notification;
         }

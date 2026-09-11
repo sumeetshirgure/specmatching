@@ -70,6 +70,7 @@ set(SOURCE_FILES_NO_MAIN
         src/specmatching/spec_matching/manifold/ball_graph.cc
         src/specmatching/spec_matching/manifold/ball_mwpm.cc
         src/specmatching/spec_matching/manifold/ball_decoding.cc
+        src/specmatching/spec_matching/fusion/fusion_solve.cc
         src/specmatching/spec_matching/certificate/max_dual.cc
         src/specmatching/spec_matching/escalation/escalate.cc
         src/specmatching/spec_matching/driver/spec_matching_decoding.cc
@@ -229,6 +230,47 @@ if (NOT (MSVC))
     target_link_options(load_balancer_profiler PRIVATE -pthread -O3)
 endif ()
 target_link_libraries(load_balancer_profiler libstim)
+
+# fusion_lb_profiler: the divide-and-conquer load balancer. An oversized component of H is cut into
+# pieces of at most ceil(n/k) defects inside the union-find pass that already finds the components;
+# each piece is solved as an independent MWPM problem in which the cut is a virtual boundary, and the
+# pieces are fused back by continuing blossom from their combined primal-dual state. Per shot it
+# logs the makespan of a simulated k-core list schedule over the measured cost of every leaf, fusion
+# and extraction, against the stock decode on G. Single thread — no thread is ever spawned.
+#
+# It is the one binary here that edits the solver: GraphFlooder gains an edge mask and a per-region
+# dual cap (see src/specmatching/sparse_blossom/flooder/graph_flooder.h). Both are inert — nullptr
+# and NO_HORIZON — on every instance but this binary's, which is what run.log records. Not in the
+# python wheel.
+#
+# Same three provenance defines as its companions, and for the same reason: the campaign artifact has
+# to record what produced it.
+add_executable(fusion_lb_profiler benchmarks/spec_matching/fusion_lb_profiler.cc ${SOURCE_FILES_NO_MAIN})
+target_include_directories(fusion_lb_profiler PRIVATE ${CMAKE_CURRENT_LIST_DIR})
+target_compile_options(fusion_lb_profiler PRIVATE ${ARCH_OPT})
+target_compile_definitions(fusion_lb_profiler PRIVATE
+        SPECMATCHING_GIT_HASH="${SPECMATCHING_GIT_HASH}"
+        SPECMATCHING_BUILD_FLAGS="${SPECMATCHING_BUILD_FLAGS}"
+        SPECMATCHING_STIM_VERSION="${SPECMATCHING_STIM_VERSION}")
+if (NOT (MSVC))
+    target_link_options(fusion_lb_profiler PRIVATE -pthread -O3)
+endif ()
+target_link_libraries(fusion_lb_profiler libstim)
+
+# The same binary with the §11 invariants live: `-UNDEBUG` turns the feasibility asserts of
+# `fusion_solve.cc` and the profiler's debug-only checks back on even in a Release tree, which is
+# what acceptance test 1 is run with.
+add_executable(fusion_lb_profiler_debug benchmarks/spec_matching/fusion_lb_profiler.cc ${SOURCE_FILES_NO_MAIN})
+target_include_directories(fusion_lb_profiler_debug PRIVATE ${CMAKE_CURRENT_LIST_DIR})
+target_compile_options(fusion_lb_profiler_debug PRIVATE ${ARCH_OPT} -UNDEBUG -g)
+target_compile_definitions(fusion_lb_profiler_debug PRIVATE
+        SPECMATCHING_GIT_HASH="${SPECMATCHING_GIT_HASH}"
+        SPECMATCHING_BUILD_FLAGS="${SPECMATCHING_BUILD_FLAGS} -UNDEBUG"
+        SPECMATCHING_STIM_VERSION="${SPECMATCHING_STIM_VERSION}")
+if (NOT (MSVC))
+    target_link_options(fusion_lb_profiler_debug PRIVATE -pthread -O3)
+endif ()
+target_link_libraries(fusion_lb_profiler_debug libstim)
 
 add_library(libspecmatching ${SOURCE_FILES_NO_MAIN})
 set_target_properties(libspecmatching PROPERTIES PREFIX "")
