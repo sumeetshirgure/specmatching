@@ -37,3 +37,4 @@ build.ninja
 tools
 design
 compile_commands.json
+obj
