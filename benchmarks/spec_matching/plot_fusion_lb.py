@@ -123,6 +123,19 @@ because the split of `cp_len` across the six buckets is not logged and inventing
 than saying so; the table prints the mean `cp_len` beside them so a reader can bound it. The two
 identities above are therefore always checked on raw numbers.
 
+## Which order the edges arrived in
+
+The profiler's `--sort` — the hardware sort that hands the union-find `H`'s edges in non-decreasing
+weight — is **off by default**, so "a cut falls on a component's heaviest links" is a property of the
+run and not of the binary. It changes which edges are refused, and with them the piece count, the
+fusion tree, the largest fusion boundary, how many regions a fusion releases and the makespan, which
+is every panel of the structure figure and most of the critical-path one. So it is read off
+`run.log`'s `edge_order=` line (`agg.json`'s `sort_edges` is the fallback) and printed in the table
+header and on both of those figures; no caption in this script asserts it. It also decides whether the
+`cut` column of the gate table means anything: the two cut-on-heaviest checks are claims about a
+sorted input and the profiler skips them without `--sort`, so the table says "not checked" rather than
+letting a `0` read as a pass.
+
 ## What travels with every number
 
 `run.log` states the model and a caveat, and they are not optional context: one shared solver
@@ -218,10 +231,12 @@ CRITICAL_PATH = ("manager", "build", "leaf", "fuse", "extract", "idle")
 # The manager core's work. The first three sum to `pre`; `dispatch_total` and `combine` are the
 # manager's other two jobs and are shown beside them rather than in a second figure.
 #
-# There is no `bucket`: the edge list arrives sorted from the hardware that produced it, the
-# simulator's stand-in `std::sort` is outside every timed region, and `run.log` records that as
-# `edge_order=sorted_by_hardware`. A run old enough to have the column reads as a missing bar here,
-# which is the right way round — a reader that silently averaged it into `pre` would be wrong.
+# There is no `bucket`, in either edge order: the design's bucketing pass is gone, and where a sort
+# does run (`--sort`) it is the hardware's, stood in for outside every timed region. `run.log` records
+# which order the run used as `edge_order=`, and `edge_order_note` is what puts it on the figure —
+# nothing here may assert it, because `--sort` is off by default. A run old enough to have the column
+# reads as a missing bar here, which is the right way round — a reader that silently averaged it into
+# `pre` would be wrong.
 MANAGER_MODULES = ("uf", "tree", "scatter", "dispatch_total", "combine")
 PRE_MODULES = ("uf", "tree", "scatter")
 
@@ -298,6 +313,36 @@ class Run:
     @property
     def verified(self):
         return self.meta.get("verify", "0").startswith("1")
+
+    @property
+    def edge_order(self):
+        """`sorted_by_hardware` or `input_order`, off `run.log`'s `edge_order=` line.
+
+        The profiler's `--sort` is off by default, so whether the union-find saw `H`'s edges in
+        non-decreasing weight is a property of the *run* and no longer one of the binary. It is the
+        difference between a cut on a component's heaviest links and a cut wherever the `ceil(n/k)`
+        threshold happened to bite, and it moves the structure figures and the makespan with it, so
+        every caption that used to assert the sorted order reads this instead.
+
+        `agg.json`'s `sort_edges` is the fallback for a log whose line was lost. `None` means neither
+        said, which is what a run older than the flag looks like if its log is gone — and is reported
+        as unknown rather than guessed at.
+        """
+        stated = self.meta.get("edge_order", "").split()
+        if stated:
+            return stated[0]
+        flag = self.agg.get("sort_edges")
+        if flag is True:
+            return "sorted_by_hardware"
+        if flag is False:
+            return "input_order"
+        return None
+
+    @property
+    def sorted_edges(self):
+        """Whether this run sorted its edge list by weight; `None` when the run does not say."""
+        order = self.edge_order
+        return None if order is None else order.startswith("sorted")
 
 
 def read_run_log(path):
@@ -617,11 +662,16 @@ def stream_groups(run, args):
 
 
 def wrap_caption(text, width=135):
-    """Re-wraps a caption to the figure width, keeping the author's own line breaks.
+    """Re-wraps a caption to a character width, keeping the author's own line breaks.
 
     A caption that runs off the right edge is a caption that was not read, and these say things — the
-    model, the warm-cache caveat, which shots are not in which series — that the figure is not honest
-    without.
+    model, the warm-cache caveat, which shots are not in which series, which order the edges arrived
+    in — that the figure is not honest without.
+
+    The width is the caller's, and `caption_block` derives it from the figure it is about to write
+    on: these range from four inches across (a one-cell run's small multiples) to fourteen (a four-k
+    sweep), and one constant cannot be right for both. 135 is the old wide default, kept for a direct
+    caller that has no figure in hand.
     """
     return "\n".join(
         textwrap.fill(line, width=width, break_long_words=False) if line else ""
@@ -790,6 +840,28 @@ def model_caveat(run):
     return "  ·  ".join(parts)
 
 
+def edge_order_note(run):
+    """Which order the union-find visited the edges in, in one line.
+
+    Taken from `run.log` rather than restated here, for the same reason as `model_caveat`: `--sort`
+    is off by default, so a caption that asserts the sorted order is a caption that is wrong about
+    most runs. The cut, the fusion tree and every structure panel depend on this, which is why it
+    goes on the figures and not only in the header.
+    """
+    sorted_edges = run.sorted_edges
+    if sorted_edges is None:
+        return "edge order: NOT STATED by this run — which links the cut fell on is unknown"
+    if sorted_edges:
+        return (
+            "edge order: sorted by weight (--sort), so the union-find saw every lighter alternative"
+            " first and the cut falls on a component's heaviest links"
+        )
+    return (
+        "edge order: the input's own (--sort off, the profiler's default), so the cut falls wherever"
+        " the ceil(n/k) threshold bit and NOT on a component's heaviest links"
+    )
+
+
 def clamp_note(cells):
     """What `--subtract-overhead` clamped, when it clamped enough to matter.
 
@@ -865,6 +937,24 @@ def save(fig, args, run, stem, theme):
 CAPTION_FONT_SIZE = 8.5
 
 
+# One character of caption text, as a fraction of the font size. matplotlib's default face is DejaVu
+# Sans, whose advance over mixed-case prose with spaces averages close to this; `caption_width` is
+# what turns it into a wrap column, and the margin below it absorbs the error either way.
+CAPTION_CHAR_EM = 0.52
+
+
+def caption_width(fig, margin_in=0.32):
+    """How many characters of caption fit across `fig`.
+
+    `wrap_caption`'s fixed 135 was tuned on the wide `k`-sweeps. A run with a single `k` draws its
+    small multiples four inches across, and there the last third of every caption wrapped past the
+    right edge of the canvas, where it was cropped without a warning — the figure looked finished and
+    was missing the sentence that said what it was. So the column comes from the figure's own width.
+    """
+    usable_points = max(1.0, (fig.get_figwidth() - margin_in) * 72.0)
+    return max(40, int(usable_points / (CAPTION_FONT_SIZE * CAPTION_CHAR_EM)))
+
+
 def caption_block(fig, theme, caption, top=0.94):
     """One caption under a figure, and the `rect` that leaves exactly room for it.
 
@@ -874,7 +964,7 @@ def caption_block(fig, theme, caption, top=0.94):
     band is `(lines * 0.16 + padding) / height` — capped, so a runaway caption cannot squeeze the
     panels to nothing.
     """
-    caption = wrap_caption(caption)
+    caption = wrap_caption(caption, width=caption_width(fig))
     lines = caption.count("\n") + 1
     height = fig.get_figheight()
     reserve = min(0.40, (lines * 0.16 + 0.18) / height)
@@ -1141,7 +1231,8 @@ def draw_critical_path(run, key, cells, args, theme):
         "Bottom row: the manager core's own work. The first three are the preprocessing regions and"
         " sum to pre; dispatch_total is every job assignment and combine is the final reduction."
         " These are serial — they do not shrink with k, and dispatch_total grows with it. There is no"
-        " bucket region: the edge list arrives sorted and the simulator's stand-in sort is untimed.\n"
+        " bucket region, and no sort is timed in either edge order.\n"
+        f"{edge_order_note(run)}.\n"
         "Means are over NON-ESCALATING shots only, as agg.json accumulates them.\n"
         + (
             f"cp_* are RAW even under --subtract-overhead (the split of cp_len across the six"
@@ -1333,6 +1424,7 @@ def draw_structure(run, key, cells, args, theme):
         " left after refusing any edge that would take a piece past ceil(n/k); the tree is the"
         " cheapest-boundary-first greedy over them; a fusion's boundary is how many crossing edges it"
         " turns interior; a release is a region whose dummy boundary was raised out from under it.\n"
+        f"{edge_order_note(run)} — every panel here is downstream of that choice.\n"
         "One hue: these are counts of one thing per panel, so identity is carried by the row label"
         " and not by colour. A shot with no defects contributes a 0 to every row."
     )
@@ -1357,6 +1449,7 @@ def table_lines(run, results, args):
         f"  timer {run.timer}  ·  thread-scoped {'yes' if run.thread_scoped else 'NO — WALL CLOCK'}"
         f"  ·  overhead {run.overhead_ns:.3f} ns/read"
     )
+    lines.append(f"  {edge_order_note(run)}")
 
     def first_word(key):
         return run.meta.get(key, "?").split()[0] if run.meta.get(key) else "?"
@@ -1473,7 +1566,7 @@ def table_lines(run, results, args):
         )
     lines.append("")
     lines.append("  manager-core means in nanoseconds; uf+tree+scatter = pre by construction")
-    lines.append("  no bucket region: the edge list arrives sorted and the stand-in sort is untimed")
+    lines.append("  no bucket region, and no sort is timed in either edge order; see the edge order above")
 
     # ---- work against path. One triple of columns per kind of solver work, so that the build —
     # which used to be the manager's whole-instance rebuild inside scatter — is visible as its own
@@ -1562,6 +1655,9 @@ def table_lines(run, results, args):
         lines.append("  div_* = shots where only one of the two escalated; a RATE difference, not an")
         lines.append("          exactness one — both directions are safe, see the profiler's deviation 9")
         lines.append("  thresh/cut/feas = the profiler's own §11 invariants; anything but 0 is a bug")
+        if run.sorted_edges is False:
+            lines.append("  cut = 0 here because it was NOT CHECKED: the two cut-on-heaviest tests are claims")
+            lines.append("          about a sorted input, and this run did not sort. thresh and feas did run")
         lines.append("  mgrwr/bindep/bfused = the per-piece build's own invariants: no solver-node write")
         lines.append("          on the manager between tree and scatter, leaves in reverse order leaving")
         lines.append("          byte-identical state, and both children built before a fusion. They are")

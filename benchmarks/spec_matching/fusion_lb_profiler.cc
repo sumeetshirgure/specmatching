@@ -56,13 +56,19 @@
 ///     parameters are set rather than four. `--T` is in **multiples of one lattice edge weight**,
 ///     as in every other binary in this directory, not in raw DEM float units; `run.log` records
 ///     `T`, `T_weight_units` and `T_int`.
-///  2. **The edge list arrives sorted (amendment 1 §1).** The hardware that produces the edge list
-///     sorts it, so the solver receives `H`'s edges in non-decreasing weight, ties by `(u, v)`, and
-///     no bucketing pass exists. The simulator stands in for that sort with a `std::sort` on the
-///     edge indices, run **outside every timed region** with the rest of the input; `ticks_bucket`
-///     is gone from every output. The refusal property of §3.2 needs only non-decreasing order,
-///     which this provides, and `(w, u, v)` is a strict total order on `H`'s edges, so the
-///     permutation is the one the design's bucketing would have produced.
+///  2. **The edge list arrives sorted (amendment 1 §1) — under `--sort`, which is off by default.**
+///     The hardware that produces the edge list sorts it, so the solver receives `H`'s edges in
+///     non-decreasing weight, ties by `(u, v)`, and no bucketing pass exists. The simulator stands in
+///     for that sort with a `std::sort` on the edge indices, run **outside every timed region** with
+///     the rest of the input; `ticks_bucket` is gone from every output. The refusal property of §3.2
+///     needs only non-decreasing order, which this provides, and `(w, u, v)` is a strict total order
+///     on `H`'s edges, so the permutation is the one the design's bucketing would have produced.
+///     Because the sort is what makes the cut fall on a component's heaviest links, it is a flag
+///     rather than a fixture: **without `--sort` no sort runs at all** and the union-find visits the
+///     edges in the order `build_ball_graph` emitted them. That is a different cut, not a wrong one —
+///     pieces are still bounded by `S = ceil(n / k)` and `--verify`'s weight identity still holds —
+///     and comparing the two runs is how the heaviest-links heuristic is priced. `run.log` records
+///     `edge_order` and `agg.json` a `sort_edges` field.
 ///  3. **When the quotient graph is built (§3.2/§3.3).** The design records a refused edge against
 ///     the pair of union-find roots its endpoints have *at the moment of refusal*. Those roots are
 ///     not final — a refusal between `a` and `b` does not stop `a` from later merging with some
@@ -238,6 +244,11 @@ struct Options {
     size_t shots = 10000;
     size_t warmup = 1000;
     uint64_t seed = 20260910;
+    /// Whether the edge list is sorted by weight before the union-find sees it (amendment 1 §1).
+    /// **Off by default**: `--sort` turns the sort on, and without it the union-find visits `H`'s
+    /// edges in the order the ball-graph builder emitted them, which is what makes "does the cut
+    /// have to fall on the heaviest links?" a question this binary can answer by measurement.
+    bool sort_edges = false;
     bool verify = false;
     bool check_determinism = false;
     std::string out_dir = "benchmarks/spec_matching/results/fusion_lb_profiler";
@@ -268,6 +279,8 @@ Options parse_options(int argc, char** argv) {
             options.warmup = std::stoul(next());
         } else if (flag == "--seed") {
             options.seed = std::stoull(next());
+        } else if (flag == "--sort") {
+            options.sort_edges = true;
         } else if (flag == "--verify") {
             options.verify = true;
         } else if (flag == "--check-determinism") {
@@ -890,6 +903,8 @@ struct CellRunner {
     /// §8's monolithic reference, on its own instance so the two solves share no state.
     BallMwpm* reference{nullptr};
     size_t k{0};
+    /// `--sort`. Off by default; see `sort_edges`.
+    bool sort_by_weight{false};
 
     /// The adjacency index of each crossing edge's two directions. Each half is filled by the build
     /// of the piece that owns that endpoint (amendment 1 §3.2), where the index is known, rather
@@ -989,9 +1004,19 @@ struct CellRunner {
     // §3. Preprocessing, on the manager core.
     // -----------------------------------------------------------------------------------------
 
-    /// Amendment 1 §1. The hardware's sort, stood in for by a `std::sort`, **outside every timed
-    /// region**: the edge list reaches the solver already in non-decreasing weight, ties by
-    /// `(u, v)`, because the sort happens in the same place the edge list is produced.
+    /// Amendment 1 §1, under `--sort`. The hardware's sort, stood in for by a `std::sort`,
+    /// **outside every timed region**: the edge list reaches the solver already in non-decreasing
+    /// weight, ties by `(u, v)`, because the sort happens in the same place the edge list is
+    /// produced.
+    ///
+    /// **Without `--sort` (the default) no sort happens at all** and `cut->order` is the identity:
+    /// the union-find visits the edges in the order the ball-graph builder emitted them. Nothing
+    /// downstream requires the weight order — a piece is still at most `S = ceil(n / k)` defects, a
+    /// defect's dummy boundary is still the minimum over its refused edges rather than the first one
+    /// seen, and `--verify`'s weight identity still holds — but the *cut is a different cut*: it no
+    /// longer falls on a component's heaviest links, which is the effect this flag exists to
+    /// measure. The two order-dependent halves of §11 test 4 are skipped in that mode; see
+    /// `check_structure`.
     ///
     /// Leaves `cut->order` a permutation of the edge indices in that order. `h.edges` itself is left
     /// alone — it is sorted by `(i, j)`, which is what `--verify`'s monolithic `rebuild` needs.
@@ -1000,6 +1025,8 @@ struct CellRunner {
         c.order.resize(h.edges.size());
         for (uint32_t e = 0; e < (uint32_t)h.edges.size(); e++)
             c.order[e] = e;
+        if (!sort_by_weight)
+            return;
         // `(w, u, v)` is a strict total order on `H`'s edges, so there is no tie for an unstable
         // sort to break differently from one run to the next.
         std::sort(c.order.begin(), c.order.end(), [&](uint32_t a, uint32_t b) {
@@ -1052,9 +1079,10 @@ struct CellRunner {
                 continue;
             }
             // Refused: this edge is a crossing edge, and both endpoints gain (or tighten) a dummy
-            // boundary at half its weight. Edges arrive in non-decreasing weight and `floor(w / 2)`
-            // is monotone in `w`, so the first refusal at a defect already sets its final `bnd` and
-            // the two lines below are no-ops on every later one.
+            // boundary at half its weight. Under `--sort` the edges arrive in non-decreasing weight
+            // and `floor(w / 2)` is monotone in `w`, so the first refusal at a defect already sets
+            // its final `bnd` and the two lines below are no-ops on every later one; unsorted they
+            // are a running minimum, which is what the two comparisons already compute.
             c.refused.push_back(e);
             pm::weight_int half = fus::even_dummy_weight(edge.w_int);
             if (half < c.bnd[edge.i]) {
@@ -1317,8 +1345,9 @@ struct CellRunner {
             c.node_degree[edge.j]++;
         }
 
-        // ---- Step 2: counting sort by piece. The fill walks the sorted order, so each piece's
-        // slice comes out in non-decreasing weight, exactly as the whole list is.
+        // ---- Step 2: counting sort by piece. The fill walks `order`, so each piece's slice comes
+        // out in whatever order the whole list is in — non-decreasing weight under `--sort`, input
+        // order without it.
         for (uint32_t i = 0; i < c.n_pieces; i++) {
             c.piece_edge_offsets[i + 1] += c.piece_edge_offsets[i];
             c.fill_cursor[i] = c.piece_edge_offsets[i];
@@ -1499,7 +1528,8 @@ struct CellRunner {
         for (size_t e = 0; e < h.edges.size(); e++)
             edge_obs[e] = edge_obs_mask(h.edges[e].entry);
 
-        // The hardware's sort, outside every timed region (amendment 1 §1).
+        // The hardware's sort, outside every timed region (amendment 1 §1). A no-op that leaves
+        // `order` the identity unless `--sort` was given.
         sort_edges(h);
 
         // The previous shot's adjacency is what makes a node "built"; dropping it is what marks
@@ -2155,6 +2185,11 @@ struct CellRunner {
     /// as heavy as it. Together those are §3.2's paragraph. (Checking "every crossing edge is at
     /// least as heavy as the lightest crossing edge of the same pair" on its own would be a
     /// tautology, which is why it is not what is checked.)
+    ///
+    /// Two of the three are claims about a sorted input, so they are checked only under `--sort`.
+    /// Without it the run is not claiming cut-on-heaviest at all — measuring what dropping the claim
+    /// costs is the point of the flag — and only the `S = ceil(n / k)` bound and "no refusal was
+    /// wasted", both of which hold in either order, are checked.
     void check_structure(const BallGraph& h, int64_t& threshold_violations, int64_t& heaviest_violations) {
         Cut& c = *cut;
         uint32_t n = (uint32_t)h.num_nodes();
@@ -2165,15 +2200,20 @@ struct CellRunner {
             if (c.piece_offsets[piece + 1] - c.piece_offsets[piece] > threshold)
                 threshold_violations++;
         }
-        for (size_t at = 1; at < c.order.size(); at++) {
-            if (h.edges[c.order[at]].w_int < h.edges[c.order[at - 1]].w_int)
-                heaviest_violations++;
+        // The two order-dependent facts are claims about a *sorted* input, so they are only checked
+        // when there was one. Without `--sort` neither holds by construction and counting them would
+        // report a violation per shot for a property the run is not claiming.
+        if (sort_by_weight) {
+            for (size_t at = 1; at < c.order.size(); at++) {
+                if (h.edges[c.order[at]].w_int < h.edges[c.order[at - 1]].w_int)
+                    heaviest_violations++;
+            }
         }
         for (uint32_t e : c.refused) {
             if (c.piece_of[h.edges[e].i] == c.piece_of[h.edges[e].j])
                 heaviest_violations++;
         }
-        for (uint32_t node = c.n_pieces; node < c.n_tree_nodes; node++) {
+        for (uint32_t node = c.n_pieces; sort_by_weight && node < c.n_tree_nodes; node++) {
             for (uint32_t at = c.interior_offsets[node] + 1; at < c.interior_offsets[node + 1]; at++) {
                 if (h.edges[c.interior_edges[at]].w_int < h.edges[c.interior_edges[at - 1]].w_int)
                     heaviest_violations++;
@@ -2280,6 +2320,7 @@ void write_aggregate(std::ofstream& out, const Options& options, const std::vect
     out << "  \"tick_unit\": \"" << hires_timer_name() << ", uncorrected; see run.log timer_overhead_ns\",\n";
     out << "  \"seed\": " << options.seed << ",\n";
     out << "  \"alpha\": " << fmt_g(options.alpha) << ",\n";
+    out << "  \"sort_edges\": " << (options.sort_edges ? "true" : "false") << ",\n";
     out << "  \"verify\": " << (options.verify ? "true" : "false") << ",\n";
     out << "  \"module_means_over\": \"non-escalating shots only (deviation 5)\",\n";
     out << "  \"cells\": [\n";
@@ -2569,6 +2610,7 @@ void run_dp_cell(
     runner.shared = &shared;
     runner.fusion = &fusion;
     runner.reference = &reference;
+    runner.sort_by_weight = options.sort_edges;
     runner.configure(n_max, num_observables, k_max);
     runner.refused_slot.reserve(INITIAL_EDGE_CAPACITY);
     runner.feasibility_scratch.reserve(n_max);
@@ -2604,7 +2646,8 @@ void run_dp_cell(
                 throw std::runtime_error("could not open " + path.str() + " for writing");
             shots_csv << "# d=" << distance << ",p=" << fmt_g(noise) << ",T=" << fmt_g(horizon) << ",k=" << k
                       << ",alpha=" << fmt_g(options.alpha) << ",seed=" << options.seed
-                      << ",tick_unit=" << hires_timer_name() << ",uncorrected=1\n";
+                      << ",sort=" << (options.sort_edges ? 1 : 0) << ",tick_unit=" << hires_timer_name()
+                      << ",uncorrected=1\n";
             shots_csv << "shot,n_def,n_edges,escalated,"
                          "n_pieces,largest_piece,n_refused,n_fusions,tree_depth,max_fusion_boundary,n_released,"
                          "ticks_uf,ticks_tree,ticks_scatter,ticks_pre,"
@@ -2757,9 +2800,21 @@ int main(int argc, char** argv) {
            " are outside every timed region; so are the edge-list sort, the per-edge and per-defect"
            " observable lookups, marking the shared instance's nodes unbuilt, the instance reset"
            " (reset_for_next_shot / abandon_shot) and the --verify cross-check\n";
-    log << "edge_order=sorted_by_hardware (std::sort in simulator, untimed): the edge list reaches"
-           " the solver in non-decreasing weight, ties by (u, v), because the sort happens in the"
-           " hardware that produces it. No bucket arena exists and there is no ticks_bucket column.\n";
+    if (options.sort_edges) {
+        log << "edge_order=sorted_by_hardware (--sort; std::sort in simulator, untimed): the edge list"
+               " reaches the solver in non-decreasing weight, ties by (u, v), because the sort happens"
+               " in the hardware that produces it. No bucket arena exists and there is no ticks_bucket"
+               " column.\n";
+    } else {
+        log << "edge_order=input_order (--sort NOT given, the default): no sort of any kind runs and the"
+               " union-find visits H's edges in the order build_ball_graph emitted them, so the cut does"
+               " NOT fall on a component's heaviest links. Every piece is still at most S = ceil(n/k)"
+               " defects and --verify's weight identity still holds, because a defect's dummy boundary is"
+               " the minimum over its refused edges rather than the first one seen; what changes is WHICH"
+               " edges are refused, and therefore n_refused, the fusion tree and the latency. The two"
+               " order-dependent halves of test 4 (cut-on-heaviest) are skipped. No bucket arena exists"
+               " and there is no ticks_bucket column.\n";
+    }
     log << "graph_build=per_piece_in_leaf (no whole-instance rebuild per shot): each leaf writes the"
            " adjacency, weights, observable masks, mask bytes and boundary edge of its own defects,"
            " on its own core, as the first of its two timed regions. The manager used to do all of"
@@ -2838,7 +2893,9 @@ int main(int argc, char** argv) {
            " arrive already sorted, so the simulator's stand-in std::sort is untimed and w_1 and the"
            " bucket count are no longer used anywhere. The refusal property needs only non-decreasing"
            " weight, which the sorted input gives, and (w, u, v) is a strict total order on H's edges"
-           " so the permutation is the one bucketing would have produced.\n";
+           " so the permutation is the one bucketing would have produced. That sorted input is itself"
+           " under a flag here: --sort turns it on and it is OFF by default, so the default run"
+           " measures what the unsorted order costs. See edge_order above.\n";
     log << "deviation_3=the quotient graph is keyed on the pieces' FINAL ids, built from the refused"
            " list at the end of the same timed uf region, because a union-find root at the moment of"
            " refusal is not final\n";
@@ -2863,8 +2920,10 @@ int main(int argc, char** argv) {
            " tick before a piece is injected and before a fusion releases anything. Both points sit"
            " between solves, where the queue is drained, so the nudge disturbs no scheduled event.\n";
     log << "balancer=cut inside the union-find: an edge whose union would take a piece past"
-           " S = ceil(n/k) is refused and becomes a crossing edge. Edges are visited in"
-           " non-decreasing weight, so a cut falls on the heaviest links of a component.\n";
+           " S = ceil(n/k) is refused and becomes a crossing edge. Under --sort the edges are visited"
+           " in non-decreasing weight, so a cut falls on the heaviest links of a component; without it"
+           " (the default) they are visited in input order and the cut falls wherever the threshold"
+           " happens to bite.\n";
     log << "fusion_tree=cheapest-boundary-first greedy (Huffman with the crossing count as the merge"
            " cost), min-heap keyed on (crossing_count, min_id, max_id), stale entries discarded on"
            " pop. It minimises the boundary of each individual fusion, not the depth of the tree;"
