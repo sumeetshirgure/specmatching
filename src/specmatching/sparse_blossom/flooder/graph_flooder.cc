@@ -309,6 +309,8 @@ GraphFillRegion *GraphFlooder::create_blossom(std::vector<RegionEdge> &contained
     blossom_region->radius = VaryingCT::growing_varying_with_zero_distance_at_time(queue.cur_time);
     blossom_region->blossom_children = std::move(contained_regions);
     for (auto &region_edge : blossom_region->blossom_children) {
+        // Freezing a child here bypasses `set_region_frozen`, so the cap tie-break is taken by hand.
+        note_growth_ending(*region_edge.region);
         region_edge.region->radius = region_edge.region->radius.then_frozen_at_time(queue.cur_time);
         region_edge.region->wrap_into_blossom(blossom_region);
         region_edge.region->shrink_event_tracker.set_no_desired_event();
@@ -379,7 +381,20 @@ void GraphFlooder::set_region_growing(GraphFillRegion &region) {
         schedule_dual_cap_event(region, inner_max);
 }
 
+void GraphFlooder::note_growth_ending(GraphFillRegion &region) {
+    if (dual_cap == NO_HORIZON || !region.radius.is_growing())
+        return;
+    if (!region.shrink_event_tracker.has_desired_time)
+        return;
+    // Monotone queue: `cur_time` never passes an event that is still in it, so "due" is equality.
+    // The comparison is cyclic because that is the form the tracker stores.
+    if (!(region.shrink_event_tracker.desired_time == cyclic_time_int{queue.cur_time}))
+        return;
+    dual_cap_hit = true;
+}
+
 void GraphFlooder::set_region_frozen(GraphFillRegion &region) {
+    note_growth_ending(region);
     bool was_shrinking = region.radius.is_shrinking();
     region.radius = region.radius.then_frozen_at_time(queue.cur_time);
 
@@ -397,6 +412,7 @@ void GraphFlooder::set_region_frozen(GraphFillRegion &region) {
 }
 
 void GraphFlooder::set_region_shrinking(GraphFillRegion &region) {
+    note_growth_ending(region);
     region.radius = region.radius.then_shrinking_at_time(queue.cur_time);
 
     // Shrinking events can now occur.
@@ -463,6 +479,12 @@ MwpmEvent GraphFlooder::process_tentative_event_returning_mwpm_event(FloodCheckE
 
 MwpmEvent GraphFlooder::run_until_next_mwpm_notification() {
     while (true) {
+        // A cap that `note_growth_ending` recorded during the caller's `process_event` is read here,
+        // before another event is dequeued: the timeline is already past `dual_cap` and everything
+        // after this point would be solving a different problem.
+        if (dual_cap_hit) {
+            return MwpmEvent::no_event();
+        }
         FloodCheckEvent tentative_event = dequeue_valid();
         if (tentative_event.tentative_event_type == NO_FLOOD_CHECK_EVENT) {
             return MwpmEvent::no_event();

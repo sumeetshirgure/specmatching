@@ -1499,6 +1499,9 @@ struct CellRunner {
     template <bool Profile>
     void run_shot(const std::vector<uint64_t>& shot, ShotMeasurement& out) {
         Cut& c = *cut;
+#ifndef NDEBUG
+        current_syndrome = &shot;
+#endif
         auto tick = []() -> uint64_t {
             if constexpr (Profile)
                 return hires_now_ns();
@@ -2018,6 +2021,43 @@ struct CellRunner {
         return length;
     }
 
+#ifndef NDEBUG
+    /// Every defect of the failing job whose own dual or one of whose unmasked edges is infeasible,
+    /// with the cut's bookkeeping for it beside the solver's state. Debug builds only.
+    std::string describe_feasibility_failure(const Job& job) {
+        Cut& c = *cut;
+        const pm::Mwpm& mwpm = shared->mwpm;
+        const pm::MatchingGraph& graph = mwpm.flooder.graph;
+        pm::cumulative_time_int now = mwpm.flooder.queue.cur_time;
+        std::ostringstream out;
+        out << "\n  T=" << fusion->horizon << " now=" << now;
+        size_t shown = 0;
+        for (uint32_t u : feasibility_scratch) {
+            const pm::DetectorNode& node = graph.nodes[u];
+            pm::cumulative_time_int dual = node.local_radius().get_distance_at_time(now);
+            if (dual <= fusion->horizon)
+                continue;
+            if (shown++ >= 8) {
+                out << "\n  ...";
+                break;
+            }
+            out << "\n  defect " << u << ": dual=" << dual << " (over by " << (dual - fusion->horizon)
+                << ") piece=" << c.piece_of[u] << " bnd=" << (int64_t)c.bnd[u]
+                << " via_dummy=" << (int)c.via_dummy[u] << " w_boundary=" << (int64_t)c.w_boundary[u]
+                << " wrapped=" << node.wrapped_radius_cached
+                << " top_radius=" << (node.region_that_arrived_top != nullptr
+                                          ? node.region_that_arrived_top->radius.get_distance_at_time(now)
+                                          : -1)
+                << " in_blossom=" << (node.region_that_arrived != node.region_that_arrived_top)
+                << " crossing_edges=" << (c.cross_offsets[u + 1] - c.cross_offsets[u]);
+        }
+        out << "\n  fusing node " << job.node << " children " << c.tree_child0[job.node] << ','
+            << c.tree_child1[job.node] << " interior_edges="
+            << (c.interior_offsets[job.node + 1] - c.interior_offsets[job.node]);
+        return out.str();
+    }
+#endif
+
     /// §11 test 1. Debug builds only; compiled out entirely when `NDEBUG` is set.
     void check_feasibility(const Job& job, TimelineStatus status) {
 #ifdef NDEBUG
@@ -2032,8 +2072,22 @@ struct CellRunner {
         feasibility_scratch.clear();
         collect_defects(job.node, c, feasibility_scratch);
         const char* why = nullptr;
-        if (!fus::feasibility_holds(*fusion, feasibility_scratch.data(), feasibility_scratch.size(), &why))
+        if (!fus::feasibility_holds(*fusion, feasibility_scratch.data(), feasibility_scratch.size(), &why)) {
             feasibility_failures++;
+            if (!first_failure.seen) {
+                first_failure.seen = true;
+                first_failure.shot = shot_ordinal;
+                first_failure.warmup = shot_is_warmup;
+                first_failure.why = why;
+                first_failure.job_is_leaf = job.kind == JobKind::LEAF;
+                first_failure.node = job.node;
+                first_failure.n_pieces = cut->n_pieces;
+                first_failure.defects = feasibility_scratch;
+                if (current_syndrome != nullptr)
+                    first_failure.syndrome = *current_syndrome;
+                first_failure.detail = describe_feasibility_failure(job);
+            }
+        }
 #endif
     }
 
@@ -2055,6 +2109,33 @@ struct CellRunner {
 
     std::vector<uint32_t> feasibility_scratch;
     int64_t feasibility_failures{0};
+
+    /// §11 test 1's *first* failure, in full. `check_feasibility` used to discard `why` and only
+    /// count, so a violation aborted the cell with nothing to reproduce from — no shot index, no
+    /// check name and no syndrome. Everything here is already in hand at the moment the predicate
+    /// returns false; keeping it costs one copy on a run that is about to abort anyway.
+    struct FeasibilityFailure {
+        bool seen{false};
+        /// Index within the cell, warm-up shots included; `warmup` says which numbering it is in.
+        uint64_t shot{0};
+        bool warmup{false};
+        /// `feasibility_holds`' own failure string — which of the four checks tripped.
+        const char* why{nullptr};
+        bool job_is_leaf{false};
+        uint32_t node{0};
+        uint32_t n_pieces{0};
+        std::vector<uint32_t> defects;
+        /// The shot's detection-event words, so the failure can be replayed.
+        std::vector<uint64_t> syndrome;
+        std::string detail;
+    };
+    FeasibilityFailure first_failure;
+    /// The shot being run, for `first_failure`. Set at the top of `run_shot`, debug builds only.
+    const std::vector<uint64_t>* current_syndrome{nullptr};
+    /// Which shot that is, in the cell's own numbering. Written by the shot loop for both builds —
+    /// it is two stores outside every timed region, and `--check-determinism` re-runs the loop.
+    uint64_t shot_ordinal{0};
+    bool shot_is_warmup{false};
 
     // -----------------------------------------------------------------------------------------
     // Amendment 1's tests 7, 8 and 9. All three are debug-only and compile out entirely under
@@ -2418,6 +2499,8 @@ Digest run_cell(
         for (size_t i = 0; i < batch; i++) {
             size_t index = done + i;
             bool measured = index >= options.warmup;
+            runner.shot_ordinal = measured ? (uint64_t)(index - options.warmup) : (uint64_t)index;
+            runner.shot_is_warmup = !measured;
             if (measured)
                 runner.run_shot<true>(sampler.shots[i], measurement);
             else
@@ -2634,6 +2717,7 @@ void run_dp_cell(
 
             runner.k = k;
             runner.feasibility_failures = 0;
+            runner.first_failure = CellRunner::FeasibilityFailure();
             runner.manager_graph_write_failures = 0;
             runner.build_independence_failures = 0;
             runner.built_before_fused_failures = 0;
@@ -2727,8 +2811,27 @@ void run_dp_cell(
                 throw std::runtime_error("test 3 (threshold): a piece exceeded ceil(n/k) at " + std::string(label));
             if (aggregate.cut_on_heaviest_violations != 0)
                 throw std::runtime_error("test 4 (cut-on-heaviest) failed at " + std::string(label));
-            if (aggregate.feasibility_violations != 0)
+            if (aggregate.feasibility_violations != 0) {
+                // The first failure, spelled out, so that an aborted cell names a shot to replay
+                // rather than only a count. Both `run.log` and stderr get it: the log is what a
+                // campaign keeps, and a run that aborts in a terminal usually has no reader for it.
+                std::ostringstream detail;
+                const CellRunner::FeasibilityFailure& f = runner.first_failure;
+                if (f.seen) {
+                    detail << "first at " << (f.warmup ? "warmup shot " : "shot ") << f.shot << ", "
+                           << (f.job_is_leaf ? "LEAF" : "FUSE") << " node " << f.node << " of " << f.n_pieces
+                           << " pieces, " << f.defects.size() << " defects, check: \""
+                           << (f.why != nullptr ? f.why : "?") << "\"";
+                    detail << "\n  syndrome (" << f.syndrome.size() << " words, hex):";
+                    for (uint64_t word : f.syndrome)
+                        detail << ' ' << std::hex << word << std::dec;
+                    detail << f.detail;
+                }
+                log << "  test 1 (feasibility) " << detail.str() << "\n";
+                log.flush();
+                std::fprintf(stderr, "\n  test 1 (feasibility) %s\n", detail.str().c_str());
                 throw std::runtime_error("test 1 (feasibility invariant) failed at " + std::string(label));
+            }
             if (aggregate.manager_graph_write_violations != 0)
                 throw std::runtime_error(
                     "amendment test 7 (no manager-side graph work) failed at " + std::string(label));
@@ -2884,7 +2987,12 @@ int main(int argc, char** argv) {
            " GraphFlooder::schedule_dual_cap_event - the per-region horizon above. The cap event"
            " rides the region's shrink_event_tracker, which is idle for exactly as long as the"
            " region is growing, so GraphFillRegion is not widened. NO_HORIZON on every instance but"
-           " this binary's.\n";
+           " this binary's. The cap event sits one tick past the cap so that a collision at a dual of"
+           " exactly T - the way a 2T edge goes tight - still runs; the queue orders nothing within a"
+           " timestamp, so GraphFlooder::note_growth_ending is the tie-break: a growing region whose"
+           " cap is due when it stops growing counts as having fired it. Without that, an event at the"
+           " cap's own time could be dequeued first, match the region and clear the tracker slot the"
+           " cap was riding, and the solve would finish COMPLETE with a defect one unit over T.\n";
     log << "decoder_otherwise_unchanged=1 (nothing else under src/specmatching/ is edited)\n";
     log << "deviation_1=file lives in benchmarks/spec_matching/, not benchmarks/two_phase/; the"
            " generator call is this corpus's own (rotated_memory_x, three noise parameters); --T is"

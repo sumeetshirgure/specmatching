@@ -133,6 +133,17 @@ struct GraphFlooder {
     /// Exposed because the fusion driver creates detection events at a non-zero clock itself and has
     /// to cap them exactly as `set_region_growing` would.
     void schedule_dual_cap_event(GraphFillRegion& region, cumulative_time_int inner_max);
+    /// §4.2. Reports a growing region that is about to stop growing while its own dual-cap event is
+    /// already due, which means its radius is one tick past the cap.
+    ///
+    /// `schedule_dual_cap_event` puts the cap at the first instant the region would grow *past* it,
+    /// so that a collision at a dual of exactly `dual_cap` — which is legal, and is how a `2T` edge
+    /// goes tight — still runs. The queue gives no order among events that share a timestamp,
+    /// though, so an event at the cap's own time can be dequeued first; if it matches or blossoms
+    /// the region, `set_region_frozen` clears the tracker slot the cap was riding and the cap is
+    /// lost. The timeline then finishes with that region's defects one unit over `dual_cap`. This is
+    /// the tie-break: a cap that was due when growth ended counts as fired.
+    void note_growth_ending(GraphFillRegion& region);
     void reschedule_events_at_detector_node(DetectorNode& detector_node);
     void do_region_created_at_empty_detector_node(GraphFillRegion& region, DetectorNode& detector_node);
     void do_region_arriving_at_empty_detector_node(
