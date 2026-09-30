@@ -83,10 +83,10 @@ produced by the `fusion_lb_profiler` binary.
 
 **Settings.** Rotated surface code, `rotated_memory_x`, `rounds = d`, one observable; uniform
 circuit noise `p = 0.001` (after-Clifford depolarisation, after-reset flip, before-measurement
-flip); horizon `T = 2` lattice edge weights (`T_int = 32548`, ball radius `R = 2 T`); `k = 10`
-solver cores, plus one resource-manager core and one fallback core; 100,000 shots per cell after
+flip); horizon `T = 2` lattice edge weights (`T_int = 32548`, ball radius `R = 2 T`); `k = 7`
+solver cores, plus one resource-manager core and one fallback core; 500,000 shots per cell after
 1,000 untimed warm-up shots; seed `20260910`; stim v1.16.0; git `1597694`; macOS, `-O3`,
-thread-scoped CPU clock with 125.5 ns per read, raw uncorrected ticks.
+thread-scoped CPU clock with 120.4 ns per read, raw uncorrected ticks.
 Ran on an Apple M5 Pro chip (2026).
 
 `fallback` is stock exact sparse blossom on `G` from the full syndrome, run on **every** shot.
@@ -95,13 +95,13 @@ Ran on an Apple M5 Pro chip (2026).
 
 | `d` | shots | escalated | `fallback` | `sparse_k` | `system` | **speedup** | `system` p99 | `system` p99.9 |
 |--:|--:|--:|--:|--:|--:|--:|--:|--:|
-| 17 | 100,000 | 20 (0.020%) | 8.27 µs | 8.92 µs | 7.61 µs | **1.09x** | 13.42 µs | 17.17 µs |
-| 25 | 100,000 | 54 (0.054%) | 35.72 µs | 14.91 µs | 14.93 µs | **2.39x** | 26.46 µs | 35.75 µs |
-| 31 | 100,000 | 74 (0.074%) | 77.42 µs | 24.01 µs | 24.06 µs | **3.22x** | 37.62 µs | 52.12 µs |
+| 17 | 500,000 | 123 (0.025%) | 8.33 µs | 7.88 µs | 7.13 µs | **1.17x** | 13.25 µs | 16.75 µs |
+| 25 | 500,000 | 312 (0.062%) | 34.95 µs | 16.31 µs | 16.33 µs | **2.14x** | 30.00 µs | 39.42 µs |
+| 31 | 500,000 | 458 (0.092%) | 76.53 µs | 28.70 µs | 28.76 µs | **2.66x** | 46.17 µs | 64.92 µs |
 
-The speedup grows with `d` because `fallback` scales with the whole of `G` (8.3 → 77.4 µs from
+The speedup grows with `d` because `fallback` scales with the whole of `G` (8.3 → 76.5 µs from
 `d = 17` to `d = 31`) while the critical path scales with the pieces `H` breaks the shot into
-(8.9 → 24.0 µs over the same range). At `d = 17` the two sides are nearly a wash; the decomposition
+(7.9 → 28.7 µs over the same range). At `d = 17` the win is small; the decomposition
 has real overhead and there is not enough work to hide it behind.
 
 ### Where the critical path goes
@@ -114,13 +114,13 @@ the fusion work, `extract` reads the matching out.
 
 | `d` | manager | build | leaf solve | fuse | extract | `sparse_k` | manager share | work / path | pieces | tree depth |
 |--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|
-| 17 | 6,200 | 163 | 566 | 1,567 | 426 | 8,922 | 69% | 6.9x | 18.2 | 3.4 |
-| 25 | 10,001 | 743 | 1,869 | 1,327 | 974 | 14,914 | 67% | 10.1x | 37.3 | 3.3 |
-| 31 | 14,745 | 1,745 | 4,411 | 1,393 | 1,719 | 24,013 | 61% | 9.6x | 60.3 | 3.5 |
+| 17 | 3,774 | 481 | 1,429 | 1,698 | 499 | 7,881 | 48% | 4.1x | 15.7 | 2.6 |
+| 25 | 7,344 | 1,485 | 4,306 | 1,917 | 1,261 | 16,313 | 45% | 5.2x | 35.3 | 2.6 |
+| 31 | 13,049 | 2,826 | 8,208 | 2,323 | 2,297 | 28,703 | 45% | 5.7x | 58.6 | 2.8 |
 
 `work / path` is total solver work divided by the part of it on the critical path — the parallelism
-the schedule actually extracts. The headline reading is that **the serial manager core is now the
-bottleneck**: it is 61–69% of the modelled critical path, so the next win is in the preprocessing,
+the schedule actually extracts. The headline reading is that **the serial manager core is the
+bottleneck**: at 45–48% of the modelled critical path it is the largest single share, so the next win is in the preprocessing,
 not in the blossom solve.
 
 ### Caveats that travel with these numbers
