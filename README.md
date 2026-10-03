@@ -15,7 +15,7 @@ A surface-code memory experiment produces one *shot* per logical time block: a s
 **detection events** ("defects") — that a decoder must turn into a correction before the next block
 arrives. The standard exact method builds a **detector graph** `G` whose nodes are detectors and
 whose edge weights are log-likelihood costs, and finds a minimum-weight perfect matching on the
-defects. Sparse blossom (PyMatching v2) does this very fast in *throughput* terms, but it is a
+defects. Sparse blossom (PyMatching v2) does this very fast in shot level parallelism terms, but it is a
 single, inherently serial graph algorithm, and its time scales with the size of the whole graph `G`,
 which grows as `d^3` in the code distance. Real-time decoding needs the *latency of one shot* to be
 small, not the shots-per-second of a batch, and that is the number this repository attacks.
@@ -35,7 +35,7 @@ So instead of solving on `G`, solve on a much smaller graph built per shot:
   Distances come from precomputed **ball tables**: for every node of `G`, every node within radius
   `R` of it, the exact discretised distance and the observable mask of the canonical shortest path.
   The hard requirement is `R >= 2 * T` — a shorter radius silently changes answers.
-* **The exactness certificate.** Run blossom on `H`. If it finishes and its terminal dual variables
+* **The exactness certificate.** Run blossom on `H`. If it finishes and its terminal nested dual variables
   all satisfy `max_u Y(u) <= T`, the result is provably a **global** MWPM on `G`: extending the dual
   by zero off `H` is feasible for the full LP, every omitted edge has strictly positive slack, and
   complementary slackness holds. The matching, its weight and its observable flips are exactly what
@@ -92,6 +92,7 @@ Ran on an Apple M5 Pro chip (2026).
 `fallback` is stock exact sparse blossom on `G` from the full syndrome, run on **every** shot.
 `sparse_k` is the makespan of the simulated `k`-core schedule. `speedup` is
 `mean(fallback) / mean(system)` over all shots, escalating ones included.
+All numbers here are averages over shots.
 
 | `d` | shots | escalated | `fallback` | `sparse_k` | `system` | **speedup** | `system` p99 | `system` p99.9 |
 |--:|--:|--:|--:|--:|--:|--:|--:|--:|
@@ -150,7 +151,7 @@ on what `k` real cores would deliver, not a measurement of them:
 ## Using it
 
 The inherited PyMatching API is unchanged and still the way to decode.
-But it is slower than PyMatching because it isn't intended to be used as a software decoder. :
+But it is slower than PyMatching because it isn't intended to be used as a software decoder.
 The profilers can be built using CMake and have their source located in benchmarks/
 
 
